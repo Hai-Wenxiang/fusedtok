@@ -86,4 +86,27 @@ std::pair<std::vector<float>, std::vector<float>>
 rope_cuda(const std::vector<float>& q, const std::vector<float>* k,
           int seq, int dim, float theta);
 
+// ---------------------------------------------------------------------------
+// RoPE, "rotate_half" (GPT-NeoX / LLaMA-HF) variant.
+//
+// Same frequencies as the interleaved variant, but pairs are formed across
+// the row halves instead of adjacent elements:
+//
+//   x1 = x[0 .. dim/2),  x2 = x[dim/2 .. dim)
+//   angle(m, j) = m * theta^(-2j / dim)
+//   x1'[j] = x1[j] * cos - x2[j] * sin
+//   x2'[j] = x1[j] * sin + x2[j] * cos
+//
+// Both variants produce permutations of each other; models are trained with
+// one specific layout, so the library offers both.
+// ---------------------------------------------------------------------------
+
+std::pair<std::vector<float>, std::vector<float>>
+rope_neox_cpu(const std::vector<float>& q, const std::vector<float>* k,
+              int seq, int dim, float theta);
+
+std::pair<std::vector<float>, std::vector<float>>
+rope_neox_cuda(const std::vector<float>& q, const std::vector<float>* k,
+               int seq, int dim, float theta);
+
 }

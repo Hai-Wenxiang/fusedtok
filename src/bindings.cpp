@@ -62,6 +62,33 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("theta") = 10000.0f, py::arg("cuda") = false,
        "Rotary position embedding on (q, k); returns (q', k').");
 
+    // RoPE rotate_half (NeoX/LLaMA-HF) variant, same signature as rope().
+    m.def("rope_neox", [](const std::vector<float>& q, py::object k,
+                          int seq, int dim, float theta, bool use_cuda) {
+        const std::vector<float>* kp = nullptr;
+        std::vector<float> keep_alive;
+        if (!k.is_none()) {
+            keep_alive = k.cast<std::vector<float>>();
+            kp = &keep_alive;
+        }
+        auto result = use_cuda ? fusedtok::rope_neox_cuda(q, kp, seq, dim, theta)
+                               : fusedtok::rope_neox_cpu(q, kp, seq, dim, theta);
+        py::object k_out = result.second.empty() && !kp ? py::none() : py::cast(result.second);
+        return py::make_tuple(py::cast(result.first), k_out);
+    }, py::arg("q"), py::arg("k"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta") = 10000.0f, py::arg("cuda") = false,
+       "Rotary position embedding (rotate_half layout); returns (q', k').");
+
+    // Sampling helpers
+    m.def("argmax", [](const std::vector<float>& x, bool use_cuda) {
+        return use_cuda ? fusedtok::argmax_cuda(x) : fusedtok::argmax_cpu(x);
+    }, py::arg("x"), py::arg("cuda") = false,
+       "Index of the largest element (earliest index on ties).");
+    m.def("temperature", [](const std::vector<float>& x, float t, bool use_cuda) {
+        return use_cuda ? fusedtok::temperature_cuda(x, t) : fusedtok::temperature_cpu(x, t);
+    }, py::arg("x"), py::arg("t"), py::arg("cuda") = false,
+       "Divide logits by temperature t > 0.");
+
     // Elementwise activations
     m.def("silu", [](const std::vector<float>& x, bool use_cuda) {
         return use_cuda ? fusedtok::silu_cuda(x) : fusedtok::silu_cpu(x);

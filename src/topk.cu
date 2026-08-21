@@ -148,4 +148,80 @@ std::pair<std::vector<float>, std::vector<int>> topp_cuda(const std::vector<floa
     return {std::move(d_vals), std::move(d_idxs)};
 }
 
+// ---------------------------------------------------------------------------
+// Sampling helpers
+// ---------------------------------------------------------------------------
+
+// Single thread performs a linear argmax scan - the greedy decoding op.
+// Strict '>' keeps the earliest index on ties (deterministic, matches CPU).
+__global__ void argmax_kernel(const float* x, int n, int* out) {
+    int best = 0;
+    for (int i = 1; i < n; ++i)
+        if (x[i] > x[best]) best = i;
+    out[0] = best;
+}
+
+// One thread per element: y[i] = x[i] / t.
+__global__ void temperature_kernel(const float* x, float* y, int n, float t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = x[i] / t;
+}
+
+int argmax_cpu(const std::vector<float>& x) {
+    if (x.empty())
+        throw std::invalid_argument("argmax of empty vector");
+    int best = 0;
+    for (size_t i = 1; i < x.size(); ++i)
+        if (x[i] > x[best]) best = (int)i;
+    return best;
+}
+
+int argmax_cuda(const std::vector<float>& x) {
+    if (x.empty())
+        throw std::invalid_argument("argmax of empty vector");
+    const int n = static_cast<int>(x.size());
+    float* dx = nullptr;
+    int* dout = nullptr;
+    int out[1] = {0};
+    if (cudaMalloc(&dx, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
+    if (cudaMalloc(&dout, sizeof(int)) != cudaSuccess) throw std::runtime_error("cudaMalloc out failed");
+    if (cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
+
+    argmax_kernel<<<1, 1>>>(dx, n, dout);
+
+    if (cudaDeviceSynchronize() != cudaSuccess)
+        throw std::runtime_error("argmax kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
+    if (cudaMemcpy(out, dout, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H out failed");
+    cudaFree(dx); cudaFree(dout);
+    return out[0];
+}
+
+std::vector<float> temperature_cpu(const std::vector<float>& x, float t) {
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    std::vector<float> y(x.size());
+    for (size_t i = 0; i < x.size(); ++i) y[i] = x[i] / t;
+    return y;
+}
+
+std::vector<float> temperature_cuda(const std::vector<float>& x, float t) {
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    const int n = static_cast<int>(x.size());
+    if (n == 0) return {};
+    std::vector<float> y(n);
+    float *dx = nullptr, *dy = nullptr;
+    if (cudaMalloc(&dx, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
+    if (cudaMalloc(&dy, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc y failed");
+    if (cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
+
+    temperature_kernel<<<(n + 255) / 256, 256>>>(dx, dy, n, t);
+
+    if (cudaDeviceSynchronize() != cudaSuccess)
+        throw std::runtime_error("temperature kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
+    if (cudaMemcpy(y.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H y failed");
+    cudaFree(dx); cudaFree(dy);
+    return y;
+}
+
 }

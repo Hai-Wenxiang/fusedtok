@@ -52,4 +52,17 @@ std::pair<std::vector<float>, std::vector<int>> topk_cuda(const std::vector<floa
 std::pair<std::vector<float>, std::vector<int>> topp_cpu(const std::vector<float>& probs, float p);
 std::pair<std::vector<float>, std::vector<int>> topp_cuda(const std::vector<float>& probs, float p);
 
+// ---------------------------------------------------------------------------
+// Sampling helpers
+//
+// argmax(x)      -> index of the largest element (earliest index on ties)
+// temperature(x) -> x[i] / t elementwise (t > 0; t < 1 sharpens, t > 1 flattens)
+// ---------------------------------------------------------------------------
+
+int argmax_cpu(const std::vector<float>& x);
+int argmax_cuda(const std::vector<float>& x);
+
+std::vector<float> temperature_cpu(const std::vector<float>& x, float t);
+std::vector<float> temperature_cuda(const std::vector<float>& x, float t);
+
 }
