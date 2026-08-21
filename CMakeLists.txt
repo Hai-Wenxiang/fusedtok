@@ -13,7 +13,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
 # The compiled extension module loaded as `import _fusedtok`
-pybind11_add_module(_fusedtok src/fusedtok.cu src/rmsnorm.cu src/swiglu.cu src/bindings.cpp)
+pybind11_add_module(_fusedtok src/fusedtok.cu src/rmsnorm.cu src/swiglu.cu src/rope.cu src/bindings.cpp)
 target_include_directories(_fusedtok PRIVATE include)
 target_link_libraries(_fusedtok PRIVATE CUDA::cudart)
 

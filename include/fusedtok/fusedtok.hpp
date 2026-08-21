@@ -60,4 +60,30 @@ std::vector<float> swiglu_cpu(const std::vector<float>& gate,
 std::vector<float> swiglu_cuda(const std::vector<float>& gate,
                                const std::vector<float>& up);
 
+// ---------------------------------------------------------------------------
+// RoPE (Rotary Position Embedding), interleaved-pair variant (original
+// RoFormer formulation).
+//
+// For position m and pair index j (pairs are (2j, 2j+1) within each row of
+// width dim):
+//
+//   angle   = m * theta^(-2j / dim)
+//   x2j'    = x2j  * cos(angle) - x2j+1 * sin(angle)
+//   x2j+1'  = x2j  * sin(angle) + x2j+1 * cos(angle)
+//
+// q (and optionally k) are flattened row-major [seq, dim]; dim must be even.
+// Returns {q_rotated, k_rotated}; the second element is nullptr-equivalent
+// (empty) when no k was supplied.
+// ---------------------------------------------------------------------------
+
+// CPU reference implementation. k may be nullptr to rotate q only.
+std::pair<std::vector<float>, std::vector<float>>
+rope_cpu(const std::vector<float>& q, const std::vector<float>* k,
+         int seq, int dim, float theta);
+
+// GPU implementation: naive one-thread-per-pair kernel.
+std::pair<std::vector<float>, std::vector<float>>
+rope_cuda(const std::vector<float>& q, const std::vector<float>* k,
+          int seq, int dim, float theta);
+
 }

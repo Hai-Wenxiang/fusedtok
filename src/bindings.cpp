@@ -40,4 +40,22 @@ PYBIND11_MODULE(_fusedtok, m) {
                         : fusedtok::swiglu_cpu(gate, up);
     }, py::arg("gate"), py::arg("up"), py::arg("cuda") = false,
        "SwiGLU activation: silu(gate) * up.");
+
+    // RoPE (interleaved pairs). q/k flattened row-major [seq, dim], dim even.
+    // Returns (q_rotated, k_rotated); the second element is None if k is None.
+    m.def("rope", [](const std::vector<float>& q, py::object k,
+                     int seq, int dim, float theta, bool use_cuda) {
+        const std::vector<float>* kp = nullptr;
+        std::vector<float> keep_alive;
+        if (!k.is_none()) {
+            keep_alive = k.cast<std::vector<float>>();
+            kp = &keep_alive;
+        }
+        auto result = use_cuda ? fusedtok::rope_cuda(q, kp, seq, dim, theta)
+                               : fusedtok::rope_cpu(q, kp, seq, dim, theta);
+        py::object k_out = result.second.empty() && !kp ? py::none() : py::cast(result.second);
+        return py::make_tuple(py::cast(result.first), k_out);
+    }, py::arg("q"), py::arg("k"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta") = 10000.0f, py::arg("cuda") = false,
+       "Rotary position embedding on (q, k); returns (q', k').");
 }
