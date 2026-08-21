@@ -33,4 +33,11 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("w"), py::arg("rows"), py::arg("cols"),
        py::arg("eps"), py::arg("residual") = py::none(), py::arg("cuda") = false,
        "RMSNorm (optionally fused with residual add).");
+
+    // SwiGLU activation: out = silu(gate) * up.
+    m.def("swiglu", [](const std::vector<float>& gate, const std::vector<float>& up, bool use_cuda) {
+        return use_cuda ? fusedtok::swiglu_cuda(gate, up)
+                        : fusedtok::swiglu_cpu(gate, up);
+    }, py::arg("gate"), py::arg("up"), py::arg("cuda") = false,
+       "SwiGLU activation: silu(gate) * up.");
 }

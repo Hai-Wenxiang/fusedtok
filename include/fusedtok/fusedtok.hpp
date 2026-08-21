@@ -43,4 +43,21 @@ std::vector<float> rmsnorm_cuda(const std::vector<float>& x,
                                 int rows, int cols, float eps,
                                 const std::vector<float>* residual);
 
+// ---------------------------------------------------------------------------
+// SwiGLU activation
+//
+//   out = silu(gate) * up,   silu(v) = v * sigmoid(v)
+//
+// gate and up are equal-length vectors (the two halves of a SwiGLU MLP
+// projection). Used by LLaMA / Qwen style feed-forward blocks.
+// ---------------------------------------------------------------------------
+
+// CPU reference implementation.
+std::vector<float> swiglu_cpu(const std::vector<float>& gate,
+                              const std::vector<float>& up);
+
+// GPU implementation: naive one-thread-per-element kernel.
+std::vector<float> swiglu_cuda(const std::vector<float>& gate,
+                               const std::vector<float>& up);
+
 }
