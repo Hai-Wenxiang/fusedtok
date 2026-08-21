@@ -2,6 +2,9 @@
 #include <pybind11/stl.h>
 
 #include "fusedtok/fusedtok.hpp"
+#include "fusedtok/activations.hpp"
+#include "fusedtok/softmax.hpp"
+#include "fusedtok/layernorm.hpp"
 
 namespace py = pybind11;
 
@@ -58,4 +61,31 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("q"), py::arg("k"), py::arg("seq"), py::arg("dim"),
        py::arg("theta") = 10000.0f, py::arg("cuda") = false,
        "Rotary position embedding on (q, k); returns (q', k').");
+
+    // Elementwise activations
+    m.def("silu", [](const std::vector<float>& x, bool use_cuda) {
+        return use_cuda ? fusedtok::silu_cuda(x) : fusedtok::silu_cpu(x);
+    }, py::arg("x"), py::arg("cuda") = false,
+       "SiLU activation: v * sigmoid(v).");
+    m.def("gelu", [](const std::vector<float>& x, bool use_cuda) {
+        return use_cuda ? fusedtok::gelu_cuda(x) : fusedtok::gelu_cpu(x);
+    }, py::arg("x"), py::arg("cuda") = false,
+       "GeLU activation (exact erf form).");
+
+    // Row-wise softmax over a flattened [rows, cols] tensor.
+    m.def("softmax", [](const std::vector<float>& x, int rows, int cols, bool use_cuda) {
+        return use_cuda ? fusedtok::softmax_cuda(x, rows, cols)
+                        : fusedtok::softmax_cpu(x, rows, cols);
+    }, py::arg("x"), py::arg("rows"), py::arg("cols"), py::arg("cuda") = false,
+       "Row-wise numerically stable softmax.");
+
+    // LayerNorm with affine weight/bias over a flattened [rows, cols] tensor.
+    m.def("layernorm", [](const std::vector<float>& x, const std::vector<float>& w,
+                          const std::vector<float>& b, int rows, int cols, float eps,
+                          bool use_cuda) {
+        return use_cuda ? fusedtok::layernorm_cuda(x, w, b, rows, cols, eps)
+                        : fusedtok::layernorm_cpu(x, w, b, rows, cols, eps);
+    }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("rows"), py::arg("cols"),
+       py::arg("eps"), py::arg("cuda") = false,
+       "LayerNorm with learned affine transform.");
 }
