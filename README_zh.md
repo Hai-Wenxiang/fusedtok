@@ -14,7 +14,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 
 | 状态 | 算子 | 说明 |
 | :---: | --- | --- |
-| 🚧 | RMSNorm（含残差） | v0.1 计划 |
+| ✅ | RMSNorm（含残差） | 暴力版，v0.1 |
 | 🚧 | RoPE | v0.1 计划 |
 | 🚧 | SwiGLU | v0.1 计划 |
 | ⏳ | top-p / top-k 采样 | v0.2 计划 |
@@ -64,6 +64,10 @@ import fusedtok
 
 x = [1.0, 2.0, 3.0]
 y = fusedtok.axpy(x, 2.0, 1.0, cuda=True)   # 当前骨架算子
+
+# 对展平的 [rows, cols] 张量做 RMSNorm,可选融合残差
+h = fusedtok.rmsnorm(x, w=[1.0, 1.0, 1.0], rows=1, cols=3, eps=1e-6,
+                     residual=skip, cuda=True)
 ```
 
 > **说明**：最终 API 目标是 torch 张量零拷贝；当前骨架使用纯列表以保持零依赖，便于框架搭建期学习。

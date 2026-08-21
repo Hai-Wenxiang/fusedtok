@@ -14,7 +14,7 @@ traffic and launch overhead.
 
 | Status | Kernel | Notes |
 |---|---|---|
-| 🚧 | RMSNorm (+residual) | planned v0.1 |
+| ✅ | RMSNorm (+residual) | naive version, v0.1 |
 | 🚧 | RoPE | planned v0.1 |
 | 🚧 | SwiGLU | planned v0.1 |
 | ⏳ | top-p / top-k sampling | planned v0.2 |
@@ -67,6 +67,10 @@ import fusedtok
 
 x = [1.0, 2.0, 3.0]
 y = fusedtok.axpy(x, 2.0, 1.0, cuda=True)   # current skeleton op
+
+# RMSNorm over a flattened [rows, cols] tensor, optional fused residual
+h = fusedtok.rmsnorm(x, w=[1.0, 1.0, 1.0], rows=1, cols=3, eps=1e-6,
+                     residual=skip, cuda=True)
 ```
 
 > The final API targets zero-copy torch tensors; the current skeleton uses plain lists
