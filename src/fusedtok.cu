@@ -5,6 +5,8 @@
 
 namespace fusedtok {
 
+// Naive kernel: one thread computes one output element.
+// No memory coalescing tricks, no vectorized loads - correctness first.
 __global__ void axpy_kernel(const float* x, float* y, float a, float b, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = a * x[i] + b;
@@ -21,6 +23,7 @@ std::vector<float> axpy_cuda(const std::vector<float>& x, float a, float b) {
     if (n == 0) return {};
     std::vector<float> y(n);
 
+    // Allocate device buffers; release them on every early-exit path
     float *dx = nullptr, *dy = nullptr;
     if (cudaMalloc(&dx, n * sizeof(float)) != cudaSuccess)
         throw std::runtime_error("cudaMalloc dx failed");
@@ -34,8 +37,10 @@ std::vector<float> axpy_cuda(const std::vector<float>& x, float a, float b) {
         throw std::runtime_error("H2D copy failed");
     }
 
+    // 256 threads per block is a safe default; grid covers n with one guard
     axpy_kernel<<<(n + 255) / 256, 256>>>(dx, dy, a, b, n);
 
+    // Synchronize before reading back: also surfaces kernel launch errors
     if (cudaDeviceSynchronize() != cudaSuccess) {
         cudaFree(dx); cudaFree(dy);
         throw std::runtime_error("kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));

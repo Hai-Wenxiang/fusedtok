@@ -1,3 +1,8 @@
+"""Minimal demo: run the axpy skeleton on CPU and CUDA and compare.
+
+Run:  py -3.12 examples/demo.py   (with the build dir on PYTHONPATH)
+"""
+
 import _fusedtok
 
 x = [float(i) for i in range(8)]
