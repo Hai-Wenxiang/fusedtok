@@ -95,3 +95,51 @@ class TestTopK:
         vgpu, igpu = _fusedtok.topk(x, 5, cuda=True)
         assert vgpu == pytest.approx(vcpu)
         assert igpu == icpu
+
+
+class TestTopp:
+    @staticmethod
+    def normalize(x):
+        s = sum(x)
+        return [v / s for v in x]
+
+    def test_hand_checkable(self):
+        # probs [0.5, 0.3, 0.2]: p=0.7 needs {0.5, 0.3}; p=1.0 needs all
+        probs = [0.5, 0.3, 0.2]
+        vals, idxs = _fusedtok.topp(probs, 0.7)
+        assert vals == pytest.approx([0.5, 0.3], abs=1e-6)
+        assert idxs == [0, 1]
+        vals, _ = _fusedtok.topp(probs, 1.0)
+        assert len(vals) == 3
+
+    def test_crossing_element_included(self):
+        # p=0.6: 0.5 alone is not enough -> include crossing element 0.3
+        vals, _ = _fusedtok.topp([0.5, 0.3, 0.2], 0.6)
+        assert vals == pytest.approx([0.5, 0.3], abs=1e-6)
+
+    def test_matches_reference_random(self):
+        probs = self.normalize(make_input(50, lo=0.1, hi=10))
+        vals, idxs = _fusedtok.topp(probs, 0.9)
+        ref = sorted(probs, reverse=True)
+        cum, keep = 0.0, 0
+        for i, v in enumerate(ref):
+            cum += v
+            keep = i + 1
+            if cum >= 0.9:
+                break
+        assert vals == pytest.approx(ref[:keep], abs=1e-5)
+        assert [probs[i] for i in idxs] == pytest.approx(ref[:keep], abs=1e-5)
+
+    def test_invalid_p_raises(self):
+        with pytest.raises(ValueError):
+            _fusedtok.topp([0.5, 0.5], 0.0)
+        with pytest.raises(ValueError):
+            _fusedtok.topp([0.5, 0.5], 1.5)
+
+    @pytest.mark.skipif(not _fusedtok.cuda_available(), reason="no GPU")
+    def test_cuda_matches_cpu(self):
+        probs = self.normalize(make_input(100, lo=0.1, hi=10))
+        vcpu, icpu = _fusedtok.topp(probs, 0.85)
+        vgpu, igpu = _fusedtok.topp(probs, 0.85, cuda=True)
+        assert vgpu == pytest.approx(vcpu, abs=1e-5)
+        assert igpu == icpu

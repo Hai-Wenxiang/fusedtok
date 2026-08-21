@@ -40,4 +40,16 @@ std::vector<float> tanh_cuda(const std::vector<float>& x);
 std::pair<std::vector<float>, std::vector<int>> topk_cpu(const std::vector<float>& x, int k);
 std::pair<std::vector<float>, std::vector<int>> topk_cuda(const std::vector<float>& x, int k);
 
+// ---------------------------------------------------------------------------
+// top-p (nucleus) selection (naive)
+//
+// Given a probability vector (already summing to ~1), returns the smallest
+// set of highest-probability elements whose cumulative mass reaches p
+// (the element that crosses the threshold is included). Returns
+// {values, indices} sorted descending. Built on top of top-k with k = n.
+// ---------------------------------------------------------------------------
+
+std::pair<std::vector<float>, std::vector<int>> topp_cpu(const std::vector<float>& probs, float p);
+std::pair<std::vector<float>, std::vector<int>> topp_cuda(const std::vector<float>& probs, float p);
+
 }

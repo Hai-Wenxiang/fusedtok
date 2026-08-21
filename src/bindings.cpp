@@ -87,6 +87,12 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("k"), py::arg("cuda") = false,
        "Return the k largest elements and their indices (descending).");
 
+    // Top-p (nucleus) selection over a probability vector.
+    m.def("topp", [](const std::vector<float>& probs, float p, bool use_cuda) {
+        return use_cuda ? fusedtok::topp_cuda(probs, p) : fusedtok::topp_cpu(probs, p);
+    }, py::arg("probs"), py::arg("p"), py::arg("cuda") = false,
+       "Smallest set of top probabilities with cumulative mass >= p.");
+
     // Row-wise softmax over a flattened [rows, cols] tensor.
     m.def("softmax", [](const std::vector<float>& x, int rows, int cols, bool use_cuda) {
         return use_cuda ? fusedtok::softmax_cuda(x, rows, cols)
