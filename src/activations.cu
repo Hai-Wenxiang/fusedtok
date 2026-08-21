@@ -30,6 +30,16 @@ __global__ void gelu_kernel(const float* x, float* y, int n) {
     }
 }
 
+__global__ void relu_kernel(const float* x, float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = x[i] > 0.0f ? x[i] : 0.0f;
+}
+
+__global__ void tanh_kernel(const float* x, float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = tanhf(x[i]);
+}
+
 // Shared host-side driver for the elementwise kernels above: allocates,
 // copies in, launches, syncs, copies back, frees. The naive version repeats
 // this boilerplate per operator on purpose - it is easy to read and diff.
@@ -80,6 +90,28 @@ std::vector<float> gelu_cpu(const std::vector<float>& x) {
 
 std::vector<float> gelu_cuda(const std::vector<float>& x) {
     return elementwise_cuda(x, gelu_kernel);
+}
+
+std::vector<float> relu_cpu(const std::vector<float>& x) {
+    std::vector<float> y(x.size());
+    for (size_t i = 0; i < x.size(); ++i)
+        y[i] = x[i] > 0.0f ? x[i] : 0.0f;
+    return y;
+}
+
+std::vector<float> relu_cuda(const std::vector<float>& x) {
+    return elementwise_cuda(x, relu_kernel);
+}
+
+std::vector<float> tanh_cpu(const std::vector<float>& x) {
+    std::vector<float> y(x.size());
+    for (size_t i = 0; i < x.size(); ++i)
+        y[i] = std::tanh(x[i]);
+    return y;
+}
+
+std::vector<float> tanh_cuda(const std::vector<float>& x) {
+    return elementwise_cuda(x, tanh_kernel);
 }
 
 }

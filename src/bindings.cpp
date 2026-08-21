@@ -71,6 +71,21 @@ PYBIND11_MODULE(_fusedtok, m) {
         return use_cuda ? fusedtok::gelu_cuda(x) : fusedtok::gelu_cpu(x);
     }, py::arg("x"), py::arg("cuda") = false,
        "GeLU activation (exact erf form).");
+    m.def("relu", [](const std::vector<float>& x, bool use_cuda) {
+        return use_cuda ? fusedtok::relu_cuda(x) : fusedtok::relu_cpu(x);
+    }, py::arg("x"), py::arg("cuda") = false,
+       "ReLU activation.");
+    m.def("tanh", [](const std::vector<float>& x, bool use_cuda) {
+        return use_cuda ? fusedtok::tanh_cuda(x) : fusedtok::tanh_cpu(x);
+    }, py::arg("x"), py::arg("cuda") = false,
+       "Tanh activation.");
+
+    // Top-k selection: returns (values, indices), descending, deterministic
+    // (earliest index wins ties).
+    m.def("topk", [](const std::vector<float>& x, int k, bool use_cuda) {
+        return use_cuda ? fusedtok::topk_cuda(x, k) : fusedtok::topk_cpu(x, k);
+    }, py::arg("x"), py::arg("k"), py::arg("cuda") = false,
+       "Return the k largest elements and their indices (descending).");
 
     // Row-wise softmax over a flattened [rows, cols] tensor.
     m.def("softmax", [](const std::vector<float>& x, int rows, int cols, bool use_cuda) {
