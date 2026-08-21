@@ -34,7 +34,31 @@ cd fusedtok
 pip install .
 ```
 
-Requirements: CUDA Toolkit >= 12.0, compute capability >= 8.0 (Ampere+).
+**Requirements:**
+
+- NVIDIA GPU of **RTX 30 series (Ampere) or newer** — e.g. RTX 3060/3090, RTX 4080, RTX 5090, A100, H100
+- CUDA Toolkit >= 12.0
+
+<details>
+<summary>What is "compute capability"? (click to expand)</summary>
+
+Compute capability is NVIDIA's version number for a GPU architecture generation — not a
+performance score. CUDA code must be compiled for a specific architecture to run on it.
+Kernels in this library target compute capability 8.0+ because features they rely on
+(e.g. `__nv_bfloat16`) only exist from that generation on.
+
+| Compute capability | Architecture | Example GPUs |
+|---|---|---|
+| 7.5 | Turing | GTX 16xx, RTX 20xx |
+| 8.0 / 8.6 | Ampere | A100, RTX 30xx |
+| 8.9 | Ada | RTX 40xx |
+| 9.0 | Hopper | H100 |
+| 12.0 | Blackwell | RTX 50xx, B200 |
+
+Check yours: run `nvidia-smi` to see your GPU model, then look it up at
+https://developer.nvidia.com/cuda-gpus
+
+</details>
 
 ## Usage (preview)
 

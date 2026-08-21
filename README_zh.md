@@ -34,7 +34,28 @@ cd fusedtok
 pip install .
 ```
 
-**环境要求**：CUDA Toolkit ≥ 12.0，计算能力 ≥ 8.0（Ampere 及以上）。
+**环境要求**：
+
+- **RTX 30 系（Ampere）或更新**的 NVIDIA 显卡 —— 如 RTX 3060/3090、RTX 4080、RTX 5090、A100、H100
+- CUDA Toolkit ≥ 12.0
+
+<details>
+<summary>什么是 "compute capability"（计算能力）？点击展开</summary>
+
+计算能力是 NVIDIA 给每代 GPU 架构的**版本编号**，不是性能分数。CUDA 代码必须针对特定架构编译才能运行。
+本库的 kernel 面向计算能力 8.0 及以上，因为所依赖的特性（如 `__nv_bfloat16`）从这一代才开始提供。
+
+| 计算能力 | 架构 | 代表显卡 |
+|---|---|---|
+| 7.5 | Turing | GTX 16xx、RTX 20xx |
+| 8.0 / 8.6 | Ampere | A100、RTX 30xx |
+| 8.9 | Ada | RTX 40xx |
+| 9.0 | Hopper | H100 |
+| 12.0 | Blackwell | RTX 50xx、B200 |
+
+查看自己的显卡：运行 `nvidia-smi` 看到型号后，在 https://developer.nvidia.com/cuda-gpus 查询对应计算能力。
+
+</details>
 
 ## 用法（预览）
 
