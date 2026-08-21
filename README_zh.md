@@ -15,12 +15,13 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | 状态 | 算子 | 说明 |
 | :---: | --- | --- |
 | ✅ | RMSNorm（含残差） | 暴力版，v0.1 |
-| ✅ | RoPE | 交错配对版，v0.1 |
+| ✅ | LayerNorm | 含仿射变换，暴力版 |
+| ✅ | RoPE | 交错与 NeoX 两种布局，暴力版 |
 | ✅ | SwiGLU | 暴力版，v0.1 |
 | ✅ | Softmax（按行） | 数值稳定版，暴力实现 |
-| ✅ | LayerNorm | 含仿射变换，暴力版 |
-| ✅ | SiLU / GeLU | 逐元素，暴力版 |
-| ⏳ | top-p / top-k 采样 | v0.2 计划 |
+| ✅ | SiLU / GeLU / ReLU / Tanh | 逐元素，暴力版 |
+| ✅ | top-k / top-p（核采样） | 平局取先下标，暴力版 |
+| ✅ | argmax / temperature | 采样辅助，暴力版 |
 | ⏳ | INT8/FP8 量化路线 | v0.3 计划 |
 
 ## 安装

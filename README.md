@@ -15,12 +15,13 @@ traffic and launch overhead.
 | Status | Kernel | Notes |
 |---|---|---|
 | ✅ | RMSNorm (+residual) | naive version, v0.1 |
-| ✅ | RoPE | interleaved pairs, naive, v0.1 |
+| ✅ | LayerNorm | with affine, naive |
+| ✅ | RoPE | interleaved **and** NeoX layouts, naive |
 | ✅ | SwiGLU | naive version, v0.1 |
 | ✅ | Softmax (row-wise) | numerically stable, naive |
-| ✅ | LayerNorm | with affine, naive |
-| ✅ | SiLU / GeLU | elementwise, naive |
-| ⏳ | top-p / top-k sampling | planned v0.2 |
+| ✅ | SiLU / GeLU / ReLU / Tanh | elementwise, naive |
+| ✅ | top-k / top-p (nucleus) | deterministic ties, naive |
+| ✅ | argmax / temperature | sampling helpers, naive |
 | ⏳ | INT8/FP8 quantized path | planned v0.3 |
 
 ## Install
