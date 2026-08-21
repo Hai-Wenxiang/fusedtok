@@ -1,0 +1,33 @@
+# Build
+build/
+out/
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.venv/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# CUDA
+*.cubin
+*.fatbin
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# OS
+Thumbs.db
+Desktop.ini
