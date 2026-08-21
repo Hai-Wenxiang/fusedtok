@@ -17,6 +17,9 @@ traffic and launch overhead.
 | ✅ | RMSNorm (+residual) | naive version, v0.1 |
 | ✅ | RoPE | interleaved pairs, naive, v0.1 |
 | ✅ | SwiGLU | naive version, v0.1 |
+| ✅ | Softmax (row-wise) | numerically stable, naive |
+| ✅ | LayerNorm | with affine, naive |
+| ✅ | SiLU / GeLU | elementwise, naive |
 | ⏳ | top-p / top-k sampling | planned v0.2 |
 | ⏳ | INT8/FP8 quantized path | planned v0.3 |
 
