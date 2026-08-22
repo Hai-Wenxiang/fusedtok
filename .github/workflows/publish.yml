@@ -4,8 +4,12 @@ name: Publish to PyPI
 # The pending publisher configured on PyPI side:
 #   project=fusedtok  owner=Hai-Wenxiang  repo=fusedtok
 #   workflow=publish.yml  environment=(none)
-# Build sdist + linux x86_64 wheel in the CUDA container, upload with
-# pypa/gh-action-pypi-publish, then verify the release exists.
+#
+# Two jobs: the CUDA build must run inside a container, but
+# pypa/gh-action-pypi-publish is a Docker action and Docker actions cannot
+# execute within container jobs - so artifacts are passed through the
+# workflow artifact store to a plain ubuntu-latest publishing job (the
+# pattern documented by PyPA for containerized builds).
 
 on:
   workflow_dispatch:
@@ -13,15 +17,10 @@ on:
     types: [published]
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
     container:
       image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-    permissions:
-      # Required for PyPI Trusted Publishing (OIDC) and artifact upload.
-      id-token: write
-      contents: read
-
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +35,28 @@ jobs:
 
       - name: List artifacts
         run: ls -lh dist/
+
+      - name: Store artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for PyPI Trusted Publishing (OIDC).
+      id-token: write
+      contents: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
       - name: Upload to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
