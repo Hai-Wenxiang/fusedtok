@@ -34,7 +34,9 @@ pybind11_add_module(_fusedtok
     src/sampling.cu
     src/bindings.cpp)
 target_include_directories(_fusedtok PRIVATE include src)
-target_link_libraries(_fusedtok PRIVATE CUDA::cudart)
+# Static CUDA runtime: the wheel then carries no libcudart.so dependency,
+# letting auditwheel tag it manylinux (PyPI rejects bare linux_x86_64 tags).
+target_link_libraries(_fusedtok PRIVATE CUDA::cudart_static)
 
 if(SKBUILD)
     install(TARGETS _fusedtok LIBRARY DESTINATION fusedtok)
