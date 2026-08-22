@@ -113,7 +113,28 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 
 ## Benchmarks
 
-Coming with v0.1 — comparisons vs PyTorch eager on RTX 3060 (sm_86).
+RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing, vs the
+equivalent PyTorch eager expressions (full data: `docs/benchmark_results.json`,
+reproduce with `python benchmarks/bench.py`):
+
+| Op | Shape | fusedtok | PyTorch eager | Speedup |
+|---|---|---:|---:|---:|
+| RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
+| RMSNorm (+residual) | [1024×4096] | 260 µs | 538 µs | **2.1x** |
+| SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
+| LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
+| SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
+| Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
+| argmax | [131072] | 36 µs | 46 µs | **1.3x** |
+| top-k (k=50) | [131072] | 168 µs | 129 µs | 0.8x |
+
+![fusedtok vs PyTorch eager](docs/benchmark_rt3060.png)
+
+Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
+intermediate tensors through global memory. Pure memory-bound elementwise ops
+run at the same ~330-500 GB/s as PyTorch's tuned kernels (silu, gelu, add ≈
+parity). Softmax and top-k remain behind PyTorch's CUB-based kernels —
+honest numbers, on the v0.2 roadmap.
 
 ## Development
 

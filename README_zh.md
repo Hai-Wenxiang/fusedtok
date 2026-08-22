@@ -108,7 +108,27 @@ values, indices = fusedtok.topk(logits, k=50)
 
 ## 性能基准
 
-随 v0.1 发布 —— 在 RTX 3060（sm_86）上对比 PyTorch eager。
+RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时，对比等价的
+PyTorch eager 表达式（完整数据：`docs/benchmark_results.json`，可用
+`python benchmarks/bench.py` 复现）：
+
+| 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
+|---|---|---:|---:|---:|
+| RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
+| RMSNorm（含残差） | [1024×4096] | 260 µs | 538 µs | **2.1x** |
+| SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
+| LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
+| SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
+| Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
+| argmax | [131072] | 36 µs | 46 µs | **1.3x** |
+| top-k (k=50) | [131072] | 168 µs | 129 µs | 0.8x |
+
+![fusedtok 对比 PyTorch eager](docs/benchmark_rt3060.png)
+
+融合算子（RoPE / RMSNorm / SwiGLU）优势明显：eager 模式的中间张量要在显存间
+来回搬运。纯带宽受限的逐元素算子与 PyTorch 调优 kernel 跑出相同的
+~330-500 GB/s（silu、gelu、add ≈ 持平）。Softmax 与 top-k 仍落后于 PyTorch
+的 CUB 内核 —— 数字诚实，改进列入 v0.2 规划。
 
 ## 开发
 
