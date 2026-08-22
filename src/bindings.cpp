@@ -550,9 +550,9 @@ PYBIND11_MODULE(_fusedtok, m) {
         }
         DevBuf dx(n * 4), dv(n * 4), di((size_t)n * sizeof(long long)), dc(sizeof(int));
         h2d(dx.get(), probs.data(), n * 4);
-        ft::topk_launch(dx.fget(), dv.fget(),
-                        static_cast<long long*>(di.get()), n, n);
-        ft::topp_count_launch(dv.fget(), n, (float)p, static_cast<int*>(dc.get()));
+        ft::topp_select_launch(dx.fget(), dv.fget(),
+                               static_cast<long long*>(di.get()), n, (float)p,
+                               static_cast<int*>(dc.get()));
         int count = 0;
         d2h(&count, dc.get(), sizeof(int));
         sync_device("topp kernels");
@@ -569,9 +569,11 @@ PYBIND11_MODULE(_fusedtok, m) {
         ft::topk_launch(df(x), dfm(vals), dllm(idxs), n, k);
     }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("k"));
 
-    m.def("topp_count_launch", [](py::int_ sorted_vals, int n, double p, py::int_ out) {
-        ft::topp_count_launch(df(sorted_vals), n, (float)p, dim_(out));
-    }, py::arg("sorted_vals"), py::arg("n"), py::arg("p"), py::arg("out"));
+    m.def("topp_select_launch", [](py::int_ x, py::int_ vals, py::int_ idxs,
+                                   int n, double p, py::int_ count) {
+        ft::topp_select_launch(df(x), dfm(vals), dllm(idxs), n, (float)p, dim_(count));
+    }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("p"),
+       py::arg("count"));
 
     m.def("argmax_launch", [](py::int_ x, py::int_ out, int n) {
         ft::argmax_launch(df(x), n, dim_(out));

@@ -26,7 +26,6 @@ find_package(pybind11 CONFIG REQUIRED)
 pybind11_add_module(_fusedtok
     src/fusedtok.cu
     src/rmsnorm.cu
-    src/swiglu.cu
     src/rope.cu
     src/activations.cu
     src/softmax.cu
@@ -41,12 +40,15 @@ if(SKBUILD)
     install(TARGETS _fusedtok LIBRARY DESTINATION fusedtok)
 endif()
 
-# Suppress C4819 (codepage warning) on MSVC hosts.
-# Options must be routed per-language: nvcc rejects a bare "/wd4819"
-# on a CUDA source as a stray input file, so CUDA sources get it
-# wrapped in -Xcompiler, CXX sources get it directly.
+# Suppress C4819 (codepage warning) on MSVC hosts, and force the conforming
+# preprocessor (CCCL / cooperative_groups headers refuse the traditional one).
+# Options must be routed per-language: nvcc rejects a bare "/Zc:..." or
+# "/wd4819" on a CUDA source as a stray input file, so CUDA sources get them
+# wrapped in -Xcompiler, CXX sources get them directly.
 if(MSVC)
     target_compile_options(_fusedtok PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4819>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>"
         "$<$<COMPILE_LANGUAGE:CXX>:/wd4819>")
 endif()

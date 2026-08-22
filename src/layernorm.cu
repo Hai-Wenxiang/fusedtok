@@ -1,7 +1,9 @@
 // LayerNorm with affine weight/bias.
 //
-// Naive single kernel: one thread per row, serial passes for mean, biased
-// variance, and the normalized write. Mirrors the CPU reference 1:1.
+// Single-kernel block-per-row implementation with two block reductions
+// (mean, then biased variance computed against the mean for numerical
+// stability - no one-pass sum/sumsq cancellation). Mirrors the CPU
+// reference exactly.
 
 #include "fusedtok/layernorm.hpp"
 #include "fusedtok/cuda_launch.hpp"
@@ -25,26 +27,31 @@ void layernorm_check(const std::vector<float>& x, const std::vector<float>& w,
         throw std::invalid_argument("weight and bias must have length cols");
 }
 
-__global__ void layernorm_kernel(const float* x, const float* w, const float* b,
-                                 float* y, int rows, int cols, float eps) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    const float* xr = x + (size_t)row * cols;
-    float* yr = y + (size_t)row * cols;
+constexpr int kLnBlock = 256;
 
-    float mean = 0.0f;
-    for (int i = 0; i < cols; ++i) mean += xr[i];
-    mean /= cols;
+__global__ void layernorm_kernel(const float* __restrict__ x,
+                                 const float* __restrict__ w,
+                                 const float* __restrict__ b,
+                                 float* __restrict__ y,
+                                 int cols, float eps) {
+    __shared__ float shared[kLnBlock / 32];
+    const float* xr = x + (size_t)blockIdx.x * cols;
+    float* yr = y + (size_t)blockIdx.x * cols;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += kLnBlock)
+        sum += xr[i];
+    const float mean = block_reduce_sum<kLnBlock>(sum, shared) / cols;
 
     float var = 0.0f;
-    for (int i = 0; i < cols; ++i) {
+    for (int i = threadIdx.x; i < cols; i += kLnBlock) {
         float d = xr[i] - mean;
         var += d * d;
     }
-    var /= cols;
+    const float total_var = block_reduce_sum<kLnBlock>(var, shared) / cols;
 
-    float inv_std = rsqrtf(var + eps);
-    for (int i = 0; i < cols; ++i)
+    const float inv_std = rsqrtf(total_var + eps);
+    for (int i = threadIdx.x; i < cols; i += kLnBlock)
         yr[i] = (xr[i] - mean) * inv_std * w[i] + b[i];
 }
 
@@ -79,8 +86,7 @@ std::vector<float> layernorm_cpu(const std::vector<float>& x,
 void layernorm_launch(const float* x, const float* w, const float* b,
                       float* y, int rows, int cols, float eps) {
     if (rows <= 0 || cols <= 0) return;
-    layernorm_kernel<<<(rows + kBlock - 1) / kBlock, kBlock>>>(
-        x, w, b, y, rows, cols, eps);
+    layernorm_kernel<<<rows, kLnBlock>>>(x, w, b, y, cols, eps);
     check_launch("layernorm kernel launch");
 }
 

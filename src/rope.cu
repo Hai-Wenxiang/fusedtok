@@ -28,8 +28,10 @@ void rope_check(const std::vector<float>& q, const std::vector<float>* k,
         throw std::invalid_argument("k.size() must equal q.size()");
 }
 
-// One thread per (position, pair): computes the rotation angle from scratch
-// with powf (naive - a real implementation precomputes frequencies once).
+// One thread per (position, pair). The pair frequency theta^(-2j/dim) is
+// computed as exp2f(-(2j/dim) * log2(theta)) - a fast hardware-friendly
+// rewrite of powf with the same value semantics - and the rotation uses a
+// single sincosf call for both trig components.
 __global__ void rope_kernel(const float* x, float* y, int seq, int dim,
                             float theta, int pos_offset) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;   // global pair index
@@ -40,9 +42,11 @@ __global__ void rope_kernel(const float* x, float* y, int seq, int dim,
     int j = p - row * pairs_per_row;                 // pair index within row
     int m = row + pos_offset;                        // absolute position
 
-    float angle = m * powf(theta, -2.0f * j / dim);
-    float c = cosf(angle);
-    float s = sinf(angle);
+    const float inv_log2_theta = log2f(theta);
+    float freq = exp2f(-(2.0f * j / dim) * inv_log2_theta);
+    float angle = m * freq;
+    float c, s;
+    sincosf(angle, &s, &c);
 
     int even = row * dim + 2 * j;
     int odd = even + 1;
@@ -53,7 +57,7 @@ __global__ void rope_kernel(const float* x, float* y, int seq, int dim,
 }
 
 // One thread per (position, j): pairs row halves instead of adjacent
-// elements. Same naive per-thread powf as the interleaved variant.
+// elements. Same frequency computation as the interleaved variant.
 __global__ void rope_neox_kernel(const float* x, float* y, int seq, int dim,
                                  float theta, int pos_offset) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;   // global j index
@@ -64,9 +68,11 @@ __global__ void rope_neox_kernel(const float* x, float* y, int seq, int dim,
     int j = p - row * half;
     int m = row + pos_offset;
 
-    float angle = m * powf(theta, -2.0f * j / dim);
-    float c = cosf(angle);
-    float s = sinf(angle);
+    const float inv_log2_theta = log2f(theta);
+    float freq = exp2f(-(2.0f * j / dim) * inv_log2_theta);
+    float angle = m * freq;
+    float c, s;
+    sincosf(angle, &s, &c);
 
     int i1 = row * dim + j;          // first half element
     int i2 = row * dim + half + j;   // matching second half element

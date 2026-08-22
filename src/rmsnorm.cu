@@ -1,9 +1,11 @@
 // RMSNorm (with optional fused residual add).
 //
-// Two-kernel naive split:
-//   kernel 1: one thread per row, serial loop accumulates sum of squares
-//   kernel 2: one thread per element, applies the row scale and weight
-// The launcher allocates a small [rows] scratch for inverse RMS values.
+// Single-kernel block-per-row implementation:
+//   - one thread block owns one row
+//   - pass 1: strided accumulation of sum of squares, warp-shuffle +
+//     shared-memory block reduction (deterministic, no scratch buffer)
+//   - pass 2: strided write of the normalized, weighted output
+// Works for any cols (large rows are re-read from cache on pass 2).
 
 #include "fusedtok/fusedtok.hpp"
 #include "fusedtok/cuda_launch.hpp"
@@ -32,35 +34,30 @@ void rmsnorm_check(const std::vector<float>& x, const std::vector<float>& w,
         throw std::invalid_argument("residual.size() must equal x.size()");
 }
 
-// Kernel 1: one thread per row. Serially accumulates sum of squares over the
-// row (O(cols) per thread) and stores the inverse RMS scalar.
-__global__ void rmsnorm_rms_kernel(const float* x, const float* r,
-                                   float* inv_rms, int rows, int cols,
-                                   float eps) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    const float* xr = x + (size_t)row * cols;
-    const float* rr = r ? r + (size_t)row * cols : nullptr;
+constexpr int kRmsBlock = 256;
+
+__global__ void rmsnorm_kernel(const float* __restrict__ x,
+                               const float* __restrict__ r,
+                               const float* __restrict__ w,
+                               float* __restrict__ y,
+                               int cols, float eps) {
+    __shared__ float shared[kRmsBlock / 32];
+    const float* xr = x + (size_t)blockIdx.x * cols;
+    const float* rr = r ? r + (size_t)blockIdx.x * cols : nullptr;
+    float* yr = y + (size_t)blockIdx.x * cols;
 
     float acc = 0.0f;
-    for (int i = 0; i < cols; ++i) {
+    for (int i = threadIdx.x; i < cols; i += kRmsBlock) {
         float v = xr[i] + (rr ? rr[i] : 0.0f);
         acc += v * v;
     }
-    float rms = sqrtf(acc / cols + eps);
-    inv_rms[row] = 1.0f / rms;
-}
+    const float total = block_reduce_sum<kRmsBlock>(acc, shared);
+    const float inv = rsqrtf(total / cols + eps);
 
-// Kernel 2: one thread per element. Reads the precomputed inverse RMS of its
-// row and applies normalization + learned weight.
-__global__ void rmsnorm_apply_kernel(const float* x, const float* r,
-                                      const float* w, const float* inv_rms,
-                                      float* y, int rows, int cols) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    int row = i / cols;
-    int col = i - row * cols;
-    y[i] = (x[i] + (r ? r[i] : 0.0f)) * inv_rms[row] * w[col];
+    for (int i = threadIdx.x; i < cols; i += kRmsBlock) {
+        float v = xr[i] + (rr ? rr[i] : 0.0f);
+        yr[i] = v * inv * w[i];
+    }
 }
 
 } // namespace
@@ -90,26 +87,8 @@ std::vector<float> rmsnorm_cpu(const std::vector<float>& x,
 void rmsnorm_launch(const float* x, const float* w, const float* r,
                     float* y, int rows, int cols, float eps) {
     if (rows <= 0 || cols <= 0) return;
-    // Scratch for per-row inverse RMS; cudaMalloc/free here keeps the launch
-    // self-contained. Note cudaFree performs an implicit device sync.
-    float* dinv = nullptr;
-    if (cudaMalloc(&dinv, rows * sizeof(float)) != cudaSuccess)
-        throw std::runtime_error(std::string("rmsnorm scratch alloc failed: ") +
-                                 cudaGetErrorString(cudaGetLastError()));
-
-    rmsnorm_rms_kernel<<<(rows + kBlock - 1) / kBlock, kBlock>>>(
-        x, r, dinv, rows, cols, eps);
-    cudaError_t err = cudaGetLastError();
-    if (err == cudaSuccess) {
-        const long long n = (long long)rows * cols;
-        rmsnorm_apply_kernel<<<(unsigned)grid_for(n), kBlock>>>(
-            x, r, w, dinv, y, rows, cols);
-        err = cudaGetLastError();
-    }
-    cudaFree(dinv);
-    if (err != cudaSuccess)
-        throw std::runtime_error(std::string("rmsnorm kernel launch: ") +
-                                 cudaGetErrorString(err));
+    rmsnorm_kernel<<<rows, kRmsBlock>>>(x, r, w, y, cols, eps);
+    check_launch("rmsnorm kernel launch");
 }
 
 } // namespace fusedtok

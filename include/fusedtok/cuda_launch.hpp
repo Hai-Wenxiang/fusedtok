@@ -54,10 +54,13 @@ void rope_neox_launch(const float* x, float* y, int seq, int dim, float theta,
 
 // --- sampling / logits post-processing --------------------------------------
 // Descending top-k; earliest index wins ties (deterministic). idxs is int64.
+// Implemented as k parallel packed-key selection rounds.
 void topk_launch(const float* x, float* vals, long long* idxs, int n, int k);
-// Nucleus prefix length over descending-sorted probs; writes one count.
-void topp_count_launch(const float* sorted_vals, int n, float p, int* out_count);
-// Greedy argmax; earliest index wins ties.
+// Nucleus selection with early exit at cumulative mass >= p; writes the
+// selected prefix into vals/idxs and the count into count_out.
+void topp_select_launch(const float* x, float* vals, long long* idxs,
+                        int n, float p, int* count_out);
+// Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out);
 // y[i] = x[i] / t.
 void temperature_launch(const float* x, float* y, int n, float t);

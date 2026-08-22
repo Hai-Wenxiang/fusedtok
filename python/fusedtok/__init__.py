@@ -461,10 +461,9 @@ def topp(probs, p, *, cuda=False):
                     torch.empty(0, dtype=torch.int64, device=probs.device))
         vals = torch.empty(n, dtype=torch.float32, device=probs.device)
         idxs = torch.empty(n, dtype=torch.int64, device=probs.device)
-        _fusedtok.topk_launch(probs.data_ptr(), vals.data_ptr(),
-                              idxs.data_ptr(), n, n)
         cnt = torch.empty(1, dtype=torch.int32, device=probs.device)
-        _fusedtok.topp_count_launch(vals.data_ptr(), n, p, cnt.data_ptr())
+        _fusedtok.topp_select_launch(probs.data_ptr(), vals.data_ptr(),
+                                     idxs.data_ptr(), n, p, cnt.data_ptr())
         c = int(cnt.item())
         return vals[:c], idxs[:c]
     arr = _as_numpy(probs, "probs")

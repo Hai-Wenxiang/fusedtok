@@ -1,7 +1,9 @@
-// Row-wise softmax, max-subtracted for numerical stability.
+﻿// Row-wise softmax, max-subtracted for numerical stability.
 //
-// Naive single kernel: one thread per row, three serial loops (max, exp-sum,
-// write). Same structure as the CPU reference.
+// Single-kernel block-per-row implementation: three strided passes over the
+// row (block-reduced max, block-reduced exp-sum, write). exp is recomputed
+// in the write pass - the row data lives in L2 between passes, and softmax
+// is bandwidth-bound anyway.
 
 #include "fusedtok/softmax.hpp"
 #include "fusedtok/cuda_launch.hpp"
@@ -23,22 +25,26 @@ void softmax_check(const std::vector<float>& x, int rows, int cols) {
         throw std::invalid_argument("x.size() must equal rows * cols");
 }
 
-__global__ void softmax_kernel(const float* x, float* y, int rows, int cols) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    const float* xr = x + (size_t)row * cols;
-    float* yr = y + (size_t)row * cols;
+constexpr int kSmBlock = 256;
+
+__global__ void softmax_kernel(const float* __restrict__ x,
+                               float* __restrict__ y,
+                               int cols) {
+    __shared__ float shared[kSmBlock / 32];
+    const float* xr = x + (size_t)blockIdx.x * cols;
+    float* yr = y + (size_t)blockIdx.x * cols;
 
     float m = -INFINITY;
-    for (int i = 0; i < cols; ++i)
-        if (xr[i] > m) m = xr[i];
+    for (int i = threadIdx.x; i < cols; i += kSmBlock)
+        m = fmaxf(m, xr[i]);
+    m = block_reduce_max<kSmBlock>(m, shared);
 
     float sum = 0.0f;
-    for (int i = 0; i < cols; ++i)
+    for (int i = threadIdx.x; i < cols; i += kSmBlock)
         sum += expf(xr[i] - m);
+    const float inv = 1.0f / block_reduce_sum<kSmBlock>(sum, shared);
 
-    float inv = 1.0f / sum;
-    for (int i = 0; i < cols; ++i)
+    for (int i = threadIdx.x; i < cols; i += kSmBlock)
         yr[i] = expf(xr[i] - m) * inv;
 }
 
@@ -66,7 +72,7 @@ std::vector<float> softmax_cpu(const std::vector<float>& x, int rows, int cols) 
 
 void softmax_launch(const float* x, float* y, int rows, int cols) {
     if (rows <= 0 || cols <= 0) return;
-    softmax_kernel<<<(rows + kBlock - 1) / kBlock, kBlock>>>(x, y, rows, cols);
+    softmax_kernel<<<rows, kSmBlock>>>(x, y, cols);
     check_launch("softmax kernel launch");
 }
 
