@@ -1,4 +1,13 @@
+﻿// Row-wise softmax, max-subtracted for numerical stability.
+//
+// Single-kernel block-per-row implementation: three strided passes over the
+// row (block-reduced max, block-reduced exp-sum, write). exp is recomputed
+// in the write pass - the row data lives in L2 between passes, and softmax
+// is bandwidth-bound anyway.
+
 #include "fusedtok/softmax.hpp"
+#include "fusedtok/cuda_launch.hpp"
+#include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
 #include <cmath>
@@ -16,29 +25,30 @@ void softmax_check(const std::vector<float>& x, int rows, int cols) {
         throw std::invalid_argument("x.size() must equal rows * cols");
 }
 
-} // namespace
+constexpr int kSmBlock = 256;
 
-// One thread per row: three serial passes over the row (max, exp-sum, write).
-// Every thread recomputes expf per element twice - deliberately wasteful,
-// kept for clarity and 1:1 correspondence with the CPU reference.
-__global__ void softmax_kernel(const float* x, float* y, int rows, int cols) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    const float* xr = x + (size_t)row * cols;
-    float* yr = y + (size_t)row * cols;
+__global__ void softmax_kernel(const float* __restrict__ x,
+                               float* __restrict__ y,
+                               int cols) {
+    __shared__ float shared[kSmBlock / 32];
+    const float* xr = x + (size_t)blockIdx.x * cols;
+    float* yr = y + (size_t)blockIdx.x * cols;
 
     float m = -INFINITY;
-    for (int i = 0; i < cols; ++i)
-        if (xr[i] > m) m = xr[i];
+    for (int i = threadIdx.x; i < cols; i += kSmBlock)
+        m = fmaxf(m, xr[i]);
+    m = block_reduce_max<kSmBlock>(m, shared);
 
     float sum = 0.0f;
-    for (int i = 0; i < cols; ++i)
+    for (int i = threadIdx.x; i < cols; i += kSmBlock)
         sum += expf(xr[i] - m);
+    const float inv = 1.0f / block_reduce_sum<kSmBlock>(sum, shared);
 
-    float inv = 1.0f / sum;
-    for (int i = 0; i < cols; ++i)
+    for (int i = threadIdx.x; i < cols; i += kSmBlock)
         yr[i] = expf(xr[i] - m) * inv;
 }
+
+} // namespace
 
 std::vector<float> softmax_cpu(const std::vector<float>& x, int rows, int cols) {
     softmax_check(x, rows, cols);
@@ -60,24 +70,10 @@ std::vector<float> softmax_cpu(const std::vector<float>& x, int rows, int cols) 
     return y;
 }
 
-std::vector<float> softmax_cuda(const std::vector<float>& x, int rows, int cols) {
-    softmax_check(x, rows, cols);
-    if (x.empty()) return {};
-    std::vector<float> y(x.size());
-
-    float *dx = nullptr, *dy = nullptr;
-    if (cudaMalloc(&dx, x.size() * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
-    if (cudaMalloc(&dy, x.size() * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc y failed");
-    if (cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
-
-    softmax_kernel<<<(rows + 255) / 256, 256>>>(dx, dy, rows, cols);
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        throw std::runtime_error("softmax kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
-    if (cudaMemcpy(y.data(), dy, x.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H y failed");
-
-    cudaFree(dx); cudaFree(dy);
-    return y;
+void softmax_launch(const float* x, float* y, int rows, int cols) {
+    if (rows <= 0 || cols <= 0) return;
+    softmax_kernel<<<rows, kSmBlock>>>(x, y, cols);
+    check_launch("softmax kernel launch");
 }
 
-}
+} // namespace fusedtok

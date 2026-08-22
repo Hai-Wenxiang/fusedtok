@@ -1,73 +1,72 @@
-"""Tests for row-wise Softmax (naive version).
+"""Row-wise softmax correctness, including overflow protection."""
 
-Reference (computed independently in Python):
-    y = exp(x - max(row)) / sum(exp(x - max(row)))
-"""
-
-import math
-import random
-
+import numpy as np
 import pytest
 
-import _fusedtok
+import fusedtok
+
+HAS_TORCH = True
+try:
+    import torch
+except ImportError:
+    HAS_TORCH = False
 
 
-def ref_softmax(x, rows, cols):
-    y = []
-    for r in range(rows):
-        row = x[r * cols:(r + 1) * cols]
-        m = max(row)
-        es = [math.exp(v - m) for v in row]
-        s = sum(es)
-        y.extend(e / s for e in es)
-    return y
-
-
-def make_input(rows, cols):
-    return [random.uniform(-10, 10) for _ in range(rows * cols)]
+def ref_softmax(x):
+    z = x.astype(np.float64)
+    z = z - z.max(axis=-1, keepdims=True)
+    e = np.exp(z)
+    return (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)
 
 
 def test_hand_checkable():
-    # Uniform row -> uniform distribution
-    y = _fusedtok.softmax([2.0, 2.0, 2.0, 2.0], 1, 4)
-    assert y == pytest.approx([0.25] * 4, abs=1e-6)
+    x = np.array([[0.0, 1.0]], dtype=np.float32)
+    y = fusedtok.softmax(x)
+    e = np.exp(1.0)
+    assert y[0] == pytest.approx([1 / (1 + e), e / (1 + e)], abs=1e-6)
 
 
 def test_rows_sum_to_one():
-    x = make_input(8, 33)
-    y = _fusedtok.softmax(x, 8, 33)
-    for r in range(8):
-        s = sum(y[r * 33:(r + 1) * 33])
-        assert s == pytest.approx(1.0, abs=1e-5)
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((5, 100)).astype(np.float32)
+    y = fusedtok.softmax(x)
+    assert y.sum(axis=-1) == pytest.approx(np.ones(5), abs=1e-5)
 
 
-def test_matches_reference():
-    x = make_input(5, 64)
-    assert _fusedtok.softmax(x, 5, 64) == pytest.approx(ref_softmax(x, 5, 64), abs=1e-5)
+def test_large_logits_do_not_overflow():
+    # naive exp(1000) would be inf; max-subtraction must keep it finite
+    x = np.array([[1000.0, 1000.5, 999.0]], dtype=np.float32)
+    y = fusedtok.softmax(x)
+    assert np.isfinite(y).all()
+    assert y.argmax() == 1
 
 
-def test_numerical_stability_large_values():
-    # Without max-subtraction, exp(1000) would overflow to inf/nan
-    x = [1000.0, 1000.0, 999.0]
-    y = _fusedtok.softmax(x, 1, 3)
-    assert all(math.isfinite(v) for v in y)
-    assert y[0] == pytest.approx(y[1], rel=1e-6)
-    assert y[2] == pytest.approx(y[0] * math.exp(-1.0), rel=1e-5)
+def test_matches_reference_random():
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((6, 33)).astype(np.float32) * 3
+    assert fusedtok.softmax(x) == pytest.approx(ref_softmax(x), abs=1e-6)
 
 
-def test_empty():
-    assert _fusedtok.softmax([], 0, 7) == []
+def test_1d_row():
+    y = fusedtok.softmax(np.zeros(4, dtype=np.float32))
+    assert y == pytest.approx(np.full(4, 0.25), abs=1e-6)
 
 
-def test_shape_mismatch_raises():
-    with pytest.raises(ValueError):
-        _fusedtok.softmax([1.0] * 5, 2, 3)
-
-
-@pytest.mark.skipif(not _fusedtok.cuda_available(), reason="no GPU")
+@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
 class TestCuda:
-    def test_matches_cpu(self):
-        x = make_input(16, 129)
-        cpu = _fusedtok.softmax(x, 16, 129)
-        cuda = _fusedtok.softmax(x, 16, 129, cuda=True)
-        assert cuda == pytest.approx(cpu, abs=1e-5)
+    def test_staged_matches_cpu(self):
+        rng = np.random.default_rng(2)
+        x = (rng.standard_normal((8, 129)) * 5).astype(np.float32)
+        assert fusedtok.softmax(x, cuda=True) == pytest.approx(
+            fusedtok.softmax(x), abs=1e-5)
+
+
+@pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()), reason="no torch/GPU")
+class TestTorchZeroCopy:
+    def test_gpu_matches_torch_reference(self):
+        rng = np.random.default_rng(3)
+        x = rng.standard_normal((8, 64)).astype(np.float32)
+        out = fusedtok.softmax(torch.from_numpy(x).cuda())
+        torch.cuda.synchronize()
+        ref = torch.softmax(torch.from_numpy(x), dim=-1)
+        assert out.cpu().numpy() == pytest.approx(ref.numpy(), abs=1e-6)

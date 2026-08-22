@@ -1,4 +1,15 @@
+// RMSNorm (with optional fused residual add).
+//
+// Single-kernel block-per-row implementation:
+//   - one thread block owns one row
+//   - pass 1: strided accumulation of sum of squares, warp-shuffle +
+//     shared-memory block reduction (deterministic, no scratch buffer)
+//   - pass 2: strided write of the normalized, weighted output
+// Works for any cols (large rows are re-read from cache on pass 2).
+
 #include "fusedtok/fusedtok.hpp"
+#include "fusedtok/cuda_launch.hpp"
+#include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
 #include <cmath>
@@ -23,39 +34,33 @@ void rmsnorm_check(const std::vector<float>& x, const std::vector<float>& w,
         throw std::invalid_argument("residual.size() must equal x.size()");
 }
 
-} // namespace
+constexpr int kRmsBlock = 256;
 
-// Kernel 1: one thread per row. Serially accumulates sum of squares over the
-// row (O(cols) per thread) and stores the inverse RMS scalar.
-// Deliberately naive - no warp reductions, no vectorized loads.
-__global__ void rmsnorm_rms_kernel(const float* x, const float* r,
-                                   float* inv_rms, int rows, int cols,
-                                   float eps) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    const float* xr = x + (size_t)row * cols;
-    const float* rr = r ? r + (size_t)row * cols : nullptr;
+__global__ void rmsnorm_kernel(const float* __restrict__ x,
+                               const float* __restrict__ r,
+                               const float* __restrict__ w,
+                               float* __restrict__ y,
+                               int cols, float eps) {
+    __shared__ float shared[kRmsBlock / 32];
+    const float* xr = x + (size_t)blockIdx.x * cols;
+    const float* rr = r ? r + (size_t)blockIdx.x * cols : nullptr;
+    float* yr = y + (size_t)blockIdx.x * cols;
 
     float acc = 0.0f;
-    for (int i = 0; i < cols; ++i) {
+    for (int i = threadIdx.x; i < cols; i += kRmsBlock) {
         float v = xr[i] + (rr ? rr[i] : 0.0f);
         acc += v * v;
     }
-    float rms = sqrtf(acc / cols + eps);
-    inv_rms[row] = 1.0f / rms;
+    const float total = block_reduce_sum<kRmsBlock>(acc, shared);
+    const float inv = rsqrtf(total / cols + eps);
+
+    for (int i = threadIdx.x; i < cols; i += kRmsBlock) {
+        float v = xr[i] + (rr ? rr[i] : 0.0f);
+        yr[i] = v * inv * w[i];
+    }
 }
 
-// Kernel 2: one thread per element. Reads the precomputed inverse RMS of its
-// row and applies normalization + learned weight.
-__global__ void rmsnorm_apply_kernel(const float* x, const float* r,
-                                     const float* w, const float* inv_rms,
-                                     float* y, int rows, int cols) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    int row = i / cols;
-    int col = i - row * cols;
-    y[i] = (x[i] + (r ? r[i] : 0.0f)) * inv_rms[row] * w[col];
-}
+} // namespace
 
 std::vector<float> rmsnorm_cpu(const std::vector<float>& x,
                                const std::vector<float>& w,
@@ -79,43 +84,11 @@ std::vector<float> rmsnorm_cpu(const std::vector<float>& x,
     return y;
 }
 
-std::vector<float> rmsnorm_cuda(const std::vector<float>& x,
-                                const std::vector<float>& w,
-                                int rows, int cols, float eps,
-                                const std::vector<float>* residual) {
-    rmsnorm_check(x, w, rows, cols, residual);
-    const size_t n = x.size();
-    if (n == 0) return {};
-    std::vector<float> y(n);
-
-    const size_t bytes_x = n * sizeof(float);
-    const size_t bytes_w = w.size() * sizeof(float);
-
-    float *dx = nullptr, *dy = nullptr, *dw = nullptr, *dr = nullptr, *dinv = nullptr;
-    if (cudaMalloc(&dx, bytes_x) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
-    if (cudaMalloc(&dy, bytes_x) != cudaSuccess) throw std::runtime_error("cudaMalloc y failed");
-    if (cudaMalloc(&dw, bytes_w) != cudaSuccess) throw std::runtime_error("cudaMalloc w failed");
-    if (cudaMalloc(&dinv, rows * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc inv_rms failed");
-    bool r_on_device = residual != nullptr;
-    if (r_on_device && cudaMalloc(&dr, bytes_x) != cudaSuccess) throw std::runtime_error("cudaMalloc r failed");
-
-    // Simplified cleanup: rely on CUDA context teardown on throw for brevity
-    // in the naive version; success path frees explicitly below.
-    if (cudaMemcpy(dx, x.data(), bytes_x, cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
-    if (cudaMemcpy(dw, w.data(), bytes_w, cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D w failed");
-    if (r_on_device && cudaMemcpy(dr, residual->data(), bytes_x, cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D r failed");
-
-    rmsnorm_rms_kernel<<<(rows + 255) / 256, 256>>>(dx, r_on_device ? dr : nullptr, dinv, rows, cols, eps);
-    rmsnorm_apply_kernel<<<((int)n + 255) / 256, 256>>>(dx, r_on_device ? dr : nullptr, dw, dinv, dy, rows, cols);
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        throw std::runtime_error("rmsnorm kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
-
-    if (cudaMemcpy(y.data(), dy, bytes_x, cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H y failed");
-
-    cudaFree(dx); cudaFree(dy); cudaFree(dw); cudaFree(dinv);
-    if (r_on_device) cudaFree(dr);
-    return y;
+void rmsnorm_launch(const float* x, const float* w, const float* r,
+                    float* y, int rows, int cols, float eps) {
+    if (rows <= 0 || cols <= 0) return;
+    rmsnorm_kernel<<<rows, kRmsBlock>>>(x, r, w, y, cols, eps);
+    check_launch("rmsnorm kernel launch");
 }
 
-}
+} // namespace fusedtok

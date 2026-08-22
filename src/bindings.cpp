@@ -1,139 +1,627 @@
+﻿// pybind11 binding layer for the fusedtok native module.
+//
+// Three entry styles per operator:
+//   1. "<op>_cpu"  - numpy in / numpy out, runs the std::vector CPU reference
+//      implementations. These are the ground truth for parity tests and run
+//      on CI machines without a GPU.
+//   2. "<op>"      - staged CUDA: numpy in / numpy out. Device memory is
+//      managed here (DevBuf RAII), transfers in/out, launch, synchronize.
+//   3. "<op>_launch" - raw CUDA entry taking int64 device pointers, no
+//      staging and no synchronization. The Python layer drives these with
+//      torch CUDA tensors (torch.empty + data_ptr()), so kernels read and
+//      write torch's own buffers with zero copies.
+//
+// Error contract (whole library): shape problems raise std::invalid_argument
+// (surfaces as Python ValueError), CUDA problems raise std::runtime_error
+// (surfaces as Python RuntimeError).
+
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <pybind11/numpy.h>
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "fusedtok/fusedtok.hpp"
 #include "fusedtok/activations.hpp"
 #include "fusedtok/softmax.hpp"
 #include "fusedtok/layernorm.hpp"
+#include "fusedtok/cuda_launch.hpp"
 
 namespace py = pybind11;
+namespace ft = fusedtok;
 
-// Thin binding layer: argument forwarding only, no logic here.
-// std::vector<float> converts to/from Python lists automatically.
+namespace {
+
+[[noreturn]] void throw_cuda(const char* what) {
+    throw std::runtime_error(std::string(what) + ": " +
+                             cudaGetErrorString(cudaGetLastError()));
+}
+
+// RAII device buffer holding raw bytes. Empty allocations stay null.
+class DevBuf {
+public:
+    explicit DevBuf(size_t bytes) {
+        if (bytes == 0) return;
+        if (cudaMalloc(&p_, bytes) != cudaSuccess) {
+            p_ = nullptr;
+            throw_cuda("cudaMalloc failed");
+        }
+    }
+    ~DevBuf() { if (p_) cudaFree(p_); }
+    DevBuf(const DevBuf&) = delete;
+    DevBuf& operator=(const DevBuf&) = delete;
+
+    void* get() const { return p_; }
+    float* fget() const { return static_cast<float*>(p_); }
+
+private:
+    void* p_ = nullptr;
+};
+
+void h2d(void* dst, const void* src, size_t bytes) {
+    if (bytes == 0) return;
+    if (cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+        throw_cuda("H2D copy failed");
+}
+void d2h(void* dst, const void* src, size_t bytes) {
+    if (bytes == 0) return;
+    if (cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw_cuda("D2H copy failed");
+}
+void sync_device(const char* what) {
+    if (cudaDeviceSynchronize() != cudaSuccess)
+        throw std::runtime_error(std::string(what) + " failed: " +
+                                 cudaGetErrorString(cudaGetLastError()));
+}
+
+// ---------------------------------------------------------------------------
+// numpy helpers
+// ---------------------------------------------------------------------------
+
+// forcecast converts other dtypes to float32 and c_style guarantees
+// contiguity (making a temporary copy when needed) - convenient and safe,
+// at the cost of a hidden copy for exotic inputs.
+using FArray = py::array_t<float, py::array::c_style | py::array::forcecast>;
+
+std::vector<py::ssize_t> shape_of(const py::array_t<float>& a) {
+    return std::vector<py::ssize_t>(a.shape(), a.shape() + a.ndim());
+}
+
+bool same_shape(const py::array_t<float>& a, const py::array_t<float>& b) {
+    return shape_of(a) == shape_of(b);
+}
+
+// Flatten to [rows, cols] where cols is the last dimension. 1-D input is
+// treated as a single row.
+void rows_cols_of(const FArray& a, long long& rows, long long& cols) {
+    if (a.ndim() == 1) {
+        rows = 1;
+        cols = a.shape(0);
+    } else if (a.ndim() == 2) {
+        rows = a.shape(0);
+        cols = a.shape(1);
+    } else {
+        throw std::invalid_argument("expected a 1-D or 2-D array");
+    }
+}
+
+std::vector<float> to_vec(const FArray& a) {
+    return std::vector<float>(a.data(), a.data() + a.size());
+}
+
+py::array_t<float> wrap_vec(const std::vector<float>& v,
+                            const std::vector<py::ssize_t>& shape) {
+    py::array_t<float> out(shape);
+    if (!v.empty())
+        std::memcpy(out.mutable_data(), v.data(), v.size() * sizeof(float));
+    return out;
+}
+
+py::array_t<long long> wrap_ivec(const std::vector<long long>& v) {
+    py::array_t<long long> out(v.size());
+    if (!v.empty())
+        std::memcpy(out.mutable_data(), v.data(), v.size() * sizeof(long long));
+    return out;
+}
+
+// Interpret Python ints (torch data_ptr()) as device pointers.
+const float* df(py::int_ p) { return reinterpret_cast<const float*>((uintptr_t)p); }
+float* dfm(py::int_ p) { return reinterpret_cast<float*>((uintptr_t)p); }
+const long long* dll(py::int_ p) { return reinterpret_cast<const long long*>((uintptr_t)p); }
+long long* dllm(py::int_ p) { return reinterpret_cast<long long*>((uintptr_t)p); }
+int* dim_(py::int_ p) { return reinterpret_cast<int*>((uintptr_t)p); }
+
+// ---------------------------------------------------------------------------
+// Staged CUDA drivers for elementwise ops (numpy in -> numpy out)
+// ---------------------------------------------------------------------------
+
+using UnaryLauncher = void (*)(const float*, float*, long long);
+using BinaryLauncher = void (*)(const float*, const float*, float*, long long);
+
+// Templated so captured lambdas (parameterized launches) work too.
+template <typename F>
+py::array_t<float> staged_unary(const FArray& x, F launch) {
+    const long long n = x.size();
+    py::array_t<float> y(shape_of(x));
+    if (n == 0) return y;
+    DevBuf dx(n * sizeof(float)), dy(n * sizeof(float));
+    h2d(dx.get(), x.data(), n * sizeof(float));
+    launch(dx.fget(), dy.fget(), n);
+    d2h(y.mutable_data(), dy.get(), n * sizeof(float));
+    sync_device("elementwise kernel");
+    return y;
+}
+
+py::array_t<float> staged_binary(const FArray& a, const FArray& b,
+                                 BinaryLauncher launch) {
+    if (!same_shape(a, b))
+        throw std::invalid_argument("inputs must have the same shape");
+    const long long n = a.size();
+    py::array_t<float> y(shape_of(a));
+    if (n == 0) return y;
+    DevBuf da(n * sizeof(float)), db(n * sizeof(float)), dy(n * sizeof(float));
+    h2d(da.get(), a.data(), n * sizeof(float));
+    h2d(db.get(), b.data(), n * sizeof(float));
+    launch(da.fget(), db.fget(), dy.fget(), n);
+    d2h(y.mutable_data(), dy.get(), n * sizeof(float));
+    sync_device("elementwise kernel");
+    return y;
+}
+
+} // namespace
+
 PYBIND11_MODULE(_fusedtok, m) {
-    m.doc() = "fusedtok: fused CUDA kernels for LLM inference";
+    m.doc() = "fusedtok native module: CPU reference, staged CUDA, and raw "
+              "device-pointer launchers";
 
-    m.def("axpy", [](const std::vector<float>& x, float a, float b, bool use_cuda) {
-        return use_cuda ? fusedtok::axpy_cuda(x, a, b) : fusedtok::axpy_cpu(x, a, b);
-    }, py::arg("x"), py::arg("a"), py::arg("b"), py::arg("cuda") = false,
-       "Compute y = a * x + b element-wise (CPU or CUDA).");
+    m.def("cuda_available", &ft::cuda_available,
+          "True if a CUDA device context can be created.");
 
-    m.def("cuda_available", &fusedtok::cuda_available,
-          "True if a CUDA device is available.");
+    // ==================================================================
+    // axpy (skeleton/demo operator): y = a * x + b
+    // ==================================================================
+    m.def("axpy_cpu", [](FArray x, float a, float b) {
+        return wrap_vec(ft::axpy_cpu(to_vec(x), a, b), shape_of(x));
+    }, py::arg("x"), py::arg("a"), py::arg("b"));
+    m.def("axpy", [](FArray x, float a, float b) {
+        return staged_unary(x, [a, b](const float* in, float* out, long long n) {
+            ft::axpy_launch(in, out, n, a, b);
+        });
+    }, py::arg("x"), py::arg("a"), py::arg("b"));
 
-    // RMSNorm with optional residual: y = (x + r) * rsqrt(mean((x+r)^2) + eps) * w.
-    // x/r are flattened row-major [rows, cols], w is [cols]. r may be None.
-    m.def("rmsnorm", [](const std::vector<float>& x, const std::vector<float>& w,
-                        int rows, int cols, float eps, py::object residual, bool use_cuda) {
-        const std::vector<float>* r = nullptr;
-        std::vector<float> keep_alive;
+    // ==================================================================
+    // Elementwise unary activations
+    // ==================================================================
+    m.def("silu_cpu", [](FArray x) { return wrap_vec(ft::silu_cpu(to_vec(x)), shape_of(x)); },
+          py::arg("x"));
+    m.def("silu", [](FArray x) { return staged_unary(x, ft::silu_launch); }, py::arg("x"));
+
+    m.def("gelu_cpu", [](FArray x) { return wrap_vec(ft::gelu_cpu(to_vec(x)), shape_of(x)); },
+          py::arg("x"));
+    m.def("gelu", [](FArray x) { return staged_unary(x, ft::gelu_launch); }, py::arg("x"));
+
+    m.def("gelu_tanh_cpu", [](FArray x) { return wrap_vec(ft::gelu_tanh_cpu(to_vec(x)), shape_of(x)); },
+          py::arg("x"));
+    m.def("gelu_tanh", [](FArray x) { return staged_unary(x, ft::gelu_tanh_launch); }, py::arg("x"));
+
+    m.def("relu_cpu", [](FArray x) { return wrap_vec(ft::relu_cpu(to_vec(x)), shape_of(x)); },
+          py::arg("x"));
+    m.def("relu", [](FArray x) { return staged_unary(x, ft::relu_launch); }, py::arg("x"));
+
+    m.def("tanh_cpu", [](FArray x) { return wrap_vec(ft::tanh_cpu(to_vec(x)), shape_of(x)); },
+          py::arg("x"));
+    m.def("tanh", [](FArray x) { return staged_unary(x, ft::tanh_launch); }, py::arg("x"));
+
+    m.def("sigmoid_cpu", [](FArray x) { return wrap_vec(ft::sigmoid_cpu(to_vec(x)), shape_of(x)); },
+          py::arg("x"));
+    m.def("sigmoid", [](FArray x) { return staged_unary(x, ft::sigmoid_launch); }, py::arg("x"));
+
+    m.def("temperature_cpu", [](FArray x, float t) {
+        return wrap_vec(ft::temperature_cpu(to_vec(x), t), shape_of(x));
+    }, py::arg("x"), py::arg("t"));
+    m.def("temperature", [](FArray x, float t) {
+        if (!(t > 0.0f)) throw std::invalid_argument("temperature must be > 0");
+        return staged_unary(x, [t](const float* in, float* out, long long n) {
+            ft::temperature_launch(in, out, (int)n, t);
+        });
+    }, py::arg("x"), py::arg("t"));
+
+    // ==================================================================
+    // Elementwise binary ops
+    // ==================================================================
+    m.def("add_cpu", [](FArray a, FArray b) {
+        return wrap_vec(ft::add_cpu(to_vec(a), to_vec(b)), shape_of(a));
+    }, py::arg("a"), py::arg("b"));
+    m.def("add", [](FArray a, FArray b) { return staged_binary(a, b, ft::add_launch); },
+          py::arg("a"), py::arg("b"));
+
+    m.def("mul_cpu", [](FArray a, FArray b) {
+        return wrap_vec(ft::mul_cpu(to_vec(a), to_vec(b)), shape_of(a));
+    }, py::arg("a"), py::arg("b"));
+    m.def("mul", [](FArray a, FArray b) { return staged_binary(a, b, ft::mul_launch); },
+          py::arg("a"), py::arg("b"));
+
+    m.def("swiglu_cpu", [](FArray g, FArray u) {
+        if (!same_shape(g, u))
+            throw std::invalid_argument("gate and up must have the same shape");
+        return wrap_vec(ft::swiglu_cpu(to_vec(g), to_vec(u)), shape_of(g));
+    }, py::arg("gate"), py::arg("up"));
+    m.def("swiglu", [](FArray g, FArray u) {
+        if (!same_shape(g, u))
+            throw std::invalid_argument("gate and up must have the same shape");
+        return staged_binary(g, u, ft::swiglu_launch);
+    }, py::arg("gate"), py::arg("up"));
+
+    // Raw launchers for the zero-copy torch path -------------------------
+    m.def("axpy_launch", [](py::int_ in, py::int_ out, long long n, float a, float b) {
+        ft::axpy_launch(df(in), dfm(out), n, a, b);
+    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("a"), py::arg("b"));
+    m.def("silu_launch", [](py::int_ in, py::int_ out, long long n) {
+        ft::silu_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("gelu_launch", [](py::int_ in, py::int_ out, long long n) {
+        ft::gelu_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("gelu_tanh_launch", [](py::int_ in, py::int_ out, long long n) {
+        ft::gelu_tanh_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("relu_launch", [](py::int_ in, py::int_ out, long long n) {
+        ft::relu_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("tanh_launch", [](py::int_ in, py::int_ out, long long n) {
+        ft::tanh_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("sigmoid_launch", [](py::int_ in, py::int_ out, long long n) {
+        ft::sigmoid_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("temperature_launch", [](py::int_ in, py::int_ out, int n, float t) {
+        ft::temperature_launch(df(in), dfm(out), n, t); }, py::arg("in"), py::arg("out"),
+        py::arg("n"), py::arg("t"));
+    m.def("add_launch", [](py::int_ a, py::int_ b, py::int_ out, long long n) {
+        ft::add_launch(df(a), df(b), dfm(out), n); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"));
+    m.def("mul_launch", [](py::int_ a, py::int_ b, py::int_ out, long long n) {
+        ft::mul_launch(df(a), df(b), dfm(out), n); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"));
+    m.def("swiglu_launch", [](py::int_ g, py::int_ u, py::int_ out, long long n) {
+        ft::swiglu_launch(df(g), df(u), dfm(out), n); }, py::arg("gate"), py::arg("up"),
+        py::arg("out"), py::arg("n"));
+
+    // ==================================================================
+    // RMSNorm / LayerNorm / softmax (row-major 2-D)
+    // ==================================================================
+    m.def("rmsnorm_cpu", [](FArray x, FArray w, py::object residual, float eps) {
+        long long rows, cols;
+        rows_cols_of(x, rows, cols);
+        if (w.ndim() != 1 || w.shape(0) != cols)
+            throw std::invalid_argument("weight must be 1-D with length cols");
+        std::vector<float> r;
+        const std::vector<float>* rp = nullptr;
         if (!residual.is_none()) {
-            keep_alive = residual.cast<std::vector<float>>();
-            r = &keep_alive;
+            FArray r_arr = residual.cast<FArray>();
+            if (!same_shape(r_arr, x))
+                throw std::invalid_argument("residual must have the same shape as x");
+            r = to_vec(r_arr);
+            rp = &r;
         }
-        return use_cuda ? fusedtok::rmsnorm_cuda(x, w, rows, cols, eps, r)
-                        : fusedtok::rmsnorm_cpu(x, w, rows, cols, eps, r);
-    }, py::arg("x"), py::arg("w"), py::arg("rows"), py::arg("cols"),
-       py::arg("eps"), py::arg("residual") = py::none(), py::arg("cuda") = false,
-       "RMSNorm (optionally fused with residual add).");
+        return wrap_vec(ft::rmsnorm_cpu(to_vec(x), to_vec(w), (int)rows, (int)cols, eps, rp),
+                        shape_of(x));
+    }, py::arg("x"), py::arg("weight"), py::arg("residual") = py::none(),
+       py::arg("eps") = 1e-6f);
 
-    // SwiGLU activation: out = silu(gate) * up.
-    m.def("swiglu", [](const std::vector<float>& gate, const std::vector<float>& up, bool use_cuda) {
-        return use_cuda ? fusedtok::swiglu_cuda(gate, up)
-                        : fusedtok::swiglu_cpu(gate, up);
-    }, py::arg("gate"), py::arg("up"), py::arg("cuda") = false,
-       "SwiGLU activation: silu(gate) * up.");
+    m.def("rmsnorm", [](FArray x, FArray w, py::object residual, float eps) {
+        long long rows, cols;
+        rows_cols_of(x, rows, cols);
+        if (w.ndim() != 1 || w.shape(0) != cols)
+            throw std::invalid_argument("weight must be 1-D with length cols");
+        const long long n = rows * cols;
+        py::array_t<float> y(shape_of(x));
+        if (n == 0) return y;
+        bool has_r = !residual.is_none();
+        FArray r_arr;
+        if (has_r) {
+            r_arr = residual.cast<FArray>();
+            if (!same_shape(r_arr, x))
+                throw std::invalid_argument("residual must have the same shape as x");
+        }
+        DevBuf dx(n * 4), dw(cols * 4), dr(has_r ? n * 4 : 0), dy(n * 4);
+        h2d(dx.get(), x.data(), n * 4);
+        h2d(dw.get(), w.data(), cols * 4);
+        if (has_r) h2d(dr.get(), r_arr.data(), n * 4);
+        ft::rmsnorm_launch(dx.fget(), dw.fget(), has_r ? dr.fget() : nullptr,
+                           dy.fget(), (int)rows, (int)cols, eps);
+        d2h(y.mutable_data(), dy.get(), n * 4);
+        sync_device("rmsnorm kernel");
+        return y;
+    }, py::arg("x"), py::arg("weight"), py::arg("residual") = py::none(),
+       py::arg("eps") = 1e-6f);
 
-    // RoPE (interleaved pairs). q/k flattened row-major [seq, dim], dim even.
-    // Returns (q_rotated, k_rotated); the second element is None if k is None.
-    m.def("rope", [](const std::vector<float>& q, py::object k,
-                     int seq, int dim, float theta, bool use_cuda) {
+    m.def("rmsnorm_launch", [](py::int_ x, py::int_ w, py::object r, py::int_ out,
+                               int rows, int cols, float eps) {
+        const float* rp = r.is_none()
+            ? nullptr
+            : reinterpret_cast<const float*>((uintptr_t)py::int_(r));
+        ft::rmsnorm_launch(df(x), df(w), rp, dfm(out), rows, cols, eps);
+    }, py::arg("x"), py::arg("weight"), py::arg("residual"), py::arg("out"),
+       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+
+    m.def("layernorm_cpu", [](FArray x, FArray w, FArray b, float eps) {
+        long long rows, cols;
+        rows_cols_of(x, rows, cols);
+        if (w.ndim() != 1 || w.shape(0) != cols || b.ndim() != 1 || b.shape(0) != cols)
+            throw std::invalid_argument("weight/bias must be 1-D with length cols");
+        return wrap_vec(ft::layernorm_cpu(to_vec(x), to_vec(w), to_vec(b),
+                                          (int)rows, (int)cols, eps), shape_of(x));
+    }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("eps") = 1e-6f);
+
+    m.def("layernorm", [](FArray x, FArray w, FArray b, float eps) {
+        long long rows, cols;
+        rows_cols_of(x, rows, cols);
+        if (w.ndim() != 1 || w.shape(0) != cols || b.ndim() != 1 || b.shape(0) != cols)
+            throw std::invalid_argument("weight/bias must be 1-D with length cols");
+        const long long n = rows * cols;
+        py::array_t<float> y(shape_of(x));
+        if (n == 0) return y;
+        DevBuf dx(n * 4), dw(cols * 4), db(cols * 4), dy(n * 4);
+        h2d(dx.get(), x.data(), n * 4);
+        h2d(dw.get(), w.data(), cols * 4);
+        h2d(db.get(), b.data(), cols * 4);
+        ft::layernorm_launch(dx.fget(), dw.fget(), db.fget(), dy.fget(),
+                             (int)rows, (int)cols, eps);
+        d2h(y.mutable_data(), dy.get(), n * 4);
+        sync_device("layernorm kernel");
+        return y;
+    }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("eps") = 1e-6f);
+
+    m.def("layernorm_launch", [](py::int_ x, py::int_ w, py::int_ b, py::int_ out,
+                                 int rows, int cols, float eps) {
+        ft::layernorm_launch(df(x), df(w), df(b), dfm(out), rows, cols, eps);
+    }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
+       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+
+    m.def("softmax_cpu", [](FArray x) {
+        long long rows, cols;
+        rows_cols_of(x, rows, cols);
+        return wrap_vec(ft::softmax_cpu(to_vec(x), (int)rows, (int)cols), shape_of(x));
+    }, py::arg("x"));
+
+    m.def("softmax", [](FArray x) {
+        long long rows, cols;
+        rows_cols_of(x, rows, cols);
+        const long long n = rows * cols;
+        py::array_t<float> y(shape_of(x));
+        if (n == 0) return y;
+        DevBuf dx(n * 4), dy(n * 4);
+        h2d(dx.get(), x.data(), n * 4);
+        ft::softmax_launch(dx.fget(), dy.fget(), (int)rows, (int)cols);
+        d2h(y.mutable_data(), dy.get(), n * 4);
+        sync_device("softmax kernel");
+        return y;
+    }, py::arg("x"));
+
+    m.def("softmax_launch", [](py::int_ in, py::int_ out, int rows, int cols) {
+        ft::softmax_launch(df(in), dfm(out), rows, cols);
+    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("cols"));
+
+    // ==================================================================
+    // RoPE (both layouts, optional position offset for kv-cache decoding)
+    // ==================================================================
+    m.def("rope_cpu", [](bool neox, FArray q, py::object k, double theta,
+                         long long pos_offset) {
+        if (q.ndim() != 2)
+            throw std::invalid_argument("q must be 2-D [seq, dim]");
+        const long long seq = q.shape(0), dim = q.shape(1);
+        if (dim % 2 != 0)
+            throw std::invalid_argument("dim must be even (RoPE pairs elements)");
+        if (pos_offset < 0)
+            throw std::invalid_argument("pos_offset must be >= 0");
         const std::vector<float>* kp = nullptr;
-        std::vector<float> keep_alive;
+        std::vector<float> kv;
         if (!k.is_none()) {
-            keep_alive = k.cast<std::vector<float>>();
-            kp = &keep_alive;
+            FArray k_arr = k.cast<FArray>();
+            if (!same_shape(k_arr, q))
+                throw std::invalid_argument("k must have the same shape as q");
+            kv = to_vec(k_arr);
+            kp = &kv;
         }
-        auto result = use_cuda ? fusedtok::rope_cuda(q, kp, seq, dim, theta)
-                               : fusedtok::rope_cpu(q, kp, seq, dim, theta);
-        py::object k_out = result.second.empty() && !kp ? py::none() : py::cast(result.second);
-        return py::make_tuple(py::cast(result.first), k_out);
-    }, py::arg("q"), py::arg("k"), py::arg("seq"), py::arg("dim"),
-       py::arg("theta") = 10000.0f, py::arg("cuda") = false,
-       "Rotary position embedding on (q, k); returns (q', k').");
+        auto result = neox
+            ? ft::rope_neox_cpu(to_vec(q), kp, (int)seq, (int)dim, (float)theta, (int)pos_offset)
+            : ft::rope_cpu(to_vec(q), kp, (int)seq, (int)dim, (float)theta, (int)pos_offset);
+        // NB: no ternary here - py::none() would implicitly convert to
+        // py::array_t and produce a garbage array.
+        py::object k_out = py::none();
+        if (kp)
+            k_out = py::cast<py::array_t<float>>(wrap_vec(result.second, shape_of(q)));
+        return py::make_tuple(wrap_vec(result.first, shape_of(q)), k_out);
+    }, py::arg("neox"), py::arg("q"), py::arg("k"), py::arg("theta") = 10000.0,
+       py::arg("pos_offset") = 0);
 
-    // RoPE rotate_half (NeoX/LLaMA-HF) variant, same signature as rope().
-    m.def("rope_neox", [](const std::vector<float>& q, py::object k,
-                          int seq, int dim, float theta, bool use_cuda) {
-        const std::vector<float>* kp = nullptr;
-        std::vector<float> keep_alive;
-        if (!k.is_none()) {
-            keep_alive = k.cast<std::vector<float>>();
-            kp = &keep_alive;
+    m.def("rope", [](bool neox, FArray q, py::object k, double theta,
+                     long long pos_offset) {
+        if (q.ndim() != 2)
+            throw std::invalid_argument("q must be 2-D [seq, dim]");
+        const long long seq = q.shape(0), dim = q.shape(1);
+        if (dim % 2 != 0)
+            throw std::invalid_argument("dim must be even (RoPE pairs elements)");
+        if (pos_offset < 0)
+            throw std::invalid_argument("pos_offset must be >= 0");
+        bool has_k = !k.is_none();
+        FArray k_arr;
+        if (has_k) {
+            k_arr = k.cast<FArray>();
+            if (!same_shape(k_arr, q))
+                throw std::invalid_argument("k must have the same shape as q");
         }
-        auto result = use_cuda ? fusedtok::rope_neox_cuda(q, kp, seq, dim, theta)
-                               : fusedtok::rope_neox_cpu(q, kp, seq, dim, theta);
-        py::object k_out = result.second.empty() && !kp ? py::none() : py::cast(result.second);
-        return py::make_tuple(py::cast(result.first), k_out);
-    }, py::arg("q"), py::arg("k"), py::arg("seq"), py::arg("dim"),
-       py::arg("theta") = 10000.0f, py::arg("cuda") = false,
-       "Rotary position embedding (rotate_half layout); returns (q', k').");
+        auto rotate_staged = [&](const FArray& in) -> py::array_t<float> {
+            const long long n = seq * dim;
+            py::array_t<float> out(shape_of(in));
+            if (n == 0) return out;
+            DevBuf dx(n * 4), dy(n * 4);
+            h2d(dx.get(), in.data(), n * 4);
+            if (neox)
+                ft::rope_neox_launch(dx.fget(), dy.fget(), (int)seq, (int)dim,
+                                     (float)theta, (int)pos_offset);
+            else
+                ft::rope_launch(dx.fget(), dy.fget(), (int)seq, (int)dim,
+                                (float)theta, (int)pos_offset);
+            d2h(out.mutable_data(), dy.get(), n * 4);
+            sync_device("rope kernel");
+            return out;
+        };
+        py::object k_out = py::none();
+        if (has_k)
+            k_out = rotate_staged(k_arr);
+        return py::make_tuple(rotate_staged(q), k_out);
+    }, py::arg("neox"), py::arg("q"), py::arg("k"), py::arg("theta") = 10000.0,
+       py::arg("pos_offset") = 0);
 
-    // Sampling helpers
-    m.def("argmax", [](const std::vector<float>& x, bool use_cuda) {
-        return use_cuda ? fusedtok::argmax_cuda(x) : fusedtok::argmax_cpu(x);
-    }, py::arg("x"), py::arg("cuda") = false,
-       "Index of the largest element (earliest index on ties).");
-    m.def("temperature", [](const std::vector<float>& x, float t, bool use_cuda) {
-        return use_cuda ? fusedtok::temperature_cuda(x, t) : fusedtok::temperature_cpu(x, t);
-    }, py::arg("x"), py::arg("t"), py::arg("cuda") = false,
-       "Divide logits by temperature t > 0.");
+    m.def("rope_launch", [](bool neox, py::int_ in, py::int_ out, int seq, int dim,
+                            double theta, int pos_offset) {
+        if (neox)
+            ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
+        else
+            ft::rope_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
+    }, py::arg("neox"), py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta"), py::arg("pos_offset"));
 
-    // Elementwise activations
-    m.def("silu", [](const std::vector<float>& x, bool use_cuda) {
-        return use_cuda ? fusedtok::silu_cuda(x) : fusedtok::silu_cpu(x);
-    }, py::arg("x"), py::arg("cuda") = false,
-       "SiLU activation: v * sigmoid(v).");
-    m.def("gelu", [](const std::vector<float>& x, bool use_cuda) {
-        return use_cuda ? fusedtok::gelu_cuda(x) : fusedtok::gelu_cpu(x);
-    }, py::arg("x"), py::arg("cuda") = false,
-       "GeLU activation (exact erf form).");
-    m.def("relu", [](const std::vector<float>& x, bool use_cuda) {
-        return use_cuda ? fusedtok::relu_cuda(x) : fusedtok::relu_cpu(x);
-    }, py::arg("x"), py::arg("cuda") = false,
-       "ReLU activation.");
-    m.def("tanh", [](const std::vector<float>& x, bool use_cuda) {
-        return use_cuda ? fusedtok::tanh_cuda(x) : fusedtok::tanh_cpu(x);
-    }, py::arg("x"), py::arg("cuda") = false,
-       "Tanh activation.");
+    // ==================================================================
+    // Sampling / logits post-processing
+    // ==================================================================
+    m.def("argmax_cpu", [](FArray x) -> long long {
+        if (x.ndim() != 1) throw std::invalid_argument("argmax expects 1-D input");
+        return ft::argmax_cpu(to_vec(x));
+    }, py::arg("x"));
 
-    // Top-k selection: returns (values, indices), descending, deterministic
-    // (earliest index wins ties).
-    m.def("topk", [](const std::vector<float>& x, int k, bool use_cuda) {
-        return use_cuda ? fusedtok::topk_cuda(x, k) : fusedtok::topk_cpu(x, k);
-    }, py::arg("x"), py::arg("k"), py::arg("cuda") = false,
-       "Return the k largest elements and their indices (descending).");
+    m.def("argmax", [](FArray x) -> long long {
+        if (x.ndim() != 1) throw std::invalid_argument("argmax expects 1-D input");
+        const int n = (int)x.size();
+        if (n == 0) throw std::invalid_argument("argmax of empty input");
+        DevBuf dx(n * 4);
+        DevBuf dout(sizeof(int));
+        h2d(dx.get(), x.data(), n * 4);
+        ft::argmax_launch(dx.fget(), n, static_cast<int*>(dout.get()));
+        long long idx = 0;
+        d2h(&idx, dout.get(), sizeof(int));
+        sync_device("argmax kernel");
+        return idx;
+    }, py::arg("x"));
 
-    // Top-p (nucleus) selection over a probability vector.
-    m.def("topp", [](const std::vector<float>& probs, float p, bool use_cuda) {
-        return use_cuda ? fusedtok::topp_cuda(probs, p) : fusedtok::topp_cpu(probs, p);
-    }, py::arg("probs"), py::arg("p"), py::arg("cuda") = false,
-       "Smallest set of top probabilities with cumulative mass >= p.");
+    m.def("topk_cpu", [](FArray x, int k) {
+        if (x.ndim() != 1) throw std::invalid_argument("topk expects 1-D input");
+        if (k < 0 || (size_t)k > x.size())
+            throw std::invalid_argument("k must be in [0, n]");
+        auto [vals, idxs] = ft::topk_cpu(to_vec(x), k);
+        return py::make_tuple(wrap_vec(vals, {(py::ssize_t)k}), wrap_ivec(idxs));
+    }, py::arg("x"), py::arg("k"));
 
-    // Row-wise softmax over a flattened [rows, cols] tensor.
-    m.def("softmax", [](const std::vector<float>& x, int rows, int cols, bool use_cuda) {
-        return use_cuda ? fusedtok::softmax_cuda(x, rows, cols)
-                        : fusedtok::softmax_cpu(x, rows, cols);
-    }, py::arg("x"), py::arg("rows"), py::arg("cols"), py::arg("cuda") = false,
-       "Row-wise numerically stable softmax.");
+    m.def("topk", [](FArray x, int k) {
+        if (x.ndim() != 1) throw std::invalid_argument("topk expects 1-D input");
+        const int n = (int)x.size();
+        if (k < 0 || k > n) throw std::invalid_argument("k must be in [0, n]");
+        py::array_t<float> vals(std::vector<py::ssize_t>{(py::ssize_t)k});
+        py::array_t<long long> idxs(std::vector<py::ssize_t>{(py::ssize_t)k});
+        if (k == 0) return py::make_tuple(vals, idxs);
+        DevBuf dx(n * 4), dv(k * 4), di((size_t)k * sizeof(long long));
+        h2d(dx.get(), x.data(), n * 4);
+        ft::topk_launch(dx.fget(), dv.fget(),
+                        static_cast<long long*>(di.get()), n, k);
+        d2h(vals.mutable_data(), dv.get(), (size_t)k * 4);
+        d2h(idxs.mutable_data(), di.get(), (size_t)k * sizeof(long long));
+        sync_device("topk kernel");
+        return py::make_tuple(vals, idxs);
+    }, py::arg("x"), py::arg("k"));
 
-    // LayerNorm with affine weight/bias over a flattened [rows, cols] tensor.
-    m.def("layernorm", [](const std::vector<float>& x, const std::vector<float>& w,
-                          const std::vector<float>& b, int rows, int cols, float eps,
-                          bool use_cuda) {
-        return use_cuda ? fusedtok::layernorm_cuda(x, w, b, rows, cols, eps)
-                        : fusedtok::layernorm_cpu(x, w, b, rows, cols, eps);
-    }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("rows"), py::arg("cols"),
-       py::arg("eps"), py::arg("cuda") = false,
-       "LayerNorm with learned affine transform.");
+    m.def("topp_cpu", [](FArray probs, double p) {
+        if (!(p > 0.0 && p <= 1.0))
+            throw std::invalid_argument("p must be in (0, 1]");
+        if (probs.ndim() != 1) throw std::invalid_argument("topp expects 1-D input");
+        auto [vals, idxs] = ft::topp_cpu(to_vec(probs), (float)p);
+        return py::make_tuple(wrap_vec(vals, {(py::ssize_t)vals.size()}), wrap_ivec(idxs));
+    }, py::arg("probs"), py::arg("p"));
+
+    m.def("topp", [](FArray probs, double p) {
+        if (!(p > 0.0 && p <= 1.0))
+            throw std::invalid_argument("p must be in (0, 1]");
+        if (probs.ndim() != 1) throw std::invalid_argument("topp expects 1-D input");
+        const int n = (int)probs.size();
+        if (n == 0) {
+            py::array_t<float> vals(std::vector<py::ssize_t>{0});
+            py::array_t<long long> idxs(std::vector<py::ssize_t>{0});
+            return py::make_tuple(vals, idxs);
+        }
+        DevBuf dx(n * 4), dv(n * 4), di((size_t)n * sizeof(long long)), dc(sizeof(int));
+        h2d(dx.get(), probs.data(), n * 4);
+        ft::topp_select_launch(dx.fget(), dv.fget(),
+                               static_cast<long long*>(di.get()), n, (float)p,
+                               static_cast<int*>(dc.get()));
+        int count = 0;
+        d2h(&count, dc.get(), sizeof(int));
+        sync_device("topp kernels");
+        py::array_t<float> vals(std::vector<py::ssize_t>{(py::ssize_t)count});
+        py::array_t<long long> idxs(std::vector<py::ssize_t>{(py::ssize_t)count});
+        if (count > 0) {
+            d2h(vals.mutable_data(), dv.get(), (size_t)count * 4);
+            d2h(idxs.mutable_data(), di.get(), (size_t)count * sizeof(long long));
+        }
+        return py::make_tuple(vals, idxs);
+    }, py::arg("probs"), py::arg("p"));
+
+    m.def("topk_launch", [](py::int_ x, py::int_ vals, py::int_ idxs, int n, int k) {
+        ft::topk_launch(df(x), dfm(vals), dllm(idxs), n, k);
+    }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("k"));
+
+    m.def("topp_select_launch", [](py::int_ x, py::int_ vals, py::int_ idxs,
+                                   int n, double p, py::int_ count) {
+        ft::topp_select_launch(df(x), dfm(vals), dllm(idxs), n, (float)p, dim_(count));
+    }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("p"),
+       py::arg("count"));
+
+    m.def("argmax_launch", [](py::int_ x, py::int_ out, int n) {
+        ft::argmax_launch(df(x), n, dim_(out));
+    }, py::arg("x"), py::arg("out"), py::arg("n"));
+
+    // ==================================================================
+    // repetition penalty
+    // ==================================================================
+    m.def("repetition_penalty_cpu", [](FArray logits, py::sequence ids, double penalty) {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(penalty > 0.0))
+            throw std::invalid_argument("penalty must be > 0");
+        std::vector<long long> token_ids;
+        for (auto item : ids) token_ids.push_back(item.cast<long long>());
+        return wrap_vec(ft::repetition_penalty_cpu(to_vec(logits), token_ids, (float)penalty),
+                        shape_of(logits));
+    }, py::arg("logits"), py::arg("token_ids"), py::arg("penalty"));
+
+    m.def("repetition_penalty", [](FArray logits, py::sequence ids, double penalty) {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(penalty > 0.0))
+            throw std::invalid_argument("penalty must be > 0");
+        std::vector<long long> token_ids;
+        for (auto item : ids) token_ids.push_back(item.cast<long long>());
+        for (long long id : token_ids)
+            if (id < 0 || id >= (long long)logits.size())
+                throw std::invalid_argument("token id out of range");
+        const int n = (int)logits.size();
+        const int m = (int)token_ids.size();
+        py::array_t<float> y(std::vector<py::ssize_t>{(py::ssize_t)n});
+        if (n == 0) return y;
+        DevBuf dxl(n * 4), dids((size_t)m * sizeof(long long)), dy(n * 4);
+        h2d(dxl.get(), logits.data(), n * 4);
+        if (m > 0)
+            h2d(dids.get(), token_ids.data(), (size_t)m * sizeof(long long));
+        ft::repetition_penalty_launch(dxl.fget(),
+                                      static_cast<const long long*>(dids.get()),
+                                      n, m, (float)penalty, dy.fget());
+        d2h(y.mutable_data(), dy.get(), n * 4);
+        sync_device("repetition_penalty kernel");
+        return y;
+    }, py::arg("logits"), py::arg("token_ids"), py::arg("penalty"));
+
+    m.def("repetition_penalty_launch", [](py::int_ logits, py::int_ ids, py::int_ out,
+                                          int n, int m, float penalty) {
+        ft::repetition_penalty_launch(df(logits), dll(ids), n, m, penalty, dfm(out));
+    }, py::arg("logits"), py::arg("token_ids"), py::arg("out"), py::arg("n"),
+       py::arg("m"), py::arg("penalty"));
 }

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "fusedtok"
+version = "0.1.0"
+description = "Fused CUDA kernels for LLM inference: RMSNorm, RoPE, SwiGLU, sampling ops, with zero-copy torch support"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Hai-Wenxiang" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+keywords = ["cuda", "llm", "inference", "kernels", "deep-learning", "pytorch"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: C++",
+    "Programming Language :: CUDA",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/Hai-Wenxiang/fusedtok"
+Repository = "https://github.com/Hai-Wenxiang/fusedtok"
+Issues = "https://github.com/Hai-Wenxiang/fusedtok/issues"
+Changelog = "https://github.com/Hai-Wenxiang/fusedtok/releases"
+
+[project.optional-dependencies]
+torch = []
+test = ["pytest>=7"]
+
+[tool.scikit-build-core]
+# The python package lives in python/fusedtok; CMake installs the native
+# _fusedtok module into that package directory.
+wheel.packages = ["python/fusedtok"]
+cmake.minimum-version = "3.24"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
