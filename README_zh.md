@@ -1,6 +1,12 @@
 # fusedtok
 
-**面向 LLM 推理的融合 CUDA 算子库** —— RMSNorm / RoPE / SwiGLU，一行 `pip install` 即可用。
+[![CI](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml/badge.svg)](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
+**面向 LLM 推理的融合 CUDA 算子库** —— RMSNorm / RoPE / SwiGLU 等，支持
+**torch 张量零拷贝**：对比 PyTorch eager 最高 **6.2 倍加速**（RoPE，
+RTX 3060，见[性能基准](#性能基准)）。
 
 **English version: [README.md](README.md)**
 
@@ -28,11 +34,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 
 ## 安装
 
-```bash
-pip install fusedtok   # 尚未发布 —— v0.1 前请从源码构建
-```
-
-源码构建：
+源码构建（预编译 wheel 上线后将支持 PyPI 一行安装）：
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
@@ -44,20 +46,22 @@ pip install .
 
 - **RTX 30 系（Ampere）或更新**的 NVIDIA 显卡 —— 如 RTX 3060/3090、RTX 4080、RTX 5090、A100、H100
 - CUDA Toolkit ≥ 12.0
+- C++17 编译器（Windows 用 MSVC，Linux 用 GCC/Clang）；Python 3.10+
 
 <details>
 <summary>什么是 "compute capability"（计算能力）？点击展开</summary>
 
 计算能力是 NVIDIA 给每代 GPU 架构的**版本编号**，不是性能分数。CUDA 代码必须针对特定架构编译才能运行。
-本库的 kernel 面向计算能力 8.0 及以上，因为所依赖的特性（如 `__nv_bfloat16`）从这一代才开始提供。
+构建产物包含计算能力 8.0（A100）与 8.6（RTX 30）的原生 cubin，以及 compute_86 PTX 回退：
+Ampere 原生运行，更新架构（RTX 40/50 等）由驱动即时编译 PTX。
 
 | 计算能力 | 架构 | 代表显卡 |
 |---|---|---|
-| 7.5 | Turing | GTX 16xx、RTX 20xx |
+| 7.5 | Turing | GTX 16xx、RTX 20xx（不支持） |
 | 8.0 / 8.6 | Ampere | A100、RTX 30xx |
-| 8.9 | Ada | RTX 40xx |
-| 9.0 | Hopper | H100 |
-| 12.0 | Blackwell | RTX 50xx、B200 |
+| 8.9 | Ada | RTX 40xx（走 PTX） |
+| 9.0 | Hopper | H100（走 PTX） |
+| 12.0 | Blackwell | RTX 50xx（走 PTX） |
 
 查看自己的显卡：运行 `nvidia-smi` 看到型号后，在 https://developer.nvidia.com/cuda-gpus 查询对应计算能力。
 
@@ -132,6 +136,8 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_results.json`，可用
 
 ## 开发
 
+完整指南（测试规则、错误契约、确定性约定）见 [CONTRIBUTING.md](CONTRIBUTING.md)。快速上手：
+
 ```bash
 # Windows：需在 VS 开发者命令行（vcvars64）中执行
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -140,12 +146,27 @@ cmake --build build
 $env:PYTHONPATH = "$PWD/build"        # Windows
 PYTHONPATH=$PWD/build                 # Linux
 python -m pytest tests -q
+python benchmarks/bench.py            # GPU 基准测试 + 出图
 ```
 
 - 支持 Windows / Linux
 - Windows 下由 MSVC 配合 nvcc 编译
 - CI 在每次推送时构建并运行 CPU 测试套件
 
+## 路线图
+
+- v0.2：bf16 支持、radix-select top-k/top-p（CUB 级速度）、融合采样
+  （softmax+top-p+抽样单趟完成）、CUDA graph 友好批处理
+- v0.3：INT8/FP8 量化路线、block size 自动调优
+- v0.4+：轻量融合 attention；PyPI 预编译 wheel
+
+## 社区
+
+- [贡献指南](CONTRIBUTING.md) —— 环境搭建、规则与 PR 流程
+- [行为准则](CODE_OF_CONDUCT.md)
+- [安全策略](SECURITY.md)
+- [更新日志](CHANGELOG.md)
+
 ## 许可证
 
-[MIT](LICENSE)
+MIT —— 见 [LICENSE](LICENSE)；第三方声明见 [NOTICES.md](NOTICES.md)。

@@ -1,6 +1,12 @@
 # fusedtok
 
-**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU, one `pip install` away.
+[![CI](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml/badge.svg)](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
+**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU and friends,
+with **zero-copy torch tensor support**: up to **6.2x faster than PyTorch eager**
+(RoPE, RTX 3060, see [Benchmarks](#benchmarks)).
 
 **中文文档请看 [README_zh.md](README_zh.md)** | English below.
 
@@ -28,11 +34,7 @@ traffic and launch overhead.
 
 ## Install
 
-```bash
-pip install fusedtok   # not yet published — building from source until v0.1
-```
-
-Build from source:
+Build from source (a PyPI package is planned once prebuilt wheels are set up):
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
@@ -44,22 +46,24 @@ pip install .
 
 - NVIDIA GPU of **RTX 30 series (Ampere) or newer** — e.g. RTX 3060/3090, RTX 4080, RTX 5090, A100, H100
 - CUDA Toolkit >= 12.0
+- A C++17 compiler (MSVC on Windows, GCC/Clang on Linux); Python 3.10+
 
 <details>
 <summary>What is "compute capability"? (click to expand)</summary>
 
 Compute capability is NVIDIA's version number for a GPU architecture generation — not a
 performance score. CUDA code must be compiled for a specific architecture to run on it.
-Kernels in this library target compute capability 8.0+ because features they rely on
-(e.g. `__nv_bfloat16`) only exist from that generation on.
+The wheel builds native cubins for compute capability 8.0 (A100) and 8.6 (RTX 30) plus a
+compute_86 PTX fallback, so Ampere runs natively and newer architectures (RTX 40/50, ...)
+JIT the PTX with their driver.
 
 | Compute capability | Architecture | Example GPUs |
 |---|---|---|
-| 7.5 | Turing | GTX 16xx, RTX 20xx |
+| 7.5 | Turing | GTX 16xx, RTX 20xx (not supported) |
 | 8.0 / 8.6 | Ampere | A100, RTX 30xx |
-| 8.9 | Ada | RTX 40xx |
-| 9.0 | Hopper | H100 |
-| 12.0 | Blackwell | RTX 50xx, B200 |
+| 8.9 | Ada | RTX 40xx (via PTX) |
+| 9.0 | Hopper | H100 (via PTX) |
+| 12.0 | Blackwell | RTX 50xx (via PTX) |
 
 Check yours: run `nvidia-smi` to see your GPU model, then look it up at
 https://developer.nvidia.com/cuda-gpus
@@ -138,6 +142,9 @@ honest numbers, on the v0.2 roadmap.
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide (test rules,
+error contract, determinism invariants). Quick start:
+
 ```bash
 # Windows: run inside a VS developer prompt (vcvars64)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -146,11 +153,26 @@ cmake --build build
 $env:PYTHONPATH = "$PWD/build"        # Windows
 PYTHONPATH=$PWD/build                 # Linux
 python -m pytest tests -q
+python benchmarks/bench.py            # GPU benchmark + chart
 ```
 
 Windows / Linux. Windows uses MSVC via nvcc; CI builds and runs the CPU test
 suite on every push.
 
+## Roadmap
+
+- v0.2: bf16 support, radix-select top-k/top-p (CUB-class speed), fused
+  sampling (softmax+top-p+draw in one pass), CUDA graph-friendly batching
+- v0.3: INT8/FP8 quantized paths, block-size autotuning
+- v0.4+: lightweight fused attention; prebuilt wheels on PyPI
+
+## Community
+
+- [Contributing guide](CONTRIBUTING.md) — setup, rules of the road, PR process
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Third-party notices: [NOTICES.md](NOTICES.md).
