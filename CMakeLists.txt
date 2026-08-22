@@ -5,13 +5,16 @@ project(fusedtok VERSION 0.1.0 LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Target GPU architecture: native sm_86 cubin (RTX 30 series, the dev GPU)
+# Target GPU architectures: native sm_80 (A100) and sm_86 (RTX 30) cubins
 # plus a compute_86 PTX embed so newer architectures (RTX 40/50, sm_89+) can
-# JIT the kernels with their drivers. Overridable for other setups, e.g.
-#   cmake -DCMAKE_CUDA_ARCHITECTURES="80;90" ..
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 86-real;86-virtual)
-endif()
+# JIT the kernels with their drivers.
+# Set unconditionally (not only when undefined): build frontends may inject
+# an empty CMAKE_CUDA_ARCHITECTURES that would otherwise fall back to the
+# compiler default. Override with -DFUSEDTOK_CUDA_ARCHITECTURES="..." if
+# you need something else.
+set(FUSEDTOK_CUDA_ARCHITECTURES "80-real;86-real;86-virtual" CACHE STRING
+    "CUDA architectures fusedtok compiles for")
+set(CMAKE_CUDA_ARCHITECTURES ${FUSEDTOK_CUDA_ARCHITECTURES})
 
 find_package(CUDAToolkit REQUIRED)
 # pybind11 provided by pip; pass its cmake dir via CMAKE_PREFIX_PATH
