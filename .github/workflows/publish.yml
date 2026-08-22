@@ -1,0 +1,46 @@
+name: Publish to PyPI
+
+# Trusted Publishing (OIDC): no API tokens or passwords anywhere.
+# The pending publisher configured on PyPI side:
+#   project=fusedtok  owner=Hai-Wenxiang  repo=fusedtok
+#   workflow=publish.yml  environment=(none)
+# Build sdist + linux x86_64 wheel in the CUDA container, upload with
+# pypa/gh-action-pypi-publish, then verify the release exists.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    permissions:
+      # Required for PyPI Trusted Publishing (OIDC) and artifact upload.
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3-dev python3-pip
+          pip3 install --no-cache-dir build
+
+      - name: Build sdist and wheel
+        run: python3 -m build --outdir dist
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Upload to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Verify project is live
+        run: |
+          sleep 10
+          curl -fsS "https://pypi.org/pypi/fusedtok/json" | head -c 200 || true
