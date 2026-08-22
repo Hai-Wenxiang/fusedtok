@@ -1,6 +1,7 @@
 # fusedtok
 
 [![CI](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml/badge.svg)](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/fusedtok.svg)](https://pypi.org/project/fusedtok/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
@@ -34,7 +35,12 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 
 ## 安装
 
-源码构建（预编译 wheel 上线后将支持 PyPI 一行安装）：
+```bash
+pip install fusedtok
+```
+
+PyPI 提供 Linux x86_64 预编译 wheel（manylinux，CUDA 12.4 构建）。
+Windows（或无匹配 wheel 的平台）下 pip 会自动从源码构建：
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git

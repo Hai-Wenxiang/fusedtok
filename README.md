@@ -1,6 +1,7 @@
 # fusedtok
 
 [![CI](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml/badge.svg)](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/fusedtok.svg)](https://pypi.org/project/fusedtok/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
@@ -34,7 +35,13 @@ traffic and launch overhead.
 
 ## Install
 
-Build from source (a PyPI package is planned once prebuilt wheels are set up):
+```bash
+pip install fusedtok
+```
+
+Prebuilt Linux x86_64 wheels (manylinux, built with CUDA 12.4) are on PyPI.
+On Windows (or any platform without a matching wheel) pip builds from
+source automatically:
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
