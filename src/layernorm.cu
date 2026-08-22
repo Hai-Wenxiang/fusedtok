@@ -1,4 +1,11 @@
+// LayerNorm with affine weight/bias.
+//
+// Naive single kernel: one thread per row, serial passes for mean, biased
+// variance, and the normalized write. Mirrors the CPU reference 1:1.
+
 #include "fusedtok/layernorm.hpp"
+#include "fusedtok/cuda_launch.hpp"
+#include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
 #include <cmath>
@@ -18,10 +25,6 @@ void layernorm_check(const std::vector<float>& x, const std::vector<float>& w,
         throw std::invalid_argument("weight and bias must have length cols");
 }
 
-} // namespace
-
-// One thread per row: serial passes for mean, biased variance, then the
-// affine write. Mirrors the CPU reference 1:1.
 __global__ void layernorm_kernel(const float* x, const float* w, const float* b,
                                  float* y, int rows, int cols, float eps) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -44,6 +47,8 @@ __global__ void layernorm_kernel(const float* x, const float* w, const float* b,
     for (int i = 0; i < cols; ++i)
         yr[i] = (xr[i] - mean) * inv_std * w[i] + b[i];
 }
+
+} // namespace
 
 std::vector<float> layernorm_cpu(const std::vector<float>& x,
                                  const std::vector<float>& w,
@@ -71,32 +76,12 @@ std::vector<float> layernorm_cpu(const std::vector<float>& x,
     return y;
 }
 
-std::vector<float> layernorm_cuda(const std::vector<float>& x,
-                                  const std::vector<float>& w,
-                                  const std::vector<float>& b,
-                                  int rows, int cols, float eps) {
-    layernorm_check(x, w, b, rows, cols);
-    if (x.empty()) return {};
-    std::vector<float> y(x.size());
-
-    float *dx = nullptr, *dw = nullptr, *db = nullptr, *dy = nullptr;
-    if (cudaMalloc(&dx, x.size() * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
-    if (cudaMalloc(&dw, w.size() * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc w failed");
-    if (cudaMalloc(&db, b.size() * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc b failed");
-    if (cudaMalloc(&dy, x.size() * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc y failed");
-
-    if (cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
-    if (cudaMemcpy(dw, w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D w failed");
-    if (cudaMemcpy(db, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D b failed");
-
-    layernorm_kernel<<<(rows + 255) / 256, 256>>>(dx, dw, db, dy, rows, cols, eps);
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        throw std::runtime_error("layernorm kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
-    if (cudaMemcpy(y.data(), dy, x.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H y failed");
-
-    cudaFree(dx); cudaFree(dw); cudaFree(db); cudaFree(dy);
-    return y;
+void layernorm_launch(const float* x, const float* w, const float* b,
+                      float* y, int rows, int cols, float eps) {
+    if (rows <= 0 || cols <= 0) return;
+    layernorm_kernel<<<(rows + kBlock - 1) / kBlock, kBlock>>>(
+        x, w, b, y, rows, cols, eps);
+    check_launch("layernorm kernel launch");
 }
 
-}
+} // namespace fusedtok

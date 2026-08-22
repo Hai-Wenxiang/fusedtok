@@ -14,14 +14,16 @@ traffic and launch overhead.
 
 | Status | Kernel | Notes |
 |---|---|---|
-| ✅ | RMSNorm (+residual) | naive version, v0.1 |
-| ✅ | LayerNorm | with affine, naive |
-| ✅ | RoPE | interleaved **and** NeoX layouts, naive |
-| ✅ | SwiGLU | naive version, v0.1 |
-| ✅ | Softmax (row-wise) | numerically stable, naive |
-| ✅ | SiLU / GeLU / ReLU / Tanh | elementwise, naive |
-| ✅ | top-k / top-p (nucleus) | deterministic ties, naive |
-| ✅ | argmax / temperature | sampling helpers, naive |
+| ✅ | RMSNorm (+residual) | LLaMA/Qwen style, fused residual add |
+| ✅ | LayerNorm | with affine |
+| ✅ | RoPE | interleaved **and** NeoX layouts, kv-cache `pos_offset` |
+| ✅ | SwiGLU | fused MLP activation |
+| ✅ | Softmax (row-wise) | numerically stable |
+| ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
+| ✅ | add / mul | elementwise binary (fused add+residual pattern) |
+| ✅ | top-k / top-p (nucleus) | deterministic ties |
+| ✅ | argmax / temperature | greedy decoding helpers |
+| ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
 | ⏳ | INT8/FP8 quantized path | planned v0.3 |
 
 ## Install
@@ -64,21 +66,45 @@ https://developer.nvidia.com/cuda-gpus
 
 </details>
 
-## Usage (preview)
+## Usage
+
+numpy in / numpy out, or torch in / torch out — including **zero-copy CUDA**:
+kernels read and write torch device buffers directly via `data_ptr()`, with
+no staging copies and no host synchronization.
 
 ```python
+import numpy as np
+import torch
 import fusedtok
 
-x = [1.0, 2.0, 3.0]
-y = fusedtok.axpy(x, 2.0, 1.0, cuda=True)   # current skeleton op
+x = np.random.randn(4, 1024).astype(np.float32)
+w = np.random.rand(1024).astype(np.float32)
 
-# RMSNorm over a flattened [rows, cols] tensor, optional fused residual
-h = fusedtok.rmsnorm(x, w=[1.0, 1.0, 1.0], rows=1, cols=3, eps=1e-6,
-                     residual=skip, cuda=True)
+# CPU reference implementation (ground truth, runs anywhere)
+y = fusedtok.rmsnorm(x, w, eps=1e-6)
+
+# staged CUDA: copies to GPU, runs kernel, copies back
+y = fusedtok.rmsnorm(x, w, cuda=True)
+
+# zero-copy CUDA with torch tensors: kernels run in torch's own buffers,
+# stream-ordered with other torch operations
+xt, wt = torch.from_numpy(x).cuda(), torch.from_numpy(w).cuda()
+yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch tensor
+
+# RoPE with kv-cache position offset, NeoX (LLaMA-HF) layout
+q = torch.randn(1, 4096, device="cuda")          # new token only
+q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
+
+# sampling side
+logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
+values, indices = fusedtok.topk(logits, k=50)
 ```
 
-> The final API targets zero-copy torch tensors; the current skeleton uses plain lists
-> to stay dependency-free while the framework is under construction.
+Every function accepts float32 numpy arrays or torch tensors (other dtypes
+are converted with a copy) and returns float32 outputs of the same family.
+CUDA torch tensors select the zero-copy path automatically.
+
+See `examples/demo.py` for a runnable tour of every operator.
 
 ## Correctness
 
@@ -95,10 +121,14 @@ Coming with v0.1 — comparisons vs PyTorch eager on RTX 3060 (sm_86).
 # Windows: run inside a VS developer prompt (vcvars64)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-py -3.12 -m pytest tests -q      # with build dir on PYTHONPATH
+# from repo root: PYTHONPATH picks up the built module, conftest.py adds python/
+$env:PYTHONPATH = "$PWD/build"        # Windows
+PYTHONPATH=$PWD/build                 # Linux
+python -m pytest tests -q
 ```
 
-Windows / Linux. Windows uses MSVC via nvcc; CI builds on both.
+Windows / Linux. Windows uses MSVC via nvcc; CI builds and runs the CPU test
+suite on every push.
 
 ## License
 

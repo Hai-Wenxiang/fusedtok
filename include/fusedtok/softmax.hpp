@@ -1,6 +1,5 @@
 #pragma once
 
-#include <utility>
 #include <vector>
 
 namespace fusedtok {
@@ -10,14 +9,10 @@ namespace fusedtok {
 //
 //   y[row, i] = exp(x[row, i] - max(row)) / sum_i exp(x[row, i] - max(row))
 //
-// x is flattened row-major [rows, cols].
+// x is flattened row-major [rows, cols]. CPU reference; the CUDA path goes
+// through softmax_launch (cuda_launch.hpp).
 // ---------------------------------------------------------------------------
 
-// CPU reference implementation.
 std::vector<float> softmax_cpu(const std::vector<float>& x, int rows, int cols);
 
-// GPU implementation, naive version: one thread per row, three serial loops
-// (max, sum of exp, write). Same kernel structure as the CPU reference.
-std::vector<float> softmax_cuda(const std::vector<float>& x, int rows, int cols);
-
-}
+} // namespace fusedtok

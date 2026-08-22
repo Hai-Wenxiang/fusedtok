@@ -5,17 +5,38 @@ project(fusedtok VERSION 0.1.0 LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Target GPU architecture: RTX 3060 (Ampere)
-set(CMAKE_CUDA_ARCHITECTURES 86)
+# Target GPU architecture: native sm_86 cubin (RTX 30 series, the dev GPU)
+# plus a compute_86 PTX embed so newer architectures (RTX 40/50, sm_89+) can
+# JIT the kernels with their drivers. Overridable for other setups, e.g.
+#   cmake -DCMAKE_CUDA_ARCHITECTURES="80;90" ..
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 86-real;86-virtual)
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 # pybind11 provided by pip; pass its cmake dir via CMAKE_PREFIX_PATH
+# (or it is injected by scikit-build-core during packaged builds)
 find_package(pybind11 CONFIG REQUIRED)
 
-# The compiled extension module loaded as `import _fusedtok`
-pybind11_add_module(_fusedtok src/fusedtok.cu src/rmsnorm.cu src/swiglu.cu src/rope.cu src/activations.cu src/softmax.cu src/layernorm.cu src/topk.cu src/bindings.cpp)
-target_include_directories(_fusedtok PRIVATE include)
+# The compiled extension module loaded as `fusedtok._fusedtok`.
+# Under scikit-build-core it installs into the python/fusedtok package dir.
+pybind11_add_module(_fusedtok
+    src/fusedtok.cu
+    src/rmsnorm.cu
+    src/swiglu.cu
+    src/rope.cu
+    src/activations.cu
+    src/softmax.cu
+    src/layernorm.cu
+    src/topk.cu
+    src/sampling.cu
+    src/bindings.cpp)
+target_include_directories(_fusedtok PRIVATE include src)
 target_link_libraries(_fusedtok PRIVATE CUDA::cudart)
+
+if(SKBUILD)
+    install(TARGETS _fusedtok LIBRARY DESTINATION fusedtok)
+endif()
 
 # Suppress C4819 (codepage warning) on MSVC hosts.
 # Options must be routed per-language: nvcc rejects a bare "/wd4819"

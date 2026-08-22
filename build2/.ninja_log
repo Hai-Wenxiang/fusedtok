@@ -1,0 +1,16 @@
+# ninja log v7
+39	3245	8091197792028916	CMakeFiles/_fusedtok.dir/src/swiglu.cu.obj	a43437479efbdef
+46	3270	8091197792098887	CMakeFiles/_fusedtok.dir/src/activations.cu.obj	16d10335b6da58ac
+35	3318	8091197791998880	CMakeFiles/_fusedtok.dir/src/rmsnorm.cu.obj	d65520bbf186053b
+61	3323	8091197792256603	CMakeFiles/_fusedtok.dir/src/sampling.cu.obj	9519c6b837d97981
+32	3326	8091197791959062	CMakeFiles/_fusedtok.dir/src/fusedtok.cu.obj	21563931cca4f8a4
+42	3336	8091197792058879	CMakeFiles/_fusedtok.dir/src/rope.cu.obj	1330416f9134f9c9
+53	3347	8091197792169994	CMakeFiles/_fusedtok.dir/src/layernorm.cu.obj	ff197465d8af2fb0
+49	3348	8091197792128878	CMakeFiles/_fusedtok.dir/src/softmax.cu.obj	7996b21091f31200
+56	3426	8091197792169994	CMakeFiles/_fusedtok.dir/src/topk.cu.obj	4c9d4d3c22857375
+3	2718	8091198234597867	CMakeFiles/_fusedtok.dir/src/bindings.cpp.obj	e896fdaa5deaca24
+2719	5047	8091198261751769	_fusedtok.cp312-win_amd64.pyd	23dc0afd832cf795
+24	2764	8091198560874592	CMakeFiles/_fusedtok.dir/src/bindings.cpp.obj	e896fdaa5deaca24
+2764	4879	8091198588277637	_fusedtok.cp312-win_amd64.pyd	23dc0afd832cf795
+30	2721	8091200355257766	CMakeFiles/_fusedtok.dir/src/bindings.cpp.obj	e896fdaa5deaca24
+2721	4808	8091200382177470	_fusedtok.cp312-win_amd64.pyd	23dc0afd832cf795

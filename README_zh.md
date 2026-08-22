@@ -14,14 +14,16 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 
 | 状态 | 算子 | 说明 |
 | :---: | --- | --- |
-| ✅ | RMSNorm（含残差） | 暴力版，v0.1 |
-| ✅ | LayerNorm | 含仿射变换，暴力版 |
-| ✅ | RoPE | 交错与 NeoX 两种布局，暴力版 |
-| ✅ | SwiGLU | 暴力版，v0.1 |
-| ✅ | Softmax（按行） | 数值稳定版，暴力实现 |
-| ✅ | SiLU / GeLU / ReLU / Tanh | 逐元素，暴力版 |
-| ✅ | top-k / top-p（核采样） | 平局取先下标，暴力版 |
-| ✅ | argmax / temperature | 采样辅助，暴力版 |
+| ✅ | RMSNorm（含残差） | LLaMA/Qwen 风格，融合残差加法 |
+| ✅ | LayerNorm | 含仿射变换 |
+| ✅ | RoPE | 交错与 NeoX 两种布局，支持 kv-cache `pos_offset` |
+| ✅ | SwiGLU | 融合 MLP 激活 |
+| ✅ | Softmax（按行） | 数值稳定版 |
+| ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | 逐元素 |
+| ✅ | add / mul | 逐元素二元（融合加残差模式） |
+| ✅ | top-k / top-p（核采样） | 平局取先下标 |
+| ✅ | argmax / temperature | 贪心解码辅助 |
+| ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
 | ⏳ | INT8/FP8 量化路线 | v0.3 计划 |
 
 ## 安装
@@ -61,20 +63,43 @@ pip install .
 
 </details>
 
-## 用法（预览）
+## 用法
+
+numpy 进 / numpy 出，或 torch 进 / torch 出 —— 并支持 **CUDA 零拷贝**：
+kernel 通过 `data_ptr()` 直接读写 torch 显存缓冲区，无暂存拷贝、无主机端同步。
 
 ```python
+import numpy as np
+import torch
 import fusedtok
 
-x = [1.0, 2.0, 3.0]
-y = fusedtok.axpy(x, 2.0, 1.0, cuda=True)   # 当前骨架算子
+x = np.random.randn(4, 1024).astype(np.float32)
+w = np.random.rand(1024).astype(np.float32)
 
-# 对展平的 [rows, cols] 张量做 RMSNorm,可选融合残差
-h = fusedtok.rmsnorm(x, w=[1.0, 1.0, 1.0], rows=1, cols=3, eps=1e-6,
-                     residual=skip, cuda=True)
+# CPU 参考实现（正确性基准，任何机器可跑）
+y = fusedtok.rmsnorm(x, w, eps=1e-6)
+
+# 暂存式 CUDA：拷入 GPU、跑 kernel、拷回
+y = fusedtok.rmsnorm(x, w, cuda=True)
+
+# torch 张量零拷贝：kernel 直接在 torch 自己的缓冲区上运行，
+# 与其他 torch 操作保持流式顺序
+xt, wt = torch.from_numpy(x).cuda(), torch.from_numpy(w).cuda()
+yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch 张量
+
+# 带 kv-cache 位置偏移的 RoPE，NeoX（LLaMA-HF）布局
+q = torch.randn(1, 4096, device="cuda")          # 只传入新 token
+q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
+
+# 采样侧
+logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
+values, indices = fusedtok.topk(logits, k=50)
 ```
 
-> **说明**：最终 API 目标是 torch 张量零拷贝；当前骨架使用纯列表以保持零依赖，便于框架搭建期学习。
+所有函数接受 float32 的 numpy 数组或 torch 张量（其他 dtype 会被拷贝转换），
+返回同族的 float32 输出。CUDA torch 张量会自动选择零拷贝路径。
+
+完整可运行的算子巡览见 `examples/demo.py`。
 
 ## 正确性
 
@@ -91,12 +116,15 @@ h = fusedtok.rmsnorm(x, w=[1.0, 1.0, 1.0], rows=1, cols=3, eps=1e-6,
 # Windows：需在 VS 开发者命令行（vcvars64）中执行
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-py -3.12 -m pytest tests -q      # 需将 build 目录加入 PYTHONPATH
+# 在仓库根目录：PYTHONPATH 指向构建产物，conftest.py 会自动加 python/ 目录
+$env:PYTHONPATH = "$PWD/build"        # Windows
+PYTHONPATH=$PWD/build                 # Linux
+python -m pytest tests -q
 ```
 
 - 支持 Windows / Linux
 - Windows 下由 MSVC 配合 nvcc 编译
-- CI 双平台构建
+- CI 在每次推送时构建并运行 CPU 测试套件
 
 ## 许可证
 

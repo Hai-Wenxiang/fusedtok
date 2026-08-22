@@ -1,4 +1,12 @@
+// Top-k / top-p selection and greedy decoding helpers.
+//
+// All selection kernels are deliberately naive (single-thread selection
+// loops); they establish an honest, deterministic baseline. Indices are
+// int64 end-to-end so results map directly onto torch tensors.
+
 #include "fusedtok/activations.hpp"
+#include "fusedtok/cuda_launch.hpp"
+#include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -20,7 +28,8 @@ void topk_check(const std::vector<float>& x, int k) {
 // Maximally naive GPU top-k: a SINGLE thread runs the same k-pass selection
 // as the CPU reference. Zero parallelism on purpose - the point is a correct
 // GPU-side baseline to compare fancier selection kernels against later.
-__global__ void topk_kernel(const float* x, float* vals, int* idxs, int n, int k) {
+__global__ void topk_kernel(const float* x, float* vals, long long* idxs,
+                            int n, int k) {
     for (int sel = 0; sel < k; ++sel) {
         int best = -1;
         for (int i = 0; i < n; ++i) {
@@ -37,10 +46,11 @@ __global__ void topk_kernel(const float* x, float* vals, int* idxs, int n, int k
     }
 }
 
-std::pair<std::vector<float>, std::vector<int>> topk_cpu(const std::vector<float>& x, int k) {
+std::pair<std::vector<float>, std::vector<long long>>
+topk_cpu(const std::vector<float>& x, int k) {
     topk_check(x, k);
     std::vector<float> vals;
-    std::vector<int> idxs;
+    std::vector<long long> idxs;
     std::vector<char> taken(x.size(), 0);
     for (int sel = 0; sel < k; ++sel) {
         int best = -1;
@@ -55,29 +65,10 @@ std::pair<std::vector<float>, std::vector<int>> topk_cpu(const std::vector<float
     return {std::move(vals), std::move(idxs)};
 }
 
-std::pair<std::vector<float>, std::vector<int>> topk_cuda(const std::vector<float>& x, int k) {
-    topk_check(x, k);
-    std::vector<float> vals(k);
-    std::vector<int> idxs(k);
-    if (k == 0) return {{}, {}};
-
-    const int n = static_cast<int>(x.size());
-    float *dx = nullptr, *dv = nullptr;
-    int* di = nullptr;
-    if (cudaMalloc(&dx, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
-    if (cudaMalloc(&dv, k * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc vals failed");
-    if (cudaMalloc(&di, k * sizeof(int)) != cudaSuccess) throw std::runtime_error("cudaMalloc idxs failed");
-    if (cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
-
-    topk_kernel<<<1, 1>>>(dx, dv, di, n, k);
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        throw std::runtime_error("topk kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
-    if (cudaMemcpy(vals.data(), dv, k * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H vals failed");
-    if (cudaMemcpy(idxs.data(), di, k * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H idxs failed");
-
-    cudaFree(dx); cudaFree(dv); cudaFree(di);
-    return {std::move(vals), std::move(idxs)};
+void topk_launch(const float* x, float* vals, long long* idxs, int n, int k) {
+    if (k <= 0) return;
+    topk_kernel<<<1, 1>>>(x, vals, idxs, n, k);
+    check_launch("topk kernel launch");
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +87,8 @@ void topp_check(const std::vector<float>& probs, float p) {
 // Single thread computes, over the descending-sorted values, how many
 // elements are needed for the cumulative sum to reach p (inclusive of the
 // crossing element). Writes the count to out_count[0].
-__global__ void topp_count_kernel(const float* sorted_vals, int n, float p, int* out_count) {
+__global__ void topp_count_kernel(const float* sorted_vals, int n, float p,
+                                  int* out_count) {
     float cum = 0.0f;
     int count = 0;
     for (int i = 0; i < n; ++i) {
@@ -107,7 +99,8 @@ __global__ void topp_count_kernel(const float* sorted_vals, int n, float p, int*
     out_count[0] = count;
 }
 
-std::pair<std::vector<float>, std::vector<int>> topp_cpu(const std::vector<float>& probs, float p) {
+std::pair<std::vector<float>, std::vector<long long>>
+topp_cpu(const std::vector<float>& probs, float p) {
     topp_check(probs, p);
     auto [vals, idxs] = topk_cpu(probs, static_cast<int>(probs.size()));
     float cum = 0.0f;
@@ -122,34 +115,17 @@ std::pair<std::vector<float>, std::vector<int>> topp_cpu(const std::vector<float
     return {std::move(vals), std::move(idxs)};
 }
 
-std::pair<std::vector<float>, std::vector<int>> topp_cuda(const std::vector<float>& probs, float p) {
-    topp_check(probs, p);
-    const int n = static_cast<int>(probs.size());
-    // Full sort via the naive top-k, then count the nucleus prefix on device
-    auto [d_vals, d_idxs] = topk_cuda(probs, n);
-    if (n == 0) return {{}, {}};
-
-    float* dsorted = nullptr;
-    int* dcount = nullptr;
-    int count[1] = {0};
-    if (cudaMalloc(&dsorted, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc sorted failed");
-    if (cudaMalloc(&dcount, sizeof(int)) != cudaSuccess) throw std::runtime_error("cudaMalloc count failed");
-    if (cudaMemcpy(dsorted, d_vals.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D sorted failed");
-
-    topp_count_kernel<<<1, 1>>>(dsorted, n, p, dcount);
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        throw std::runtime_error("topp kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
-    if (cudaMemcpy(count, dcount, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H count failed");
-
-    cudaFree(dsorted); cudaFree(dcount);
-    d_vals.resize(count[0]);
-    d_idxs.resize(count[0]);
-    return {std::move(d_vals), std::move(d_idxs)};
+void topp_count_launch(const float* sorted_vals, int n, float p, int* out_count) {
+    if (n <= 0) {
+        out_count[0] = 0;
+        return;
+    }
+    topp_count_kernel<<<1, 1>>>(sorted_vals, n, p, out_count);
+    check_launch("topp_count kernel launch");
 }
 
 // ---------------------------------------------------------------------------
-// Sampling helpers
+// argmax / temperature
 // ---------------------------------------------------------------------------
 
 // Single thread performs a linear argmax scan - the greedy decoding op.
@@ -161,67 +137,21 @@ __global__ void argmax_kernel(const float* x, int n, int* out) {
     out[0] = best;
 }
 
-// One thread per element: y[i] = x[i] / t.
-__global__ void temperature_kernel(const float* x, float* y, int n, float t) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = x[i] / t;
-}
-
-int argmax_cpu(const std::vector<float>& x) {
+long long argmax_cpu(const std::vector<float>& x) {
     if (x.empty())
         throw std::invalid_argument("argmax of empty vector");
-    int best = 0;
+    long long best = 0;
     for (size_t i = 1; i < x.size(); ++i)
-        if (x[i] > x[best]) best = (int)i;
+        if (x[i] > x[best]) best = (long long)i;
     return best;
 }
 
-int argmax_cuda(const std::vector<float>& x) {
-    if (x.empty())
-        throw std::invalid_argument("argmax of empty vector");
-    const int n = static_cast<int>(x.size());
-    float* dx = nullptr;
-    int* dout = nullptr;
-    int out[1] = {0};
-    if (cudaMalloc(&dx, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
-    if (cudaMalloc(&dout, sizeof(int)) != cudaSuccess) throw std::runtime_error("cudaMalloc out failed");
-    if (cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
-
-    argmax_kernel<<<1, 1>>>(dx, n, dout);
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        throw std::runtime_error("argmax kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
-    if (cudaMemcpy(out, dout, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H out failed");
-    cudaFree(dx); cudaFree(dout);
-    return out[0];
+void argmax_launch(const float* x, int n, int* out) {
+    if (n <= 0) return;
+    argmax_kernel<<<1, 1>>>(x, n, out);
+    check_launch("argmax kernel launch");
 }
 
-std::vector<float> temperature_cpu(const std::vector<float>& x, float t) {
-    if (!(t > 0.0f))
-        throw std::invalid_argument("temperature must be > 0");
-    std::vector<float> y(x.size());
-    for (size_t i = 0; i < x.size(); ++i) y[i] = x[i] / t;
-    return y;
-}
+// temperature_launch is implemented in activations.cu.
 
-std::vector<float> temperature_cuda(const std::vector<float>& x, float t) {
-    if (!(t > 0.0f))
-        throw std::invalid_argument("temperature must be > 0");
-    const int n = static_cast<int>(x.size());
-    if (n == 0) return {};
-    std::vector<float> y(n);
-    float *dx = nullptr, *dy = nullptr;
-    if (cudaMalloc(&dx, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc x failed");
-    if (cudaMalloc(&dy, n * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc y failed");
-    if (cudaMemcpy(dx, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("H2D x failed");
-
-    temperature_kernel<<<(n + 255) / 256, 256>>>(dx, dy, n, t);
-
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        throw std::runtime_error("temperature kernel failed: " + std::string(cudaGetErrorString(cudaGetLastError())));
-    if (cudaMemcpy(y.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("D2H y failed");
-    cudaFree(dx); cudaFree(dy);
-    return y;
-}
-
-}
+} // namespace fusedtok
