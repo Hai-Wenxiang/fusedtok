@@ -28,8 +28,9 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | Softmax（按行） | 数值稳定版 |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | 逐元素 |
 | ✅ | add / mul | 逐元素二元（融合加残差模式） |
-| ✅ | top-k / top-p（核采样） | 平局取先下标 |
+| ✅ | top-k / top-p（核采样） | radix-select，平局取先下标（131k 词表 1.4x） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
+| ✅ | sample_topp | 融合核采样：softmax -> top-p -> 种子抽取，单 kernel |
 | ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
 | ⏳ | INT8/FP8 量化路线 | v0.3 计划 |
 
@@ -107,7 +108,9 @@ values, indices = fusedtok.topk(logits, k=50)
 ```
 
 所有函数接受 float32 的 numpy 数组或 torch 张量（其他 dtype 会被拷贝转换），
-返回同族的 float32 输出。CUDA torch 张量会自动选择零拷贝路径。
+返回同族的 float32 输出。CUDA torch 张量会自动选择零拷贝路径；CUDA 张量
+也支持 **bfloat16** —— kernel 内部以 float32 计算、在读写边界转换
+（norm 权重自动升精度到 float32；采样/选择类算子保持 float32）。
 
 完整可运行的算子巡览见 `examples/demo.py`。
 
@@ -135,6 +138,22 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_results.json`，可用
 
 ![fusedtok 对比 PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
+**RTX 5060 Ti（Blackwell，sm_120）** —— 同套测试，torch 2.11/cu128，亮点：
+
+| 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
+|---|---|---:|---:|---:|
+| RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
+| RMSNorm（含残差） | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
+| Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
+| argmax | [32000] | 11 µs | 22 µs | **1.9x** |
+| LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
+
+![fusedtok 对比 PyTorch eager（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
+
+PyPI wheel 附带 sm_80/sm_86 原生 cubin 与 compute_86 PTX 回退 —— 已在
+Blackwell（sm_120）驱动上验证 JIT 运行正确。
+
 融合算子（RoPE / RMSNorm / SwiGLU）优势明显：eager 模式的中间张量要在显存间
 来回搬运。纯带宽受限的逐元素算子与 PyTorch 调优 kernel 跑出相同的
 ~330-500 GB/s（silu、gelu、add ≈ 持平）。Softmax 与 top-k 仍落后于 PyTorch
@@ -161,9 +180,10 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 
 ## 路线图
 
-- v0.2：bf16 支持、radix-select top-k/top-p（CUB 级速度）、融合采样
-  （softmax+top-p+抽样单趟完成）、CUDA graph 友好批处理
-- v0.3：INT8/FP8 量化路线、block size 自动调优
+- v0.2（已完成）：bf16 零拷贝、radix-select top-k/top-p、融合核采样、
+  单读 softmax、CUDA graph 验证
+- v0.3：INT8/FP8 量化路线、merge-sort 选择（CUB 级）、bf16x2 向量化、
+  block size 自动调优
 - v0.4+：轻量融合 attention；PyPI 预编译 wheel
 
 ## 社区

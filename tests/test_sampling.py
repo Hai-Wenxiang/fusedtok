@@ -134,6 +134,98 @@ def test_rep_penalty_zero_and_empty():
 
 
 @pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
+class TestRadixSelect:
+    """Targeted coverage for the radix-select GPU path (v0.2).
+
+    The radix kernel replaces the per-round selection loop; these cases pin
+    the semantics that are easiest to break: heavy ties, boundary sizes
+    around the shared/global bitonic cutover (m <= 2048 vs above), k = 1,
+    k = n, and workspace reuse across calls with different k.
+    """
+
+    def test_heavy_ties_earliest_indices(self):
+        # thousands of identical values: boundary falls inside one big tie
+        x = np.full(5000, 0.5, dtype=np.float32)
+        x[::7] = 1.0          # a few strictly larger
+        x[3::11] = -0.5
+        v, i = fusedtok.topk(x, 64, cuda=True)
+        ref_v, ref_i = fusedtok.topk(x, 64)
+        assert v == pytest.approx(ref_v, abs=1e-6)
+        assert i.tolist() == ref_i.tolist()   # ties -> earliest index, exact
+
+    def test_ties_span_boundary(self):
+        # tie group straddles the k-th position exactly
+        x = np.zeros(1000, dtype=np.float32)
+        x[:100] = 2.0                        # top group
+        x[100:300] = 1.0                     # tie group around the boundary
+        v, i = fusedtok.topk(x, 150, cuda=True)
+        ref_v, ref_i = fusedtok.topk(x, 150)
+        assert i.tolist() == ref_i.tolist()
+
+    def test_k1_equals_argmax(self):
+        rng = np.random.default_rng(10)
+        x = rng.standard_normal(4096).astype(np.float32)
+        v, i = fusedtok.topk(x, 1, cuda=True)
+        assert i[0] == fusedtok.argmax(x, cuda=True)
+        assert v[0] == pytest.approx(x.max(), abs=1e-6)
+
+    def test_full_sort_non_power_of_two(self):
+        # k = n exercises emit + sort with padding; 4097 is not a power of 2
+        rng = np.random.default_rng(11)
+        x = rng.standard_normal(4097).astype(np.float32)
+        v, i = fusedtok.topk(x, 4097, cuda=True)
+        assert v == pytest.approx(np.sort(x)[::-1], abs=1e-5)
+        assert (np.diff(v) <= 1e-6).all()
+
+    def test_across_bitonic_cutover(self):
+        # m pads to 2048 (shared path) and 4096 (global path): both must agree
+        rng = np.random.default_rng(12)
+        x = rng.standard_normal(5000).astype(np.float32)
+        for k in (2047, 2048, 2049, 3000):
+            v, i = fusedtok.topk(x, k, cuda=True)
+            ref_v, ref_i = fusedtok.topk(x, k)
+            assert i.tolist() == ref_i.tolist(), f"k={k}"
+
+    def test_workspace_growth_across_calls(self):
+        # same process, increasing then decreasing k: the process-cached
+        # key buffer must serve every call correctly
+        rng = np.random.default_rng(13)
+        x = rng.standard_normal(9000).astype(np.float32)
+        for k in (5, 700, 8000, 33, 8000):
+            v, i = fusedtok.topk(x, k, cuda=True)
+            ref_v, ref_i = fusedtok.topk(x, k)
+            assert v == pytest.approx(ref_v, abs=1e-5), f"k={k}"
+            assert i.tolist() == ref_i.tolist(), f"k={k}"
+
+    def test_large_vocab(self):
+        # realistic LLM vocabulary size (global bitonic path)
+        rng = np.random.default_rng(14)
+        x = rng.standard_normal(131072).astype(np.float32)
+        v, i = fusedtok.topk(x, 50, cuda=True)
+        ref_v, ref_i = fusedtok.topk(x, 50)
+        assert v == pytest.approx(ref_v, abs=1e-5)
+        assert i.tolist() == ref_i.tolist()
+
+    def test_all_negative_values(self):
+        # negative-only range exercises the flipped mantissa ordering
+        rng = np.random.default_rng(15)
+        x = -rng.uniform(0.1, 5.0, 7000).astype(np.float32)
+        v, i = fusedtok.topk(x, 100, cuda=True)
+        ref_v, ref_i = fusedtok.topk(x, 100)
+        assert v == pytest.approx(ref_v, abs=1e-5)
+        assert i.tolist() == ref_i.tolist()
+
+    def test_topp_nucleus_matches_reference(self):
+        rng = np.random.default_rng(16)
+        p = rng.random(20000).astype(np.float32)
+        p /= p.sum()
+        v, i = fusedtok.topp(p, 0.9, cuda=True)
+        ref_v, ref_i = fusedtok.topp(p, 0.9)
+        assert v == pytest.approx(ref_v, abs=1e-5)
+        assert i.tolist() == ref_i.tolist()
+
+
+@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
 class TestCuda:
     def test_topk_matches_cpu(self):
         rng = np.random.default_rng(2)

@@ -19,6 +19,7 @@
 #include <pybind11/numpy.h>
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <cstdint>
 #include <cstring>
@@ -286,6 +287,59 @@ PYBIND11_MODULE(_fusedtok, m) {
         ft::swiglu_launch(df(g), df(u), dfm(out), n); }, py::arg("gate"), py::arg("up"),
         py::arg("out"), py::arg("n"));
 
+    // bf16 zero-copy launchers (torch bf16 tensors; compute stays float32)
+    using BF = __nv_bfloat16;
+    auto dbf = [](py::int_ p) { return reinterpret_cast<const BF*>((uintptr_t)p); };
+    auto dbfm = [](py::int_ p) { return reinterpret_cast<BF*>((uintptr_t)p); };
+    m.def("silu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::silu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("gelu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::gelu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("gelu_tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::gelu_tanh_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("relu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::relu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::tanh_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("sigmoid_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::sigmoid_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("add_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n) {
+        ft::add_launch_bf16(dbf(a), dbf(b), dbfm(out), n); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"));
+    m.def("mul_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n) {
+        ft::mul_launch_bf16(dbf(a), dbf(b), dbfm(out), n); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"));
+    m.def("swiglu_launch_bf16", [dbf, dbfm](py::int_ g, py::int_ u, py::int_ out, long long n) {
+        ft::swiglu_launch_bf16(dbf(g), dbf(u), dbfm(out), n); }, py::arg("gate"), py::arg("up"),
+        py::arg("out"), py::arg("n"));
+    m.def("rmsnorm_launch_bf16", [dbf, dbfm](py::int_ x, py::int_ w, py::object r,
+                                             py::int_ out, int rows, int cols, float eps) {
+        const float* rp_f = nullptr;   // residual is bf16 like x
+        const BF* rp = r.is_none()
+            ? nullptr
+            : reinterpret_cast<const BF*>((uintptr_t)py::int_(r));
+        ft::rmsnorm_launch_bf16(dbf(x), df(w), rp, dbfm(out), rows, cols, eps);
+    }, py::arg("x"), py::arg("weight"), py::arg("residual"), py::arg("out"),
+       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+    m.def("layernorm_launch_bf16", [dbf, dbfm](py::int_ x, py::int_ w, py::int_ b,
+                                               py::int_ out, int rows, int cols, float eps) {
+        ft::layernorm_launch_bf16(dbf(x), df(w), df(b), dbfm(out), rows, cols, eps);
+    }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
+       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+    m.def("softmax_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int rows, int cols) {
+        ft::softmax_launch_bf16(dbf(in), dbfm(out), rows, cols);
+    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("cols"));
+    m.def("rope_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int seq, int dim,
+                                          double theta, int pos_offset) {
+        ft::rope_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset);
+    }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta"), py::arg("pos_offset"));
+    m.def("rope_neox_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int seq, int dim,
+                                               double theta, int pos_offset) {
+        ft::rope_neox_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset);
+    }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta"), py::arg("pos_offset"));
+
     // ==================================================================
     // RMSNorm / LayerNorm / softmax (row-major 2-D)
     // ==================================================================
@@ -483,6 +537,13 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("neox"), py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
        py::arg("theta"), py::arg("pos_offset"));
 
+    // explicit-layout aliases (float32)
+    m.def("rope_neox_launch", [](py::int_ in, py::int_ out, int seq, int dim,
+                                 double theta, int pos_offset) {
+        ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
+    }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta"), py::arg("pos_offset"));
+
     // ==================================================================
     // Sampling / logits post-processing
     // ==================================================================
@@ -624,4 +685,45 @@ PYBIND11_MODULE(_fusedtok, m) {
         ft::repetition_penalty_launch(df(logits), dll(ids), n, m, penalty, dfm(out));
     }, py::arg("logits"), py::arg("token_ids"), py::arg("out"), py::arg("n"),
        py::arg("m"), py::arg("penalty"));
+
+    // ==================================================================
+    // fused nucleus sampling: softmax -> nucleus -> inverse-CDF draw
+    // ==================================================================
+    m.def("sample_topp_cpu", [](FArray logits, double p, double t,
+                                unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_topp_cpu(to_vec(logits), (float)p, (float)t, seed);
+    }, py::arg("logits"), py::arg("p"), py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_topp", [](FArray logits, double p, double t,
+                            unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(p > 0.0 && p <= 1.0))
+            throw std::invalid_argument("p must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_topp_launch(dx.fget(), n,
+                                                       (float)p, (float)t, seed);
+        sync_device("sample kernel");
+        return token;
+    }, py::arg("logits"), py::arg("p"), py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    // Zero-copy torch path: device pointer in, token out (the one-int
+    // readback is inherent to returning a host value).
+    m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
+                                   unsigned long long seed) -> long long {
+        if (!(p > 0.0 && p <= 1.0))
+            throw std::invalid_argument("p must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_topp_launch(df(x), n, (float)p, (float)t, seed);
+    }, py::arg("logits"), py::arg("n"), py::arg("p"), py::arg("t"),
+       py::arg("seed"));
 }

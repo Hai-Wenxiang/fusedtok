@@ -1,11 +1,14 @@
 // RoPE (Rotary Position Embedding), interleaved and NeoX (rotate_half)
 // layouts, with an optional position offset for kv-cache decoding.
+// Templated on storage dtype (float32 compute, bf16 converts at the
+// load/store boundary).
 
 #include "fusedtok/fusedtok.hpp"
 #include "fusedtok/cuda_launch.hpp"
 #include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -32,7 +35,8 @@ void rope_check(const std::vector<float>& q, const std::vector<float>* k,
 // computed as exp2f(-(2j/dim) * log2(theta)) - a fast hardware-friendly
 // rewrite of powf with the same value semantics - and the rotation uses a
 // single sincosf call for both trig components.
-__global__ void rope_kernel(const float* x, float* y, int seq, int dim,
+template <typename T>
+__global__ void rope_kernel(const T* x, T* y, int seq, int dim,
                             float theta, int pos_offset) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;   // global pair index
     int pairs_per_row = dim / 2;
@@ -48,17 +52,18 @@ __global__ void rope_kernel(const float* x, float* y, int seq, int dim,
     float c, s;
     sincosf(angle, &s, &c);
 
-    int even = row * dim + 2 * j;
-    int odd = even + 1;
-    float xe = x[even];
-    float xo = x[odd];
-    y[even] = xe * c - xo * s;
-    y[odd] = xe * s + xo * c;
+    const long long even = (long long)row * dim + 2 * j;
+    const long long odd = even + 1;
+    float xe = ld_f(x, even);
+    float xo = ld_f(x, odd);
+    st_f(y, even, xe * c - xo * s);
+    st_f(y, odd, xe * s + xo * c);
 }
 
 // One thread per (position, j): pairs row halves instead of adjacent
 // elements. Same frequency computation as the interleaved variant.
-__global__ void rope_neox_kernel(const float* x, float* y, int seq, int dim,
+template <typename T>
+__global__ void rope_neox_kernel(const T* x, T* y, int seq, int dim,
                                  float theta, int pos_offset) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;   // global j index
     int half = dim / 2;
@@ -74,12 +79,12 @@ __global__ void rope_neox_kernel(const float* x, float* y, int seq, int dim,
     float c, s;
     sincosf(angle, &s, &c);
 
-    int i1 = row * dim + j;          // first half element
-    int i2 = row * dim + half + j;   // matching second half element
-    float x1 = x[i1];
-    float x2 = x[i2];
-    y[i1] = x1 * c - x2 * s;
-    y[i2] = x1 * s + x2 * c;
+    const long long i1 = (long long)row * dim + j;          // first half
+    const long long i2 = i1 + half;                          // second half
+    float x1 = ld_f(x, i1);
+    float x2 = ld_f(x, i2);
+    st_f(y, i1, x1 * c - x2 * s);
+    st_f(y, i2, x1 * s + x2 * c);
 }
 
 } // namespace
@@ -138,18 +143,36 @@ void rope_launch(const float* x, float* y, int seq, int dim, float theta,
                  int pos_offset) {
     if (seq <= 0 || dim <= 0) return;
     int pairs = seq * (dim / 2);
-    rope_kernel<<<(pairs + kBlock - 1) / kBlock, kBlock>>>(
+    rope_kernel<float><<<(pairs + kBlock - 1) / kBlock, kBlock>>>(
         x, y, seq, dim, theta, pos_offset);
     check_launch("rope kernel launch");
+}
+
+void rope_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, int seq,
+                      int dim, float theta, int pos_offset) {
+    if (seq <= 0 || dim <= 0) return;
+    int pairs = seq * (dim / 2);
+    rope_kernel<__nv_bfloat16><<<(pairs + kBlock - 1) / kBlock, kBlock>>>(
+        x, y, seq, dim, theta, pos_offset);
+    check_launch("rope bf16 kernel launch");
 }
 
 void rope_neox_launch(const float* x, float* y, int seq, int dim, float theta,
                       int pos_offset) {
     if (seq <= 0 || dim <= 0) return;
     int threads_needed = seq * (dim / 2);
-    rope_neox_kernel<<<(threads_needed + kBlock - 1) / kBlock, kBlock>>>(
+    rope_neox_kernel<float><<<(threads_needed + kBlock - 1) / kBlock, kBlock>>>(
         x, y, seq, dim, theta, pos_offset);
     check_launch("rope_neox kernel launch");
+}
+
+void rope_neox_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, int seq,
+                           int dim, float theta, int pos_offset) {
+    if (seq <= 0 || dim <= 0) return;
+    int threads_needed = seq * (dim / 2);
+    rope_neox_kernel<__nv_bfloat16><<<(threads_needed + kBlock - 1) / kBlock, kBlock>>>(
+        x, y, seq, dim, theta, pos_offset);
+    check_launch("rope_neox bf16 kernel launch");
 }
 
 } // namespace fusedtok

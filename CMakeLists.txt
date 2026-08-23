@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(fusedtok VERSION 0.1.2 LANGUAGES CXX CUDA)
+project(fusedtok VERSION 0.2.0 LANGUAGES CXX CUDA)
 
 # C++17 for host code; CUDA follows via nvcc default
 set(CMAKE_CXX_STANDARD 17)
@@ -15,6 +15,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(FUSEDTOK_CUDA_ARCHITECTURES "80-real;86-real;86-virtual" CACHE STRING
     "CUDA architectures fusedtok compiles for")
 set(CMAKE_CUDA_ARCHITECTURES ${FUSEDTOK_CUDA_ARCHITECTURES})
+
+if(NOT DEFINED CMAKE_CUDA_FLAGS)
+    set(CMAKE_CUDA_FLAGS "-lineinfo")
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 # pybind11 provided by pip; pass its cmake dir via CMAKE_PREFIX_PATH

@@ -30,7 +30,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 __all__ = [
     "cuda_available",
@@ -98,6 +98,23 @@ def _check_torch_f32(t, name):
         raise ValueError(f"{name} must be contiguous")
 
 
+def _check_torch_float(t, name):
+    """Accept float32 or bfloat16 (the two dtypes with CUDA kernels)."""
+    if t.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(f"{name} must be float32 or bfloat16, got {t.dtype}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _norm_weight_f32(weight, ref):
+    """Norm weights must reach the kernel as float32 (they commonly are in
+    checkpoints, and the bf16 kernels read them as float). Small [cols]
+    upcast copy when the caller hands us bf16."""
+    if weight.dtype is torch.float32:
+        return weight
+    return weight.to(torch.float32)
+
+
 def _as_numpy(x, name):
     """Anything -> float32 C-contiguous numpy array (copy only if needed)."""
     if isinstance(x, np.ndarray):
@@ -127,12 +144,15 @@ def _device_path(x, cuda):
 # ---------------------------------------------------------------------------
 
 
-def _unary(x, cuda, staged, cpu, launch):
+def _unary(x, cuda, staged, cpu, launch, launch_bf16=None):
     path = _device_path(x, cuda)
     if path == "torch-cuda":
-        _check_torch_f32(x, "x")
+        _check_torch_float(x, "x")
         out = torch.empty_like(x)
-        launch(x.data_ptr(), out.data_ptr(), x.numel())
+        if x.dtype is torch.bfloat16 and launch_bf16 is not None:
+            launch_bf16(x.data_ptr(), out.data_ptr(), x.numel())
+        else:
+            launch(x.data_ptr(), out.data_ptr(), x.numel())
         return out
     arr = _as_numpy(x, "x")
     res = staged(arr) if path == "staged" else cpu(arr)
@@ -142,37 +162,37 @@ def _unary(x, cuda, staged, cpu, launch):
 def silu(x, *, cuda=False):
     """SiLU / Swish activation: ``v * sigmoid(v)``."""
     return _unary(x, cuda, _fusedtok.silu, _fusedtok.silu_cpu,
-                  _fusedtok.silu_launch)
+                  _fusedtok.silu_launch, _fusedtok.silu_launch_bf16)
 
 
 def gelu(x, *, cuda=False):
     """GeLU activation, exact erf form: ``0.5 v (1 + erf(v / sqrt(2)))``."""
     return _unary(x, cuda, _fusedtok.gelu, _fusedtok.gelu_cpu,
-                  _fusedtok.gelu_launch)
+                  _fusedtok.gelu_launch, _fusedtok.gelu_launch_bf16)
 
 
 def gelu_tanh(x, *, cuda=False):
     """GeLU activation, tanh approximation (BERT/GPT checkpoint variant)."""
     return _unary(x, cuda, _fusedtok.gelu_tanh, _fusedtok.gelu_tanh_cpu,
-                  _fusedtok.gelu_tanh_launch)
+                  _fusedtok.gelu_tanh_launch, _fusedtok.gelu_tanh_launch_bf16)
 
 
 def relu(x, *, cuda=False):
     """ReLU activation: ``max(v, 0)``."""
     return _unary(x, cuda, _fusedtok.relu, _fusedtok.relu_cpu,
-                  _fusedtok.relu_launch)
+                  _fusedtok.relu_launch, _fusedtok.relu_launch_bf16)
 
 
 def tanh(x, *, cuda=False):
     """Hyperbolic tangent activation."""
     return _unary(x, cuda, _fusedtok.tanh, _fusedtok.tanh_cpu,
-                  _fusedtok.tanh_launch)
+                  _fusedtok.tanh_launch, _fusedtok.tanh_launch_bf16)
 
 
 def sigmoid(x, *, cuda=False):
     """Logistic sigmoid: ``1 / (1 + exp(-v))``."""
     return _unary(x, cuda, _fusedtok.sigmoid, _fusedtok.sigmoid_cpu,
-                  _fusedtok.sigmoid_launch)
+                  _fusedtok.sigmoid_launch, _fusedtok.sigmoid_launch_bf16)
 
 
 def temperature(x, t, *, cuda=False):
@@ -211,16 +231,21 @@ def axpy(x, a=1.0, b=0.0, *, cuda=False):
 # ---------------------------------------------------------------------------
 
 
-def _binary(a, b, cuda, staged, cpu, launch, name):
+def _binary(a, b, cuda, staged, cpu, launch, name, launch_bf16=None):
     if _is_torch(a) and a.is_cuda:
         if not (_is_torch(b) and b.is_cuda):
             raise TypeError("both inputs must be CUDA tensors")
-        _check_torch_f32(a, name)
-        _check_torch_f32(b, name)
+        _check_torch_float(a, name)
+        _check_torch_float(b, name)
+        if a.dtype is not b.dtype:
+            raise TypeError("inputs must have the same dtype")
         if a.shape != b.shape:
             raise ValueError("inputs must have the same shape")
         out = torch.empty_like(a)
-        launch(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel())
+        if a.dtype is torch.bfloat16 and launch_bf16 is not None:
+            launch_bf16(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel())
+        else:
+            launch(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel())
         return out
     arr_a = _as_numpy(a, name)
     arr_b = _as_numpy(b, name)
@@ -233,19 +258,19 @@ def _binary(a, b, cuda, staged, cpu, launch, name):
 def add(a, b, *, cuda=False):
     """Elementwise ``a + b`` (the fused add + residual pattern)."""
     return _binary(a, b, cuda, _fusedtok.add, _fusedtok.add_cpu,
-                   _fusedtok.add_launch, "a")
+                   _fusedtok.add_launch, "a", _fusedtok.add_launch_bf16)
 
 
 def mul(a, b, *, cuda=False):
     """Elementwise ``a * b``."""
     return _binary(a, b, cuda, _fusedtok.mul, _fusedtok.mul_cpu,
-                   _fusedtok.mul_launch, "a")
+                   _fusedtok.mul_launch, "a", _fusedtok.mul_launch_bf16)
 
 
 def swiglu(gate, up, *, cuda=False):
     """SwiGLU activation: ``silu(gate) * up``."""
     return _binary(gate, up, cuda, _fusedtok.swiglu, _fusedtok.swiglu_cpu,
-                   _fusedtok.swiglu_launch, "gate")
+                   _fusedtok.swiglu_launch, "gate", _fusedtok.swiglu_launch_bf16)
 
 
 # ---------------------------------------------------------------------------
@@ -262,22 +287,28 @@ def rmsnorm(x, weight, *, residual=None, eps=1e-6, cuda=False):
     """
     path = _device_path(x, cuda)
     if path == "torch-cuda":
-        _check_torch_f32(x, "x")
+        _check_torch_float(x, "x")
         if not (_is_torch(weight) and weight.is_cuda):
             raise TypeError("weight must be a CUDA tensor when x is on CUDA")
-        _check_torch_f32(weight, "weight")
+        weight = _norm_weight_f32(weight, x)
         r_ptr = None
         if residual is not None:
             if not (_is_torch(residual) and residual.is_cuda):
                 raise TypeError("residual must be a CUDA tensor when x is on CUDA")
-            _check_torch_f32(residual, "residual")
+            _check_torch_float(residual, "residual")
+            if residual.dtype is not x.dtype:
+                raise TypeError("residual must have the same dtype as x")
             if residual.shape != x.shape:
                 raise ValueError("residual must have the same shape as x")
             r_ptr = residual.data_ptr()
         rows, cols = _shape_rows_cols(x)
         out = torch.empty_like(x)
-        _fusedtok.rmsnorm_launch(x.data_ptr(), weight.data_ptr(), r_ptr,
-                                 out.data_ptr(), rows, cols, eps)
+        if x.dtype is torch.bfloat16:
+            _fusedtok.rmsnorm_launch_bf16(x.data_ptr(), weight.data_ptr(),
+                                          r_ptr, out.data_ptr(), rows, cols, eps)
+        else:
+            _fusedtok.rmsnorm_launch(x.data_ptr(), weight.data_ptr(), r_ptr,
+                                     out.data_ptr(), rows, cols, eps)
         return out
     arr_x = _as_numpy(x, "x")
     res = (
@@ -309,16 +340,22 @@ def layernorm(x, weight, bias, *, eps=1e-6, cuda=False):
     """
     path = _device_path(x, cuda)
     if path == "torch-cuda":
-        _check_torch_f32(x, "x")
-        for name, t in (("weight", weight), ("bias", bias)):
-            if not (_is_torch(t) and t.is_cuda):
+        _check_torch_float(x, "x")
+        for name, tv in (("weight", weight), ("bias", bias)):
+            if not (_is_torch(tv) and tv.is_cuda):
                 raise TypeError(f"{name} must be a CUDA tensor when x is on CUDA")
-            _check_torch_f32(t, name)
+        weight = _norm_weight_f32(weight, x)
+        bias = _norm_weight_f32(bias, x)
         rows, cols = _shape_rows_cols(x)
         out = torch.empty_like(x)
-        _fusedtok.layernorm_launch(x.data_ptr(), weight.data_ptr(),
-                                   bias.data_ptr(), out.data_ptr(),
-                                   rows, cols, eps)
+        if x.dtype is torch.bfloat16:
+            _fusedtok.layernorm_launch_bf16(x.data_ptr(), weight.data_ptr(),
+                                            bias.data_ptr(), out.data_ptr(),
+                                            rows, cols, eps)
+        else:
+            _fusedtok.layernorm_launch(x.data_ptr(), weight.data_ptr(),
+                                       bias.data_ptr(), out.data_ptr(),
+                                       rows, cols, eps)
         return out
     arr_x = _as_numpy(x, "x")
     args = (arr_x, _as_numpy(weight, "weight"), _as_numpy(bias, "bias"), eps)
@@ -330,10 +367,13 @@ def softmax(x, *, cuda=False):
     """Row-wise numerically stable softmax over the last dimension."""
     path = _device_path(x, cuda)
     if path == "torch-cuda":
-        _check_torch_f32(x, "x")
+        _check_torch_float(x, "x")
         rows, cols = _shape_rows_cols(x)
         out = torch.empty_like(x)
-        _fusedtok.softmax_launch(x.data_ptr(), out.data_ptr(), rows, cols)
+        if x.dtype is torch.bfloat16:
+            _fusedtok.softmax_launch_bf16(x.data_ptr(), out.data_ptr(), rows, cols)
+        else:
+            _fusedtok.softmax_launch(x.data_ptr(), out.data_ptr(), rows, cols)
         return out
     arr_x = _as_numpy(x, "x")
     res = _fusedtok.softmax(arr_x) if path == "staged" else _fusedtok.softmax_cpu(arr_x)
@@ -360,7 +400,7 @@ def rope(q, k=None, *, theta=10000.0, pos_offset=0, neox=False, cuda=False):
     """
     path = _device_path(q, cuda)
     if path == "torch-cuda":
-        _check_torch_f32(q, "q")
+        _check_torch_float(q, "q")
         if q.ndim != 2:
             raise ValueError("q must be 2-D [seq, dim]")
         seq, dim = q.shape
@@ -373,11 +413,21 @@ def rope(q, k=None, *, theta=10000.0, pos_offset=0, neox=False, cuda=False):
         if k is not None:
             if not (_is_torch(k) and k.is_cuda):
                 raise TypeError("k must be a CUDA tensor when q is on CUDA")
-            _check_torch_f32(k, "k")
+            _check_torch_float(k, "k")
+            if k.dtype is not q.dtype:
+                raise TypeError("k must have the same dtype as q")
             if k.shape != q.shape:
                 raise ValueError("k must have the same shape as q")
             k_out = torch.empty_like(k)
-        _launch_rope = _fusedtok.rope_launch
+        if q.dtype is torch.bfloat16:
+            def _launch_rope(neox_flag, src, dst, s, d, th, off):
+                if neox_flag:
+                    _fusedtok.rope_neox_launch_bf16(src, dst, s, d, th, off)
+                else:
+                    _fusedtok.rope_launch_bf16(src, dst, s, d, th, off)
+        else:
+            def _launch_rope(neox_flag, src, dst, s, d, th, off):
+                _fusedtok.rope_launch(neox_flag, src, dst, s, d, th, off)
         _launch_rope(neox, q.data_ptr(), q_out.data_ptr(), seq, dim,
                      theta, pos_offset)
         if k_out is not None:
@@ -515,3 +565,32 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
             else _fusedtok.repetition_penalty_cpu)
     res = call(arr, ids, penalty)
     return _numpy_to_torch_like(res, logits) if _is_torch(logits) else res
+
+
+def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
+    """Fused nucleus sampling: one GPU round trip from raw logits to a token.
+
+    Pipeline (single cooperative kernel): softmax(logits / temperature) ->
+    truncate to the smallest top-p nucleus -> inverse-CDF draw using a
+    hash-uniform of ``seed``. Deterministic per seed; the RNG is a
+    splitmix-style hash (reproducible, NOT cryptographically secure).
+
+    Returns the sampled token id (int). ``p`` in (0, 1], temperature > 0.
+    """
+    if not 0.0 < p <= 1.0:
+        raise ValueError("p must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_topp_launch(logits.data_ptr(),
+                                                logits.numel(), p,
+                                                temperature, seed))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = _fusedtok.sample_topp if path == "staged" else _fusedtok.sample_topp_cpu
+    return int(call(arr, p, temperature, seed))

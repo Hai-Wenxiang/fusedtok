@@ -28,8 +28,9 @@ traffic and launch overhead.
 | ✅ | Softmax (row-wise) | numerically stable |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
 | ✅ | add / mul | elementwise binary (fused add+residual pattern) |
-| ✅ | top-k / top-p (nucleus) | deterministic ties |
+| ✅ | top-k / top-p (nucleus) | radix-select, deterministic ties (1.4x vs torch @131k) |
 | ✅ | argmax / temperature | greedy decoding helpers |
+| ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, one kernel |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
 | ⏳ | INT8/FP8 quantized path | planned v0.3 |
 
@@ -113,6 +114,9 @@ values, indices = fusedtok.topk(logits, k=50)
 
 Every function accepts float32 numpy arrays or torch tensors (other dtypes
 are converted with a copy) and returns float32 outputs of the same family.
+CUDA torch tensors may also be **bfloat16** - the kernels compute in float32
+and convert at the load/store boundary (norm weights are upcast to float32
+automatically; sampling/selection ops stay float32).
 CUDA torch tensors select the zero-copy path automatically.
 
 See `examples/demo.py` for a runnable tour of every operator.
@@ -141,6 +145,22 @@ reproduce with `python benchmarks/bench.py`):
 
 ![fusedtok vs PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
+**RTX 5060 Ti (Blackwell, sm_120)** — same suite, torch 2.11/cu128, highlights:
+
+| Op | Shape | fusedtok | PyTorch eager | Speedup |
+|---|---|---:|---:|---:|
+| RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
+| RMSNorm (+residual) | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
+| Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
+| argmax | [32000] | 11 µs | 22 µs | **1.9x** |
+| LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
+
+![fusedtok vs PyTorch eager (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
+
+The PyPI wheel ships sm_80/sm_86 cubins plus a compute_86 PTX fallback —
+verified to JIT and run correctly on Blackwell (sm_120) drivers.
+
 Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
 intermediate tensors through global memory. Pure memory-bound elementwise ops
 run at the same ~330-500 GB/s as PyTorch's tuned kernels (silu, gelu, add ≈
@@ -168,9 +188,10 @@ suite on every push.
 
 ## Roadmap
 
-- v0.2: bf16 support, radix-select top-k/top-p (CUB-class speed), fused
-  sampling (softmax+top-p+draw in one pass), CUDA graph-friendly batching
-- v0.3: INT8/FP8 quantized paths, block-size autotuning
+- v0.2 (done): bf16 zero-copy, radix-select top-k/top-p, fused nucleus
+  sampling, single-read softmax, CUDA-graph verified
+- v0.3: INT8/FP8 quantized paths, merge-sort selection (CUB-class),
+  bf16x2 vectorized elementwise, block-size autotuning
 - v0.4+: lightweight fused attention; prebuilt wheels on PyPI
 
 ## Community
