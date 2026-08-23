@@ -60,6 +60,22 @@ class TestCuda:
         assert fusedtok.softmax(x, cuda=True) == pytest.approx(
             fusedtok.softmax(x), abs=1e-5)
 
+    @pytest.mark.parametrize("cols", [8191, 8192, 8193, 16384])
+    def test_kernel_cutover_widths(self, cols):
+        # 8192 = exactly kSmPerThread * kSmBlock (register path boundary);
+        # 8193+ switches to the online streaming kernel. Both must match
+        # the CPU reference within the fast-exp tolerance.
+        rng = np.random.default_rng(cols)
+        x = (rng.standard_normal((4, cols)) * 3).astype(np.float32)
+        gpu = fusedtok.softmax(x, cuda=True)
+        cpu = fusedtok.softmax(x)
+        # __expf is a fast approximation; worst-case relative drift vs the
+        # exact-exp CPU reference is ~2.4e-5 on rows dominated by one
+        # extreme element (both float32 accumulation orders contribute).
+        # Typical rows match far below 1e-6.
+        assert gpu == pytest.approx(cpu, rel=3e-5, abs=1e-6)
+        assert np.isfinite(gpu).all()
+
 
 @pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()), reason="no torch/GPU")
 class TestTorchZeroCopy:
