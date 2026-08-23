@@ -30,6 +30,7 @@ traffic and launch overhead.
 | ✅ | add / mul | elementwise binary (fused add+residual pattern) |
 | ✅ | top-k / top-p (nucleus) | radix-select, deterministic ties (1.4x vs torch @131k) |
 | ✅ | argmax / temperature | greedy decoding helpers |
+| ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, one kernel |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
 | ⏳ | INT8/FP8 quantized path | planned v0.3 |
 

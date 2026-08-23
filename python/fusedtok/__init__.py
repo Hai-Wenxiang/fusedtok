@@ -515,3 +515,32 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
             else _fusedtok.repetition_penalty_cpu)
     res = call(arr, ids, penalty)
     return _numpy_to_torch_like(res, logits) if _is_torch(logits) else res
+
+
+def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
+    """Fused nucleus sampling: one GPU round trip from raw logits to a token.
+
+    Pipeline (single cooperative kernel): softmax(logits / temperature) ->
+    truncate to the smallest top-p nucleus -> inverse-CDF draw using a
+    hash-uniform of ``seed``. Deterministic per seed; the RNG is a
+    splitmix-style hash (reproducible, NOT cryptographically secure).
+
+    Returns the sampled token id (int). ``p`` in (0, 1], temperature > 0.
+    """
+    if not 0.0 < p <= 1.0:
+        raise ValueError("p must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_topp_launch(logits.data_ptr(),
+                                                logits.numel(), p,
+                                                temperature, seed))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = _fusedtok.sample_topp if path == "staged" else _fusedtok.sample_topp_cpu
+    return int(call(arr, p, temperature, seed))

@@ -16,6 +16,10 @@ set(FUSEDTOK_CUDA_ARCHITECTURES "80-real;86-real;86-virtual" CACHE STRING
     "CUDA architectures fusedtok compiles for")
 set(CMAKE_CUDA_ARCHITECTURES ${FUSEDTOK_CUDA_ARCHITECTURES})
 
+if(NOT DEFINED CMAKE_CUDA_FLAGS)
+    set(CMAKE_CUDA_FLAGS "-lineinfo")
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 # pybind11 provided by pip; pass its cmake dir via CMAKE_PREFIX_PATH
 # (or it is injected by scikit-build-core during packaged builds)

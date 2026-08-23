@@ -30,6 +30,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | add / mul | 逐元素二元（融合加残差模式） |
 | ✅ | top-k / top-p（核采样） | radix-select，平局取先下标（131k 词表 1.4x） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
+| ✅ | sample_topp | 融合核采样：softmax -> top-p -> 种子抽取，单 kernel |
 | ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
 | ⏳ | INT8/FP8 量化路线 | v0.3 计划 |
 

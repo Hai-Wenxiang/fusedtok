@@ -75,4 +75,16 @@ std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
                                           const std::vector<long long>& token_ids,
                                           float penalty);
 
+// ---------------------------------------------------------------------------
+// Fused nucleus sampling (deterministic per seed):
+//   probs = softmax(logits / t); nucleus = smallest top-p prefix;
+//   u = uniform hash of seed; return the token where the nucleus cumulative
+//   probability reaches u. The RNG is a splitmix-style hash - deterministic
+//   and reproducible, NOT cryptographically secure.
+// Returns the sampled token id.
+// ---------------------------------------------------------------------------
+
+long long sample_topp_cpu(const std::vector<float>& logits,
+                          float p, float t, unsigned long long seed);
+
 } // namespace fusedtok
