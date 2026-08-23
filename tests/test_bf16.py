@@ -18,7 +18,6 @@ pytestmark = pytest.mark.skipif(
     reason="no torch / no GPU")
 
 
-@requires_gpu
 class TestBf16:
     def _pair(self, *shape, seed=0):
         g = torch.Generator(device="cpu").manual_seed(seed)
