@@ -28,7 +28,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | Softmax（按行） | 数值稳定版 |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | 逐元素 |
 | ✅ | add / mul | 逐元素二元（融合加残差模式） |
-| ✅ | top-k / top-p（核采样） | 平局取先下标 |
+| ✅ | top-k / top-p（核采样） | radix-select，平局取先下标（131k 词表 1.4x） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
 | ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
 | ⏳ | INT8/FP8 量化路线 | v0.3 计划 |

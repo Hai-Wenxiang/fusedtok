@@ -28,7 +28,7 @@ traffic and launch overhead.
 | ✅ | Softmax (row-wise) | numerically stable |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
 | ✅ | add / mul | elementwise binary (fused add+residual pattern) |
-| ✅ | top-k / top-p (nucleus) | deterministic ties |
+| ✅ | top-k / top-p (nucleus) | radix-select, deterministic ties (1.4x vs torch @131k) |
 | ✅ | argmax / temperature | greedy decoding helpers |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
 | ⏳ | INT8/FP8 quantized path | planned v0.3 |

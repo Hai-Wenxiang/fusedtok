@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - Unreleased
+
+### Changed
+- top-k / top-p GPU path rewritten: single cooperative kernel doing 8-round
+  256-bin radix refinement over order-preserving packed keys, one emit scan,
+  and a bitonic sort (shared-memory fast path for k <= 2048, global-memory
+  grid-participating path above). Deterministic ties (earliest index) are
+  preserved exactly; process-cached workspace avoids per-call device syncs
+  and keeps the hot path CUDA-graph-capturable. top-k @131072: 0.77x ->
+  1.42x vs PyTorch; top-p: 26x faster than v0.1 (still behind torch.sort at
+  small vocab sizes - honest numbers, merge-sort upgrade planned).
+  Host-driven per-round fallback retained for non-cooperative devices.
+
 ## [0.1.2] - 2026-08-23
 
 ### Fixed
