@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml/badge.svg)](https://github.com/Hai-Wenxiang/fusedtok/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/fusedtok.svg)](https://pypi.org/project/fusedtok/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/pyproject.toml)
 
-**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU and friends,
+**Fused CUDA kernels for LLM inference** 鈥?RMSNorm / RoPE / SwiGLU and friends,
 with **zero-copy torch tensor support**: up to **6.2x faster than PyTorch eager**
 (RoPE, RTX 3060, see [Benchmarks](#benchmarks)).
 
-**中文文档请看 [README_zh.md](README_zh.md)** | English below.
+**涓枃鏂囨。璇风湅 [README_zh.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README_zh.md)** | English below.
 
 ## Why
 
@@ -21,17 +21,17 @@ traffic and launch overhead.
 
 | Status | Kernel | Notes |
 |---|---|---|
-| ✅ | RMSNorm (+residual) | LLaMA/Qwen style, fused residual add |
-| ✅ | LayerNorm | with affine |
-| ✅ | RoPE | interleaved **and** NeoX layouts, kv-cache `pos_offset` |
-| ✅ | SwiGLU | fused MLP activation |
-| ✅ | Softmax (row-wise) | numerically stable |
-| ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
-| ✅ | add / mul | elementwise binary (fused add+residual pattern) |
-| ✅ | top-k / top-p (nucleus) | deterministic ties |
-| ✅ | argmax / temperature | greedy decoding helpers |
-| ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
-| ⏳ | INT8/FP8 quantized path | planned v0.3 |
+| 鉁?| RMSNorm (+residual) | LLaMA/Qwen style, fused residual add |
+| 鉁?| LayerNorm | with affine |
+| 鉁?| RoPE | interleaved **and** NeoX layouts, kv-cache `pos_offset` |
+| 鉁?| SwiGLU | fused MLP activation |
+| 鉁?| Softmax (row-wise) | numerically stable |
+| 鉁?| SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
+| 鉁?| add / mul | elementwise binary (fused add+residual pattern) |
+| 鉁?| top-k / top-p (nucleus) | deterministic ties |
+| 鉁?| argmax / temperature | greedy decoding helpers |
+| 鉁?| repetition penalty | CTRL-style, applied to sampled token ids |
+| 鈴?| INT8/FP8 quantized path | planned v0.3 |
 
 ## Install
 
@@ -51,14 +51,14 @@ pip install .
 
 **Requirements:**
 
-- NVIDIA GPU of **RTX 30 series (Ampere) or newer** — e.g. RTX 3060/3090, RTX 4080, RTX 5090, A100, H100
+- NVIDIA GPU of **RTX 30 series (Ampere) or newer** 鈥?e.g. RTX 3060/3090, RTX 4080, RTX 5090, A100, H100
 - CUDA Toolkit >= 12.0
 - A C++17 compiler (MSVC on Windows, GCC/Clang on Linux); Python 3.10+
 
 <details>
 <summary>What is "compute capability"? (click to expand)</summary>
 
-Compute capability is NVIDIA's version number for a GPU architecture generation — not a
+Compute capability is NVIDIA's version number for a GPU architecture generation 鈥?not a
 performance score. CUDA code must be compiled for a specific architecture to run on it.
 The wheel builds native cubins for compute capability 8.0 (A100) and 8.6 (RTX 30) plus a
 compute_86 PTX fallback, so Ampere runs natively and newer architectures (RTX 40/50, ...)
@@ -79,7 +79,7 @@ https://developer.nvidia.com/cuda-gpus
 
 ## Usage
 
-numpy in / numpy out, or torch in / torch out — including **zero-copy CUDA**:
+numpy in / numpy out, or torch in / torch out 鈥?including **zero-copy CUDA**:
 kernels read and write torch device buffers directly via `data_ptr()`, with
 no staging copies and no host synchronization.
 
@@ -130,26 +130,26 @@ reproduce with `python benchmarks/bench.py`):
 
 | Op | Shape | fusedtok | PyTorch eager | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
-| RMSNorm (+residual) | [1024×4096] | 260 µs | 538 µs | **2.1x** |
-| SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
-| LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
-| SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
-| Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
-| argmax | [131072] | 36 µs | 46 µs | **1.3x** |
-| top-k (k=50) | [131072] | 168 µs | 129 µs | 0.8x |
+| RoPE NeoX (q+k) | [2048脳4096] | 416 碌s | 2570 碌s | **6.2x** |
+| RMSNorm (+residual) | [1024脳4096] | 260 碌s | 538 碌s | **2.1x** |
+| SwiGLU | [1024脳4096] | 153 碌s | 257 碌s | **1.7x** |
+| LayerNorm | [1024脳4096] | 168 碌s | 162 碌s | ~1.0x |
+| SiLU | [1024脳4096] | 105 碌s | 112 碌s | ~1.0x |
+| Softmax | [1024脳4096] | 159 碌s | 115 碌s | 0.7x |
+| argmax | [131072] | 36 碌s | 46 碌s | **1.3x** |
+| top-k (k=50) | [131072] | 168 碌s | 129 碌s | 0.8x |
 
-![fusedtok vs PyTorch eager](docs/benchmark_rt3060.png)
+![fusedtok vs PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
 Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
 intermediate tensors through global memory. Pure memory-bound elementwise ops
-run at the same ~330-500 GB/s as PyTorch's tuned kernels (silu, gelu, add ≈
-parity). Softmax and top-k remain behind PyTorch's CUB-based kernels —
+run at the same ~330-500 GB/s as PyTorch's tuned kernels (silu, gelu, add 鈮?
+parity). Softmax and top-k remain behind PyTorch's CUB-based kernels 鈥?
 honest numbers, on the v0.2 roadmap.
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide (test rules,
+See [CONTRIBUTING.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CONTRIBUTING.md) for the full guide (test rules,
 error contract, determinism invariants). Quick start:
 
 ```bash
@@ -175,11 +175,11 @@ suite on every push.
 
 ## Community
 
-- [Contributing guide](CONTRIBUTING.md) — setup, rules of the road, PR process
-- [Code of conduct](CODE_OF_CONDUCT.md)
-- [Security policy](SECURITY.md)
-- [Changelog](CHANGELOG.md)
+- [Contributing guide](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CONTRIBUTING.md) 鈥?setup, rules of the road, PR process
+- [Code of conduct](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CODE_OF_CONDUCT.md)
+- [Security policy](https://github.com/Hai-Wenxiang/fusedtok/blob/main/SECURITY.md)
+- [Changelog](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CHANGELOG.md)
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party notices: [NOTICES.md](NOTICES.md).
+MIT 鈥?see [LICENSE](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE). Third-party notices: [NOTICES.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/NOTICES.md).

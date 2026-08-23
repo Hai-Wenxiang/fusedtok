@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-08-23
+
+### Fixed
+- README links on PyPI: relative links (README_zh.md, docs image, community
+  files) resolved against pypi.org and 404'd. All links are now absolute
+  GitHub URLs, so the Chinese README, the benchmark chart, and the
+  contributing/security/coc/changelog links work from the PyPI page.
+
 ## [0.1.0] - 2026-08-23
 
 First public release.
