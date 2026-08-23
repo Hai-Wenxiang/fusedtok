@@ -199,7 +199,9 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 
 - v0.2（已完成）：bf16 零拷贝、radix-select top-k/top-p、融合核采样、
   单读 softmax、CUDA graph 验证
-- v0.3：INT8/FP8 量化路线、merge-sort 选择（CUB 级）、bf16x2 向量化、
+- v0.3（已完成）：chunk-merge 选择排序 + 并行核计数、bf16x4/x8 向量化、
+  INT8 量化/反量化工具
+- v0.4：decoupled-lookback 选择（多 SM 卡达 CUB 级）、INT8 GEMM、
   block size 自动调优
 - v0.4+：轻量融合 attention；PyPI 预编译 wheel
 

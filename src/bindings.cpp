@@ -717,6 +717,49 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     // Zero-copy torch path: device pointer in, token out (the one-int
     // readback is inherent to returning a host value).
+    // ==================================================================
+    // INT8 symmetric per-tensor quantization
+    // ==================================================================
+    m.def("quantize_int8_cpu", [](FArray x) {
+        auto [q, scale] = ft::quantize_int8_cpu(to_vec(x));
+        py::array_t<signed char> qout(std::vector<py::ssize_t>{(py::ssize_t)q.size()});
+        if (!q.empty())
+            std::memcpy(qout.mutable_data(), q.data(), q.size());
+        return py::make_tuple(qout, scale);
+    }, py::arg("x"));
+
+    m.def("dequantize_int8_cpu", [](py::array_t<signed char, py::array::c_style> q,
+                                    float scale) {
+        auto info = q.request();
+        const signed char* p = static_cast<const signed char*>(info.ptr);
+        std::vector<float> x = ft::dequantize_int8_cpu(
+            std::vector<signed char>(p, p + q.size()), scale);
+        return wrap_vec(x, shape_of(q));
+    }, py::arg("q"), py::arg("scale"));
+
+    m.def("quantize_launch", [](py::int_ x, py::int_ q, py::int_ scale, long long n) {
+        ft::quantize_int8_launch(df(x),
+                                 reinterpret_cast<signed char*>((uintptr_t)q),
+                                 dfm(scale), n);
+    }, py::arg("x"), py::arg("q"), py::arg("scale"), py::arg("n"));
+
+    m.def("dequantize_launch", [](py::int_ q, py::int_ x, float scale, long long n) {
+        ft::dequantize_int8_launch(
+            reinterpret_cast<const signed char*>((uintptr_t)q),
+            dfm(x), scale, n);
+    }, py::arg("q"), py::arg("x"), py::arg("scale"), py::arg("n"));
+
+    m.def("qadd_launch", [](py::int_ qa, py::int_ qb, float sa, float sb,
+                            py::int_ qy, py::int_ out_scale, long long n) {
+        ft::qadd_int8_launch(
+            reinterpret_cast<const signed char*>((uintptr_t)qa),
+            reinterpret_cast<const signed char*>((uintptr_t)qb),
+            sa, sb,
+            reinterpret_cast<signed char*>((uintptr_t)qy),
+            dfm(out_scale), n);
+    }, py::arg("qa"), py::arg("qb"), py::arg("sa"), py::arg("sb"),
+       py::arg("qy"), py::arg("out_scale"), py::arg("n"));
+
     m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
                                    unsigned long long seed) -> long long {
         if (!(p > 0.0 && p <= 1.0))

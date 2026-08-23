@@ -30,7 +30,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "cuda_available",
@@ -54,6 +54,9 @@ __all__ = [
     "topk",
     "topp",
     "sample_topp",
+    "quantize_int8",
+    "dequantize_int8",
+    "qadd_int8",
 ]
 
 
@@ -566,6 +569,59 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
             else _fusedtok.repetition_penalty_cpu)
     res = call(arr, ids, penalty)
     return _numpy_to_torch_like(res, logits) if _is_torch(logits) else res
+
+
+def quantize_int8(x):
+    """Symmetric per-tensor INT8 quantization (storage path).
+
+    ``scale = max(|x|) / 127``; ``q = clamp(round(x / scale), -127, 127)``.
+    Returns ``(q, scale)`` where q is an int8 array/tensor matching the
+    input family. CUDA tensors run the zero-copy launcher (f32 in).
+    """
+    path = _device_path(x, cuda=False)
+    if path == "torch-cuda":
+        _check_torch_f32(x, "x")
+        q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+        scale = torch.empty(1, dtype=torch.float32, device=x.device)
+        _fusedtok.quantize_launch(x.data_ptr(), q.data_ptr(),
+                                  scale.data_ptr(), x.numel())
+        return q, scale
+    arr = _as_numpy(x, "x")
+    q, s = _fusedtok.quantize_int8_cpu(arr)
+    if _is_torch(x):
+        return torch.from_numpy(q), s
+    return q, s
+
+
+def dequantize_int8(q, scale):
+    """Dequantize int8 to float32: ``x = q * scale``. Accepts the tuple
+    from :func:`quantize_int8` or separate (q, scale) values."""
+    if _is_torch(q) and q.is_cuda:
+        x = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+        _fusedtok.dequantize_launch(q.data_ptr(), x.data_ptr(),
+                                    float(scale), q.numel())
+        return x
+    arr = np.asarray(q)
+    out = _fusedtok.dequantize_int8_cpu(arr, float(scale))
+    return _numpy_to_torch_like(out, q) if _is_torch(q) else out
+
+
+def qadd_int8(qa, sa, qb, sb):
+    """Fused dequant-add-requant for int8 tensors: computes
+    ``qa*sa + qb*sb`` in float32 and requantizes with the output's own
+    per-tensor scale. Returns ``(qy, out_scale)``. One device pass instead
+    of dequant -> add -> quant round trips."""
+    if not (_is_torch(qa) and qa.is_cuda and _is_torch(qb) and qb.is_cuda):
+        raise TypeError("qadd_int8 requires CUDA int8 tensors")
+    if qa.dtype is not torch.int8 or qb.dtype is not torch.int8:
+        raise TypeError("inputs must be int8")
+    if qa.shape != qb.shape:
+        raise ValueError("inputs must have the same shape")
+    qy = torch.empty(qa.shape, dtype=torch.int8, device=qa.device)
+    out_scale = torch.empty(1, dtype=torch.float32, device=qa.device)
+    _fusedtok.qadd_launch(qa.data_ptr(), qb.data_ptr(), float(sa), float(sb),
+                          qy.data_ptr(), out_scale.data_ptr(), qa.numel())
+    return qy, out_scale
 
 
 def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):

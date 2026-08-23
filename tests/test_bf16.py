@@ -103,6 +103,30 @@ class TestBf16:
         with pytest.raises(TypeError):
             fusedtok.silu(xh)
 
+    def test_bf16x4_tail_and_unaligned(self):
+        # v0.3 elementwise bf16 vectorizes 4-per-thread when 8B aligned;
+        # sizes not divisible by 4 take the scalar tail, and storage-offset
+        # views (odd element offset -> odd byte offset) fall back to the
+        # scalar kernel. All paths must agree with the f32 reference.
+        base = torch.randn(4, 1027, device="cuda")   # 1027 = 4k+3 tail
+        x16 = base.to(torch.bfloat16)
+        ref = torch.nn.functional.silu(base)
+        # aligned whole tensor (vector + tail)
+        y = fusedtok.silu(x16)
+        assert torch.allclose(y.float(), ref, rtol=2e-2, atol=2e-2)
+        # unaligned view: storage_offset 1 -> 2-byte misalignment
+        # (4108 - 1 = 4107 elements = 3 x 1369)
+        v16 = x16.flatten()[1:].view(3, 1369)
+        r16 = fusedtok.silu(v16)
+        assert torch.allclose(r16.float(),
+                              torch.nn.functional.silu(base.flatten()[1:].view(3, 1369)),
+                              rtol=2e-2, atol=2e-2)
+        # binary op with tail
+        z16 = torch.randn(4, 1027, device="cuda").to(torch.bfloat16)
+        a = fusedtok.add(x16, z16)
+        assert torch.allclose(a.float(), x16.float() + z16.float(),
+                              rtol=2e-2, atol=2e-2)
+
     def test_bf16_weight_upcasted_for_norms(self):
         # norm weights may arrive as bf16; the layer upcasts the [cols]
         # vector (small copy) and stays correct

@@ -45,6 +45,7 @@
 #include <cooperative_groups.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -66,6 +67,14 @@ void topk_check(const std::vector<float>& x, int k) {
 
 constexpr int kSelBlock = 256;
 constexpr int kSelWarps = kSelBlock / 32;
+// Per-block sort chunk (shared-memory bitonic): 2048 keys = 16KB shared.
+// Powers of two keep the chunk-merge arithmetic exact.
+constexpr int kSelSortChunk = 2048;
+// per-block scan chunk for the parallel nucleus count
+constexpr int kSelScanChunk = 2048;
+
+// merge tile: one co-rank search + shared staging per this many outputs
+constexpr int kSelMergeTile = 256;
 
 // ---------------------------------------------------------------------------
 // process-cached workspace
@@ -169,8 +178,16 @@ __global__ void radix_topk_kernel(const RadixArgs a) {
     if (blockIdx.x == 0) {
         for (int i = threadIdx.x; i < 260; i += blockDim.x) a.ws[i] = 0ULL;
         if (threadIdx.x == 0) *g_remaining = (unsigned long long)a.k;
-        for (long long i = a.k + threadIdx.x; i < a.m; i += blockDim.x)
-            keys[i] = 0ULL;                        // pad = smallest key
+        // count_out is an external buffer: preset to INT_MAX so the
+        // atomicMin-based nucleus count starts from a clean sentinel
+        // (sample mode overwrites it directly in phase 4)
+        if (threadIdx.x == 0 && a.count_out) *a.count_out = INT_MAX;
+        // zero the pads of BOTH key buffers: merges read both, and every
+        // real key is > 0 (index bits), so 0 pads always sink to the tail
+        for (long long i = a.k + threadIdx.x; i < a.m; i += blockDim.x) {
+            keys[i] = 0ULL;
+            (a.ws + 260 + a.m)[i] = 0ULL;
+        }
     }
     grid.sync();
 
@@ -240,57 +257,133 @@ __global__ void radix_topk_kernel(const RadixArgs a) {
     }
     grid.sync();
 
-    // ---- phase 3: bitonic sort (descending) of keys[0..a.m) --------------------
-    if (a.m <= 2048) {
-        // shared-memory fast path: one block sorts, others wait at the sync
-        if (blockIdx.x == 0) {
-            __shared__ unsigned long long sk[2048];
-            for (int i = threadIdx.x; i < a.m; i += blockDim.x) sk[i] = keys[i];
+    // ---- phase 3: parallel chunk sort + pairwise merge ------------------------
+    // v0.3: replaces the global bitonic (O(log^2 m) grid.sync barriers, most
+    // blocks idle at high strides) with two structured stages:
+    //   3a) every block independently sorts one kSelSortChunk-key chunk in
+    //       shared memory (no grid participation inside the sort)
+    //   3b) log2(nb) pairwise merge levels; each output element finds its
+    //       source via a merge-path co-rank binary search over the two runs
+    //       (arrays are strictly descending with unique keys, so the search
+    //       predicate is monotone). Buffers ping-pong between the primary
+    //       key array and the scratch array; pads are 0 and every real key
+    //       is > 0 (index bits), so zeros always merge to the tail.
+    {
+        __shared__ unsigned long long sk[kSelSortChunk];
+        __shared__ unsigned long long sA[kSelMergeTile];
+        __shared__ unsigned long long sB[kSelMergeTile];
+        unsigned long long* keys_a = keys;                 // primary buffer
+        unsigned long long* keys_b = a.ws + 260 + a.m;       // scratch buffer
+
+        // 3a) per-block chunk sort (blocks beyond nb_sort only wait)
+        const int c = kSelSortChunk;
+        const int nb_sort = (a.m + c - 1) / c;
+        // blocks may FEWER than chunks (grid is capped by cooperative-launch
+        // occupancy): stride blocks over chunks so every chunk gets sorted
+        for (int chunk = blockIdx.x; chunk < nb_sort; chunk += grid_blocks) {
+            const int base = chunk * c;
+            // one chunk covers all of m -> sort exactly m (a power of two);
+            // running the full 2048 network on tiny k wastes ~4x passes
+            const int len = (nb_sort == 1) ? a.m : c;
+            for (int i = threadIdx.x; i < len; i += kSelBlock)
+                sk[i] = keys[base + i];
             __syncthreads();
-            for (int size = 2; size <= a.m; size <<= 1) {
+            for (int size = 2; size <= len; size <<= 1) {
                 for (int stride = size >> 1; stride > 0; stride >>= 1) {
                     __syncthreads();
-                    for (int i = threadIdx.x; i < a.m; i += blockDim.x) {
+                    for (int i = threadIdx.x; i < len; i += kSelBlock) {
                         const int j = i ^ stride;
-                        if (j > i) {
+                        if (j > i && j < len) {
                             const bool up = (i & size) == 0;   // descending
-                            const unsigned long long a = sk[i];
-                            const unsigned long long b = sk[j];
-                            if ((up && a < b) || (!up && a > b)) {
-                                sk[i] = b;
-                                sk[j] = a;
+                            const unsigned long long v0 = sk[i];
+                            const unsigned long long v1 = sk[j];
+                            if ((up && v0 < v1) || (!up && v0 > v1)) {
+                                sk[i] = v1;
+                                sk[j] = v0;
                             }
                         }
                     }
                 }
             }
             __syncthreads();
-            for (int i = threadIdx.x; i < a.k; i += blockDim.x) keys[i] = sk[i];
+            for (int i = threadIdx.x; i < len; i += kSelBlock)
+                if (base + i < a.m) keys[base + i] = sk[i];
+            __syncthreads();   // sk reused by the next chunk of this block
         }
         grid.sync();
-    } else {
-        // global-memory bitonic with grid participation
-        for (int size = 2; size <= a.m; size <<= 1) {
-            for (int stride = size >> 1; stride > 0; stride >>= 1) {
-                grid.sync();
-                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < a.m;
-                     i += grid_blocks * blockDim.x) {
-                    const int j = i ^ stride;
-                    if (j > i && j < a.m) {
-                        const bool up = (i & size) == 0;
-                        const unsigned long long a = keys[i];
-                        const unsigned long long b = keys[j];
-                        if ((up && a < b) || (!up && a > b)) {
-                            keys[i] = b;
-                            keys[j] = a;
-                        }
-                    }
-                }
-            }
-        }
-        grid.sync();
-    }
 
+        // 3b) pairwise merges, tile-based merge path: each block handles
+        // tiles of kSelMergeTile outputs. ONE global-memory co-rank binary
+        // search per tile locates the (i, j) split of the two source runs;
+        // the tile's inputs are staged into shared memory and each thread
+        // resolves its element with a cheap in-shared search. Global reads
+        // stay coalesced and per-element binary search over global memory
+        // (the v0.3 first cut, 3x slower than bitonic at 131k) is avoided.
+        unsigned long long* src_buf = keys_a;
+        unsigned long long* dst_buf = keys_b;
+        int run = c;
+        while (run < a.m) {
+            grid.sync();   // all reads target the previous level's output
+            const long long ntiles = a.m / kSelMergeTile;
+            for (long long tile = blockIdx.x; tile < ntiles;
+                 tile += grid_blocks) {
+                const long long p0 = tile * kSelMergeTile;
+                const long long pair = p0 / (2 * run);
+                const long long lo0 = p0 - pair * 2 * run;
+                const long long a_base = pair * 2 * run;
+                const long long b_base = a_base + run;
+                // co-rank for the tile start: largest i with
+                // (i == 0 || A[i-1] > B[lo0-i])
+                long long l = lo0 > run ? lo0 - run : 0;
+                long long h = lo0 < run ? lo0 : run;
+                while (l < h) {
+                    const long long mid = (l + h + 1) >> 1;
+                    const bool pred =
+                        mid == 0 ||
+                        src_buf[a_base + mid - 1] > src_buf[b_base + lo0 - mid];
+                    if (pred) l = mid; else h = mid - 1;
+                }
+                const long long i0 = l, j0 = lo0 - i0;
+                // stage up to kSelMergeTile inputs from each run (0-padded;
+                // real keys are > 0 so pads sort to the tail)
+                for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
+                    sA[u] = (i0 + u < run) ? src_buf[a_base + i0 + u] : 0ULL;
+                    sB[u] = (j0 + u < run) ? src_buf[b_base + j0 + u] : 0ULL;
+                }
+                __syncthreads();
+                // in-tile co-rank per thread (shared memory, log T steps)
+                for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
+                    long long l2 = u > kSelMergeTile ? 0 : 0;   // clamp below
+                    l2 = 0;
+                    long long h2 = u < kSelMergeTile ? u : kSelMergeTile;
+                    while (l2 < h2) {
+                        const long long mid = (l2 + h2 + 1) >> 1;
+                        const bool pred =
+                            mid == 0 || sA[mid - 1] > sB[u - mid];
+                        if (pred) l2 = mid; else h2 = mid - 1;
+                    }
+                    const long long i = l2, j = u - i;
+                    const bool take_a =
+                        (i < kSelMergeTile) &&
+                        (j >= kSelMergeTile || sA[i] > sB[j]);
+                    dst_buf[p0 + u] = take_a ? sA[i] : sB[j];
+                }
+                __syncthreads();
+            }
+            unsigned long long* tmp = src_buf; src_buf = dst_buf; dst_buf = tmp;
+            run <<= 1;
+        }
+        grid.sync();
+
+        // 3c) ensure the sorted result lives in the primary buffer (decode
+        // below reads `keys`); an odd number of merge levels ends in scratch
+        if (src_buf != keys_a) {
+            for (int i = blockIdx.x * kSelBlock + threadIdx.x; i < a.k;
+                 i += grid_blocks * kSelBlock)
+                keys[i] = keys_b[i];
+            grid.sync();
+        }
+    }
     // ---- phase 4: decode / nucleus count / sample ------------------------------
     if (blockIdx.x == 0) {
         for (int i = threadIdx.x; i < a.k; i += blockDim.x) {
@@ -338,17 +431,102 @@ __global__ void radix_topk_kernel(const RadixArgs a) {
                 }
             }
             if (a.count_out) *a.count_out = nucleus;
-        } else if (a.p_stop > 0.0f && threadIdx.x == 0) {
-            // nucleus count over descending values until >= p
-            float cum = 0.0f;
-            int count = 0;
-            for (int i = 0; i < a.k; ++i) {
-                cum += unfkey((unsigned)(keys[i] >> 32));
-                count = i + 1;
-                if (cum >= a.p_stop) break;
-            }
-            *a.count_out = count;
         }
+    }
+
+    // ---- phase 4b: parallel nucleus count (ALL blocks participate) ------
+    // Must live OUTSIDE the block-0-only decode scope: the grid scan calls
+    // grid.sync(), which deadlocks unless every block reaches it.
+    if (a.sample == 0 && a.p_stop > 0.0f) {
+        float* bsums = reinterpret_cast<float*>(a.ws + 260 + 2 * a.m);
+        const int scan_len = a.k;
+        const long long per =
+            (scan_len + (long long)grid_blocks - 1) / grid_blocks;
+        const long long b0 = (long long)blockIdx.x * per;
+        const long long b1 = min((long long)scan_len, b0 + per);
+
+        float bsum = 0.0f;
+        for (long long i = b0 + threadIdx.x; i < b1; i += kSelBlock)
+            bsum += unfkey((unsigned)(keys[i] >> 32));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            bsum += __shfl_down_sync(0xffffffffu, bsum, off);
+        __shared__ float sh_warp[kSelWarps];
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        if (lane == 0) sh_warp[warp] = bsum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float s = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < kSelWarps; ++w) s += sh_warp[w];
+            bsums[blockIdx.x] = s;
+        }
+        grid.sync();
+
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            float acc = 0.0f;
+            for (int b = 0; b < (int)grid_blocks; ++b) {
+                const float s = bsums[b];
+                bsums[b] = acc;
+                acc += s;
+            }
+        }
+        grid.sync();
+
+        const float carry = bsums[blockIdx.x];
+        const int cnt = (int)(b1 - b0);
+        __shared__ float loc[2][kSelScanChunk];
+        __shared__ int sh_first;
+        if (threadIdx.x == 0) sh_first = INT_MAX;
+        __syncthreads();
+        if (cnt > kSelScanChunk) {
+            // only when the grid is tiny; serial fallback stays correct.
+            // A block whose slice never crosses p must NOT publish its
+            // end-of-slice index - only report an actual crossing.
+            if (threadIdx.x == 0) {
+                float cum = carry;
+                bool found = false;
+                for (int i = 0; i < cnt; ++i) {
+                    cum += unfkey((unsigned)(keys[b0 + i] >> 32));
+                    if (cum >= a.p_stop) {
+                        atomicMin(a.count_out, (int)b0 + i + 1);
+                        found = true;
+                        break;
+                    }
+                }
+                (void)found;
+            }
+        } else if (cnt > 0) {
+            // double-buffered Hillis-Steele: within one round, address x is
+            // WRITTEN (as dst[i]) and READ (as src[i-stride]) by different
+            // threads - a single shared array races (verified by
+            // compute-sanitizer racecheck). Ping-pong between loc0/loc1.
+            float* cur = loc[0];
+            float* nxt = loc[1];
+            for (int i = threadIdx.x; i < cnt; i += kSelBlock)
+                cur[i] = unfkey((unsigned)(keys[b0 + i] >> 32));
+            __syncthreads();
+            for (int stride = 1; stride < cnt; stride <<= 1) {
+                for (int i = threadIdx.x; i < cnt; i += kSelBlock)
+                    nxt[i] = cur[i] + ((i >= stride) ? cur[i - stride] : 0.0f);
+                __syncthreads();
+                float* tmp = cur; cur = nxt; nxt = tmp;
+            }
+            for (int i = threadIdx.x; i < cnt; i += kSelBlock) {
+                if (carry + cur[i] >= a.p_stop) {
+                    atomicMin(&sh_first, (int)(b0 + i));
+                    break;   // later i in this thread are larger
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0 && sh_first != INT_MAX)
+                atomicMin(a.count_out, sh_first + 1);
+        }
+        grid.sync();
+        // no crossing anywhere (p > total mass): the nucleus is everything
+        if (blockIdx.x == 0 && threadIdx.x == 0 && *a.count_out == INT_MAX)
+            *a.count_out = scan_len;
     }
 }
 
@@ -445,7 +623,9 @@ void launch_radix_topk(const float* x, float* vals, long long* idxs,
                        unsigned long long sample_seed, int sample) {
     int m = 1;
     while (m < k) m <<= 1;                        // bitonic pad size
-    unsigned long long* ws = selection_workspace((size_t)m);
+    // two m-word key buffers (ping-pong) + 256 words of block-sum scratch
+    // for the parallel nucleus count (writes past 2*m otherwise)
+    unsigned long long* ws = selection_workspace(2 * (size_t)m + 256);
 
     int dev = 0, num_sms = 0, blocks_per_sm = 0;
     cudaGetDevice(&dev);
@@ -575,10 +755,10 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
     for (;;) {
         int m = 1;
         while (m < window) m <<= 1;
-        // Grow the workspace BEFORE grabbing the token slot: launching
-        // grows it internally, and a post-grab growth would free the old
-        // buffer underneath the pointer.
-        unsigned long long* ws = selection_workspace((size_t)m);
+        // Grow the workspace to the FULL launch size (two m-word key
+        // buffers + block-sum scratch) BEFORE grabbing the token slot: the
+        // launch would grow it otherwise and free the old buffer below it.
+        unsigned long long* ws = selection_workspace(2 * (size_t)m + 256);
         int* token_out = reinterpret_cast<int*>(ws + 256);
         int token = -1;
         cudaMemcpy(token_out, &token, sizeof(int), cudaMemcpyHostToDevice);
