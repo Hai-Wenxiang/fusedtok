@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-08-24
+
+### Fixed
+- README operator table synced with the shipped 0.3.0 (INT8 row was still
+  marked "planned"; top-k speedup updated to the measured 1.6x; stale
+  "v0.2 roadmap" pointer corrected) - bilingual
+
+### Changed
+- demo tours the INT8 utilities (roundtrip error bound, zero-copy scale
+  parity, fused qadd vs an explicit float reference)
+- dequantize_int8 dispatches through the shared device-path helper
+  (consistency only; behavior unchanged)
+
 ## [0.3.0] - 2026-08-24
 
 ### Added
