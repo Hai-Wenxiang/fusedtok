@@ -28,11 +28,11 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | Softmax（按行） | 数值稳定版 |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | 逐元素 |
 | ✅ | add / mul | 逐元素二元（融合加残差模式） |
-| ✅ | top-k / top-p（核采样） | radix-select，平局取先下标（131k 词表 1.4x） |
+| ✅ | top-k / top-p（核采样） | chunk-merge 选择，平局取先下标（131k 词表 1.6x） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
 | ✅ | sample_topp | 融合核采样：softmax -> top-p -> 种子抽取，单 kernel |
 | ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
-| ⏳ | INT8/FP8 量化路线 | v0.3 计划 |
+| ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称 per-tensor INT8，融合反量化-加-重量化（INT8 GEMM：v0.4） |
 
 ## 安装
 
@@ -174,7 +174,7 @@ Blackwell（sm_120）驱动上验证 JIT 运行正确。
 融合算子（RoPE / RMSNorm / SwiGLU）优势明显：eager 模式的中间张量要在显存间
 来回搬运。纯带宽受限的逐元素算子与 PyTorch 调优 kernel 跑出相同的
 ~330-500 GB/s（silu、gelu、add ≈ 持平）。Softmax 与 top-k 仍落后于 PyTorch
-的 CUB 内核 —— 数字诚实，改进列入 v0.2 规划。
+的 CUB 内核 —— 数字诚实，改进列入 v0.4 规划（decoupled-lookback 选择）。
 
 ## 开发
 

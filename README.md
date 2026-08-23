@@ -28,11 +28,11 @@ traffic and launch overhead.
 | ✅ | Softmax (row-wise) | numerically stable |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
 | ✅ | add / mul | elementwise binary (fused add+residual pattern) |
-| ✅ | top-k / top-p (nucleus) | radix-select, deterministic ties (1.4x vs torch @131k) |
+| ✅ | top-k / top-p (nucleus) | chunk-merge select, deterministic ties (1.6x vs torch @131k) |
 | ✅ | argmax / temperature | greedy decoding helpers |
 | ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, one kernel |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
-| ⏳ | INT8/FP8 quantized path | planned v0.3 |
+| ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant (INT8 GEMM: v0.4) |
 
 ## Install
 
@@ -182,7 +182,7 @@ Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
 intermediate tensors through global memory. Pure memory-bound elementwise ops
 run at the same ~330-500 GB/s as PyTorch's tuned kernels (silu, gelu, add ≈
 parity). Softmax and top-k remain behind PyTorch's CUB-based kernels —
-honest numbers, on the v0.2 roadmap.
+honest numbers, on the v0.4 roadmap (decoupled-lookback selection).
 
 ## Development
 
