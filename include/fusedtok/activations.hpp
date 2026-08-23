@@ -87,4 +87,15 @@ std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
 long long sample_topp_cpu(const std::vector<float>& logits,
                           float p, float t, unsigned long long seed);
 
+// ---------------------------------------------------------------------------
+// INT8 symmetric per-tensor quantization (storage path; GEMM is v0.4+):
+//   scale = max(|x|) / 127; q = clamp(round(x / scale), -127, 127)
+// ---------------------------------------------------------------------------
+
+std::pair<std::vector<signed char>, float>
+quantize_int8_cpu(const std::vector<float>& x);
+
+std::vector<float> dequantize_int8_cpu(const std::vector<signed char>& q,
+                                       float scale);
+
 } // namespace fusedtok

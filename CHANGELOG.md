@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.3.0] - Unreleased
 
+### Added
+- INT8 symmetric per-tensor quantization utilities: `quantize_int8` /
+  `dequantize_int8` (scale = absmax/127, clamp to [-127, 127]) and the
+  fused `qadd_int8` (dequant -> add -> requant in one device pass, the
+  output using its own absmax scale). Storage/dtype path; INT8 GEMM stays
+  on the v0.4+ roadmap.
+- bf16x8 (uint4, 16-byte) vectorization tier for elementwise kernels:
+  8-byte accesses saturate Ampere GDDR6 but leave ~2.8x on the table on
+  GDDR7 parts - measured bf16 silu on RTX 5060 Ti: 28.3 -> 10.2 us
+  (1.05x vs torch). Dispatch tiers x8 / x4 / scalar by alignment.
+
+### Performance interpretation (dual-GPU, honest)
+- Ampere (RTX 3060, 28 SM): topk(131k, k=50) 1.62x vs torch; topp
+  nucleus count now parallel (2178 -> 1146 us at 131k); bf16 elementwise
+  at DRAM parity (325 GB/s effective).
+- Blackwell (RTX 5060 Ti, 36 SM): bare topk remains 0.31x vs torch's CUB
+  radix-select (40 us) - the chunk-merge sort removed the barrier
+  pathology but CUB's decoupled-lookback passes stay ahead at high SM
+  counts; sample_topp 903 -> 672 us. Documented as the v0.4 selection
+  work item; argmax 1.07x, bf16 silu 1.05x.
+
 ### Changed
 - selection sort phase rewritten: per-block chunk sorts + merge-path levels
   (one co-rank search per 256-output tile) replace the global bitonic;

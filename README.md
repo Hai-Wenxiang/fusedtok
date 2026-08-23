@@ -207,8 +207,10 @@ suite on every push.
 
 - v0.2 (done): bf16 zero-copy, radix-select top-k/top-p, fused nucleus
   sampling, single-read softmax, CUDA-graph verified
-- v0.3: INT8/FP8 quantized paths, merge-sort selection (CUB-class),
-  bf16x2 vectorized elementwise, block-size autotuning
+- v0.3 (done): chunk-merge selection sort + parallel nucleus count,
+  bf16x4/x8 vectorized elementwise, INT8 quantize/dequantize utilities
+- v0.4: decoupled-lookback selection (CUB-class on many-SM GPUs),
+  INT8 GEMM path, block-size autotuning
 - v0.4+: lightweight fused attention; prebuilt wheels on PyPI
 
 ## Community

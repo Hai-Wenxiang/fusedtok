@@ -68,6 +68,19 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
 // and inverse-CDF samples with a hash-uniform of `seed`. Returns the token.
 long long sample_topp_launch(const float* x, int n, float p, float t,
                              unsigned long long seed);
+// INT8 quantization: q = clamp(round(x * (1/scale))), scale = absmax/127
+// (written to scale_out device float). n elements.
+void quantize_int8_launch(const float* x, signed char* q,
+                          float* scale_out, long long n);
+// x[i] = q[i] * scale.
+void dequantize_int8_launch(const signed char* q, float* x,
+                            float scale, long long n);
+// Fused dequant-add-requant: y = clamp(round((qa*sa + qb*sb) * (1/scale_y)))
+// with scale_y = absmax(qa*sa + qb*sb)/127 (written to out_scale).
+void qadd_int8_launch(const signed char* qa, const signed char* qb,
+                      float sa, float sb, signed char* qy,
+                      float* out_scale, long long n);
+
 // Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out);
 // y[i] = x[i] / t.
