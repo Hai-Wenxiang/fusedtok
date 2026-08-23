@@ -115,10 +115,11 @@ class TestBf16:
         y = fusedtok.silu(x16)
         assert torch.allclose(y.float(), ref, rtol=2e-2, atol=2e-2)
         # unaligned view: storage_offset 1 -> 2-byte misalignment
-        v16 = x16.flatten()[1:].view(4, 1026)
+        # (4108 - 1 = 4107 elements = 3 x 1369)
+        v16 = x16.flatten()[1:].view(3, 1369)
         r16 = fusedtok.silu(v16)
         assert torch.allclose(r16.float(),
-                              torch.nn.functional.silu(base.flatten()[1:].view(4, 1026)),
+                              torch.nn.functional.silu(base.flatten()[1:].view(3, 1369)),
                               rtol=2e-2, atol=2e-2)
         # binary op with tail
         z16 = torch.randn(4, 1027, device="cuda").to(torch.bfloat16)
