@@ -19,6 +19,7 @@
 #include <pybind11/numpy.h>
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <cstdint>
 #include <cstring>
@@ -286,6 +287,59 @@ PYBIND11_MODULE(_fusedtok, m) {
         ft::swiglu_launch(df(g), df(u), dfm(out), n); }, py::arg("gate"), py::arg("up"),
         py::arg("out"), py::arg("n"));
 
+    // bf16 zero-copy launchers (torch bf16 tensors; compute stays float32)
+    using BF = __nv_bfloat16;
+    auto dbf = [](py::int_ p) { return reinterpret_cast<const BF*>((uintptr_t)p); };
+    auto dbfm = [](py::int_ p) { return reinterpret_cast<BF*>((uintptr_t)p); };
+    m.def("silu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::silu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("gelu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::gelu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("gelu_tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::gelu_tanh_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("relu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::relu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::tanh_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("sigmoid_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
+        ft::sigmoid_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
+    m.def("add_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n) {
+        ft::add_launch_bf16(dbf(a), dbf(b), dbfm(out), n); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"));
+    m.def("mul_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n) {
+        ft::mul_launch_bf16(dbf(a), dbf(b), dbfm(out), n); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"));
+    m.def("swiglu_launch_bf16", [dbf, dbfm](py::int_ g, py::int_ u, py::int_ out, long long n) {
+        ft::swiglu_launch_bf16(dbf(g), dbf(u), dbfm(out), n); }, py::arg("gate"), py::arg("up"),
+        py::arg("out"), py::arg("n"));
+    m.def("rmsnorm_launch_bf16", [dbf, dbfm](py::int_ x, py::int_ w, py::object r,
+                                             py::int_ out, int rows, int cols, float eps) {
+        const float* rp_f = nullptr;   // residual is bf16 like x
+        const BF* rp = r.is_none()
+            ? nullptr
+            : reinterpret_cast<const BF*>((uintptr_t)py::int_(r));
+        ft::rmsnorm_launch_bf16(dbf(x), df(w), rp, dbfm(out), rows, cols, eps);
+    }, py::arg("x"), py::arg("weight"), py::arg("residual"), py::arg("out"),
+       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+    m.def("layernorm_launch_bf16", [dbf, dbfm](py::int_ x, py::int_ w, py::int_ b,
+                                               py::int_ out, int rows, int cols, float eps) {
+        ft::layernorm_launch_bf16(dbf(x), df(w), df(b), dbfm(out), rows, cols, eps);
+    }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
+       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+    m.def("softmax_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int rows, int cols) {
+        ft::softmax_launch_bf16(dbf(in), dbfm(out), rows, cols);
+    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("cols"));
+    m.def("rope_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int seq, int dim,
+                                          double theta, int pos_offset) {
+        ft::rope_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset);
+    }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta"), py::arg("pos_offset"));
+    m.def("rope_neox_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int seq, int dim,
+                                               double theta, int pos_offset) {
+        ft::rope_neox_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset);
+    }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta"), py::arg("pos_offset"));
+
     // ==================================================================
     // RMSNorm / LayerNorm / softmax (row-major 2-D)
     // ==================================================================
@@ -481,6 +535,13 @@ PYBIND11_MODULE(_fusedtok, m) {
         else
             ft::rope_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
     }, py::arg("neox"), py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
+       py::arg("theta"), py::arg("pos_offset"));
+
+    // explicit-layout aliases (float32)
+    m.def("rope_neox_launch", [](py::int_ in, py::int_ out, int seq, int dim,
+                                 double theta, int pos_offset) {
+        ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
+    }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
        py::arg("theta"), py::arg("pos_offset"));
 
     // ==================================================================

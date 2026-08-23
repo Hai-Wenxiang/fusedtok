@@ -1,19 +1,25 @@
 // Elementwise activations and binary ops.
 //
 // Structure per operator: a functor with the element formula, a CPU
-// reference implementation (ground truth, runs anywhere), and a *_launch
-// raw-pointer entry point. The CUDA path vectorizes into float4 loads and
-// stores whenever the buffers are 16-byte aligned (torch and cudaMalloc
-// allocations always are); a scalar tail kernel handles n % 4 leftovers.
+// reference implementation (ground truth, runs anywhere), and *_launch
+// raw-pointer entry points (float32 and bf16 variants).
+//
+// Compute always runs in float32; bf16 buffers convert at the memory
+// boundary via ld_f/st_f. The CUDA float32 path vectorizes into float4
+// loads/stores whenever the buffers are 16-byte aligned (torch and
+// cudaMalloc allocations always are); bf16 and misaligned float paths use
+// the scalar kernels.
 
 #include "fusedtok/activations.hpp"
 #include "fusedtok/cuda_launch.hpp"
 #include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace fusedtok {
 
@@ -70,7 +76,7 @@ struct SwigluOp {
     }
 };
 
-// --- vectorized kernels -------------------------------------------------------
+// --- kernels -------------------------------------------------------------------
 
 template <typename F>
 __global__ void unary_f4_kernel(const float4* __restrict__ in,
@@ -87,11 +93,11 @@ __global__ void unary_f4_kernel(const float4* __restrict__ in,
     }
 }
 
-template <typename F>
-__global__ void unary_f1_kernel(const float* __restrict__ in,
-                                float* __restrict__ out, int n, F f) {
+template <typename T, typename F>
+__global__ void unary_f1_kernel(const T* __restrict__ in,
+                                T* __restrict__ out, int n, F f) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = f(in[i]);
+    if (i < n) st_f(out, i, f(ld_f(in, i)));
 }
 
 template <typename F>
@@ -111,18 +117,17 @@ __global__ void binary_f4_kernel(const float4* __restrict__ a,
     }
 }
 
-template <typename F>
-__global__ void binary_f1_kernel(const float* __restrict__ a,
-                                 const float* __restrict__ b,
-                                 float* __restrict__ out, int n, F f) {
+template <typename T, typename F>
+__global__ void binary_f1_kernel(const T* __restrict__ a,
+                                 const T* __restrict__ b,
+                                 T* __restrict__ out, int n, F f) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = f(a[i], b[i]);
+    if (i < n) st_f(out, i, f(ld_f(a, i), ld_f(b, i)));
 }
 
-// --- host drivers --------------------------------------------------------------
+// --- host drivers ----------------------------------------------------------------
 
-// Launch a unary elementwise op, vectorized when possible. Pointers must be
-// 16-byte aligned for the float4 path; misaligned views fall back to scalar.
+// float32 driver: float4 vectorized with scalar tail when aligned.
 template <typename F>
 void launch_unary(const float* x, float* y, long long n, F f) {
     if (n <= 0) return;
@@ -134,12 +139,23 @@ void launch_unary(const float* x, float* y, long long n, F f) {
             reinterpret_cast<const float4*>(x), reinterpret_cast<float4*>(y), n4, f);
         const int tail = (int)(n - n4 * 4);
         if (tail > 0)
-            unary_f1_kernel<F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            unary_f1_kernel<float, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
                 x + n4 * 4, y + n4 * 4, tail, f);
     } else {
-        unary_f1_kernel<F><<<(unsigned)grid_for(n), kBlock>>>(x, y, (int)n, f);
+        unary_f1_kernel<float, F><<<(unsigned)grid_for(n), kBlock>>>(x, y, (int)n, f);
     }
     check_launch("elementwise kernel launch");
+}
+
+// bf16 driver: scalar kernel (bf16 packs 8 per 16B, vectorization is a
+// v0.3 candidate via __nv_bfloat162).
+template <typename F>
+void launch_unary_bf16(const __nv_bfloat16* x, __nv_bfloat16* y,
+                       long long n, F f) {
+    if (n <= 0) return;
+    unary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n), kBlock>>>(
+        x, y, (int)n, f);
+    check_launch("elementwise bf16 kernel launch");
 }
 
 template <typename F>
@@ -155,12 +171,21 @@ void launch_binary(const float* a, const float* b, float* y, long long n, F f) {
             reinterpret_cast<float4*>(y), n4, f);
         const int tail = (int)(n - n4 * 4);
         if (tail > 0)
-            binary_f1_kernel<F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            binary_f1_kernel<float, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
                 a + n4 * 4, b + n4 * 4, y + n4 * 4, tail, f);
     } else {
-        binary_f1_kernel<F><<<(unsigned)grid_for(n), kBlock>>>(a, b, y, (int)n, f);
+        binary_f1_kernel<float, F><<<(unsigned)grid_for(n), kBlock>>>(a, b, y, (int)n, f);
     }
     check_launch("elementwise kernel launch");
+}
+
+template <typename F>
+void launch_binary_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                        __nv_bfloat16* y, long long n, F f) {
+    if (n <= 0) return;
+    binary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n), kBlock>>>(
+        a, b, y, (int)n, f);
+    check_launch("elementwise bf16 kernel launch");
 }
 
 } // namespace
@@ -180,6 +205,10 @@ void silu_launch(const float* x, float* y, long long n) {
     launch_unary(x, y, n, SiluOp{});
 }
 
+void silu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
+    launch_unary_bf16(x, y, n, SiluOp{});
+}
+
 // --- GeLU (exact erf form) -------------------------------------------------------
 
 std::vector<float> gelu_cpu(const std::vector<float>& x) {
@@ -193,6 +222,10 @@ std::vector<float> gelu_cpu(const std::vector<float>& x) {
 
 void gelu_launch(const float* x, float* y, long long n) {
     launch_unary(x, y, n, GeluOp{});
+}
+
+void gelu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
+    launch_unary_bf16(x, y, n, GeluOp{});
 }
 
 // --- GeLU (tanh approximation) ----------------------------------------------------
@@ -211,6 +244,10 @@ void gelu_tanh_launch(const float* x, float* y, long long n) {
     launch_unary(x, y, n, GeluTanhOp{});
 }
 
+void gelu_tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
+    launch_unary_bf16(x, y, n, GeluTanhOp{});
+}
+
 // --- ReLU --------------------------------------------------------------------------
 
 std::vector<float> relu_cpu(const std::vector<float>& x) {
@@ -222,6 +259,10 @@ std::vector<float> relu_cpu(const std::vector<float>& x) {
 
 void relu_launch(const float* x, float* y, long long n) {
     launch_unary(x, y, n, ReluOp{});
+}
+
+void relu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
+    launch_unary_bf16(x, y, n, ReluOp{});
 }
 
 // --- Tanh --------------------------------------------------------------------------
@@ -237,6 +278,10 @@ void tanh_launch(const float* x, float* y, long long n) {
     launch_unary(x, y, n, TanhOp{});
 }
 
+void tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
+    launch_unary_bf16(x, y, n, TanhOp{});
+}
+
 // --- Sigmoid ----------------------------------------------------------------------
 
 std::vector<float> sigmoid_cpu(const std::vector<float>& x) {
@@ -250,6 +295,10 @@ std::vector<float> sigmoid_cpu(const std::vector<float>& x) {
 
 void sigmoid_launch(const float* x, float* y, long long n) {
     launch_unary(x, y, n, SigmoidOp{});
+}
+
+void sigmoid_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
+    launch_unary_bf16(x, y, n, SigmoidOp{});
 }
 
 // --- Temperature scaling --------------------------------------------------------------
@@ -281,6 +330,11 @@ void add_launch(const float* a, const float* b, float* y, long long n) {
     launch_binary(a, b, y, n, AddOp{});
 }
 
+void add_launch_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                     __nv_bfloat16* y, long long n) {
+    launch_binary_bf16(a, b, y, n, AddOp{});
+}
+
 std::vector<float> mul_cpu(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size())
         throw std::invalid_argument("mul: inputs must have the same size");
@@ -291,6 +345,11 @@ std::vector<float> mul_cpu(const std::vector<float>& a, const std::vector<float>
 
 void mul_launch(const float* a, const float* b, float* y, long long n) {
     launch_binary(a, b, y, n, MulOp{});
+}
+
+void mul_launch_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                     __nv_bfloat16* y, long long n) {
+    launch_binary_bf16(a, b, y, n, MulOp{});
 }
 
 // --- SwiGLU --------------------------------------------------------------------------
@@ -309,6 +368,11 @@ std::vector<float> swiglu_cpu(const std::vector<float>& gate,
 
 void swiglu_launch(const float* gate, const float* up, float* y, long long n) {
     launch_binary(gate, up, y, n, SwigluOp{});
+}
+
+void swiglu_launch_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                        __nv_bfloat16* y, long long n) {
+    launch_binary_bf16(gate, up, y, n, SwigluOp{});
 }
 
 } // namespace fusedtok

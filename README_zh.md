@@ -108,7 +108,9 @@ values, indices = fusedtok.topk(logits, k=50)
 ```
 
 所有函数接受 float32 的 numpy 数组或 torch 张量（其他 dtype 会被拷贝转换），
-返回同族的 float32 输出。CUDA torch 张量会自动选择零拷贝路径。
+返回同族的 float32 输出。CUDA torch 张量会自动选择零拷贝路径；CUDA 张量
+也支持 **bfloat16** —— kernel 内部以 float32 计算、在读写边界转换
+（norm 权重自动升精度到 float32；采样/选择类算子保持 float32）。
 
 完整可运行的算子巡览见 `examples/demo.py`。
 

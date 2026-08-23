@@ -17,6 +17,9 @@
 
 #include <cstdint>
 
+// bf16 storage type (compute stays float32)
+struct __nv_bfloat16;
+
 namespace fusedtok {
 
 // --- elementwise unary activations -----------------------------------------
@@ -73,5 +76,35 @@ void temperature_launch(const float* x, float* y, int n, float t);
 // logits/y: [n], ids: [m] unique token ids.
 void repetition_penalty_launch(const float* logits, const long long* ids,
                                int n, int m, float penalty, float* y);
+
+
+// --- bf16 variants: float32 compute, bf16 storage ---------------------------
+// Weight/bias parameters stay float32 (norm weights are commonly kept fp32
+// in bf16 checkpoints). Available for: elementwise unary/binary, norms,
+// softmax, RoPE. Sampling/selection ops remain float32 (logits are f32).
+void silu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n);
+void gelu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n);
+void gelu_tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n);
+void relu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n);
+void tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n);
+void sigmoid_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n);
+void add_launch_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                     __nv_bfloat16* y, long long n);
+void mul_launch_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                     __nv_bfloat16* y, long long n);
+void swiglu_launch_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                        __nv_bfloat16* y, long long n);
+void rmsnorm_launch_bf16(const __nv_bfloat16* x, const float* w,
+                         const __nv_bfloat16* r, __nv_bfloat16* y,
+                         int rows, int cols, float eps);
+void layernorm_launch_bf16(const __nv_bfloat16* x, const float* w,
+                           const float* b, __nv_bfloat16* y,
+                           int rows, int cols, float eps);
+void softmax_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y,
+                         int rows, int cols);
+void rope_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, int seq,
+                      int dim, float theta, int pos_offset);
+void rope_neox_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, int seq,
+                           int dim, float theta, int pos_offset);
 
 } // namespace fusedtok

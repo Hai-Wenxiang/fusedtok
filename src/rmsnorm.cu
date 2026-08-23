@@ -1,17 +1,16 @@
 // RMSNorm (with optional fused residual add).
 //
-// Single-kernel block-per-row implementation:
-//   - one thread block owns one row
-//   - pass 1: strided accumulation of sum of squares, warp-shuffle +
-//     shared-memory block reduction (deterministic, no scratch buffer)
-//   - pass 2: strided write of the normalized, weighted output
-// Works for any cols (large rows are re-read from cache on pass 2).
+// Single-kernel block-per-row implementation, templated on storage dtype:
+// compute always runs in float32; bf16 inputs convert at load, outputs
+// round to nearest-even bf16 at store. Weight stays float32 in both cases
+// (matching common checkpoint layouts where norm weights are kept fp32).
 
 #include "fusedtok/fusedtok.hpp"
 #include "fusedtok/cuda_launch.hpp"
 #include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <stdexcept>
 
@@ -26,37 +25,37 @@ void rmsnorm_check(const std::vector<float>& x, const std::vector<float>& w,
                    int rows, int cols, const std::vector<float>* residual) {
     if (rows < 0 || cols <= 0)
         throw std::invalid_argument("rows must be >= 0 and cols must be > 0");
-    if (static_cast<long long>(rows) * cols != static_cast<long long>(x.size()))
+    if (static_cast<long long>(rows) * cols != static_cast<long long>(x.size())
+        || (residual && residual->size() != x.size()))
         throw std::invalid_argument("x.size() must equal rows * cols");
     if (w.size() != static_cast<size_t>(cols))
         throw std::invalid_argument("weight.size() must equal cols");
-    if (residual && residual->size() != x.size())
-        throw std::invalid_argument("residual.size() must equal x.size()");
 }
 
 constexpr int kRmsBlock = 256;
 
-__global__ void rmsnorm_kernel(const float* __restrict__ x,
-                               const float* __restrict__ r,
+template <typename T>
+__global__ void rmsnorm_kernel(const T* __restrict__ x,
+                               const T* __restrict__ r,
                                const float* __restrict__ w,
-                               float* __restrict__ y,
+                               T* __restrict__ y,
                                int cols, float eps) {
     __shared__ float shared[kRmsBlock / 32];
-    const float* xr = x + (size_t)blockIdx.x * cols;
-    const float* rr = r ? r + (size_t)blockIdx.x * cols : nullptr;
-    float* yr = y + (size_t)blockIdx.x * cols;
+    const T* xr = x + (size_t)blockIdx.x * cols;
+    const T* rr = r ? r + (size_t)blockIdx.x * cols : nullptr;
+    T* yr = y + (size_t)blockIdx.x * cols;
 
     float acc = 0.0f;
     for (int i = threadIdx.x; i < cols; i += kRmsBlock) {
-        float v = xr[i] + (rr ? rr[i] : 0.0f);
+        float v = ld_f(xr, i) + (rr ? ld_f(rr, i) : 0.0f);
         acc += v * v;
     }
     const float total = block_reduce_sum<kRmsBlock>(acc, shared);
     const float inv = rsqrtf(total / cols + eps);
 
     for (int i = threadIdx.x; i < cols; i += kRmsBlock) {
-        float v = xr[i] + (rr ? rr[i] : 0.0f);
-        yr[i] = v * inv * w[i];
+        float v = ld_f(xr, i) + (rr ? ld_f(rr, i) : 0.0f);
+        st_f(yr, i, v * inv * w[i]);
     }
 }
 
@@ -87,8 +86,16 @@ std::vector<float> rmsnorm_cpu(const std::vector<float>& x,
 void rmsnorm_launch(const float* x, const float* w, const float* r,
                     float* y, int rows, int cols, float eps) {
     if (rows <= 0 || cols <= 0) return;
-    rmsnorm_kernel<<<rows, kRmsBlock>>>(x, r, w, y, cols, eps);
+    rmsnorm_kernel<float><<<rows, kRmsBlock>>>(x, r, w, y, cols, eps);
     check_launch("rmsnorm kernel launch");
+}
+
+void rmsnorm_launch_bf16(const __nv_bfloat16* x, const float* w,
+                         const __nv_bfloat16* r, __nv_bfloat16* y,
+                         int rows, int cols, float eps) {
+    if (rows <= 0 || cols <= 0) return;
+    rmsnorm_kernel<__nv_bfloat16><<<rows, kRmsBlock>>>(x, r, w, y, cols, eps);
+    check_launch("rmsnorm bf16 kernel launch");
 }
 
 } // namespace fusedtok

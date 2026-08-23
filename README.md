@@ -114,6 +114,9 @@ values, indices = fusedtok.topk(logits, k=50)
 
 Every function accepts float32 numpy arrays or torch tensors (other dtypes
 are converted with a copy) and returns float32 outputs of the same family.
+CUDA torch tensors may also be **bfloat16** - the kernels compute in float32
+and convert at the load/store boundary (norm weights are upcast to float32
+automatically; sampling/selection ops stay float32).
 CUDA torch tensors select the zero-copy path automatically.
 
 See `examples/demo.py` for a runnable tour of every operator.

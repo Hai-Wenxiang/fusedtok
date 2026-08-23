@@ -16,6 +16,14 @@ adheres to [Semantic Versioning](https://semver.org/).
   CPU reference implements the identical algorithm; boundary draws may pick
   a neighbor token due to exact-exp vs fast-exp rounding (both valid).
   Same seed gives the same token across the CPU / staged / zero-copy paths.
+### Added
+- bfloat16 support on the zero-copy torch path for the inference core:
+  SiLU / GeLU (both forms) / ReLU / Tanh / Sigmoid, add / mul / SwiGLU,
+  RMSNorm / LayerNorm (norm weights upcast to float32 automatically),
+  row-wise softmax, and both RoPE layouts. Kernels are templated on the
+  storage dtype and compute in float32, converting at the load/store
+  boundary (round-to-nearest-even). Sampling/selection ops remain float32
+  (logits are f32). numpy paths are unaffected (numpy has no native bf16).
 ### Changed
 - softmax rewritten for the LLM-relevant row widths (cols <= 8192):
   register-resident single-read kernel - each thread keeps its slice of the

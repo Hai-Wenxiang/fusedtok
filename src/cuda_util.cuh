@@ -5,6 +5,7 @@
 // the order-preserving float key packing used by the selection kernels.
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -98,6 +99,25 @@ __device__ __forceinline__ unsigned int fkey(float v) {
 __device__ __forceinline__ float unfkey(unsigned int u) {
     unsigned int bits = (u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u;
     return __uint_as_float(bits);
+}
+
+// ---------------------------------------------------------------------------
+// dtype-generic load/store for kernel templates: compute always happens in
+// float32; bf16 buffers convert at the memory boundary. This keeps one code
+// path per kernel with full numerical parity tooling.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float ld_f(const float* p, long long i) {
+    return p[i];
+}
+__device__ __forceinline__ float ld_f(const __nv_bfloat16* p, long long i) {
+    return __bfloat162float(p[i]);
+}
+__device__ __forceinline__ void st_f(float* p, long long i, float v) {
+    p[i] = v;
+}
+__device__ __forceinline__ void st_f(__nv_bfloat16* p, long long i, float v) {
+    p[i] = __float2bfloat16_rn(v);   // round-to-nearest-even
 }
 
 } // namespace fusedtok
