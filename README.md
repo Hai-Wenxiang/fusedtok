@@ -145,6 +145,22 @@ reproduce with `python benchmarks/bench.py`):
 
 ![fusedtok vs PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
+**RTX 5060 Ti (Blackwell, sm_120)** — same suite, torch 2.11/cu128, highlights:
+
+| Op | Shape | fusedtok | PyTorch eager | Speedup |
+|---|---|---:|---:|---:|
+| RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
+| RMSNorm (+residual) | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
+| Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
+| argmax | [32000] | 11 µs | 22 µs | **1.9x** |
+| LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
+
+![fusedtok vs PyTorch eager (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
+
+The PyPI wheel ships sm_80/sm_86 cubins plus a compute_86 PTX fallback —
+verified to JIT and run correctly on Blackwell (sm_120) drivers.
+
 Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
 intermediate tensors through global memory. Pure memory-bound elementwise ops
 run at the same ~330-500 GB/s as PyTorch's tuned kernels (silu, gelu, add ≈

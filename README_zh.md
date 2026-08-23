@@ -138,6 +138,22 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_results.json`，可用
 
 ![fusedtok 对比 PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
+**RTX 5060 Ti（Blackwell，sm_120）** —— 同套测试，torch 2.11/cu128，亮点：
+
+| 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
+|---|---|---:|---:|---:|
+| RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
+| RMSNorm（含残差） | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
+| Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
+| argmax | [32000] | 11 µs | 22 µs | **1.9x** |
+| LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
+
+![fusedtok 对比 PyTorch eager（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
+
+PyPI wheel 附带 sm_80/sm_86 原生 cubin 与 compute_86 PTX 回退 —— 已在
+Blackwell（sm_120）驱动上验证 JIT 运行正确。
+
 融合算子（RoPE / RMSNorm / SwiGLU）优势明显：eager 模式的中间张量要在显存间
 来回搬运。纯带宽受限的逐元素算子与 PyTorch 调优 kernel 跑出相同的
 ~330-500 GB/s（silu、gelu、add ≈ 持平）。Softmax 与 top-k 仍落后于 PyTorch
