@@ -3,13 +3,19 @@ path, with float32 references (bf16 has ~3 decimal digits; tolerances
 account for the 8-bit mantissa)."""
 
 import pytest
-import torch
 
 import fusedtok
 
-requires_gpu = pytest.mark.skipif(
-    not (fusedtok.cuda_available() and hasattr(torch, "bfloat16")),
-    reason="no GPU / no bfloat16")
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:          # torch is optional; CI runs without it
+    torch = None
+    HAS_TORCH = False
+
+pytestmark = pytest.mark.skipif(
+    not (HAS_TORCH and fusedtok.cuda_available()),
+    reason="no torch / no GPU")
 
 
 @requires_gpu
