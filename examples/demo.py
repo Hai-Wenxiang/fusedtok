@@ -191,6 +191,30 @@ def main():
         ALL_OK &= ok
 
     print(SEP)
+    print("INT8: symmetric per-tensor quantization (storage path)")
+    x = rng.standard_normal(512).astype(np.float32)
+    q, s = fusedtok.quantize_int8(x)
+    back = fusedtok.dequantize_int8(q, s)
+    err = np.abs(back - x).max()
+    ok = q.dtype == np.int8 and err <= s * 0.51
+    print(f"  {'roundtrip error < half-step':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    if have_cuda and HAS_TORCH:
+        xt = torch.from_numpy(x).cuda()
+        tq, ts = fusedtok.quantize_int8(xt)
+        ok = tq.dtype is torch.int8 and abs(float(ts) - s) < 1e-6 * max(s, 1e-30)
+        print(f"  {'zero-copy matches CPU scale':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+        zt = torch.from_numpy(rng.standard_normal(512).astype(np.float32)).cuda()
+        qz, sz = fusedtok.quantize_int8(zt)
+        qy, sy = fusedtok.qadd_int8(tq, float(ts), qz, float(sz))
+        ref, sref = fusedtok.quantize_int8(back * 0 + (x + zt.cpu().numpy()).astype(np.float32))
+        dqy = qy.float().cpu().numpy() * float(sy)
+        ok = np.abs(dqy - np.asarray(x + zt.cpu().numpy())).max() <= float(sy) * 1.01
+        print(f"  {'fused qadd within one step':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+
+    print(SEP)
     print("ALL PASS" if ALL_OK else "SOME CHECKS FAILED")
     return 0 if ALL_OK else 1
 
