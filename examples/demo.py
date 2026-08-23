@@ -1,18 +1,29 @@
 """Demo: run every fusedtok operator and verify it against closed-form
 results on all available execution paths (CPU reference, staged CUDA,
-zero-copy torch CUDA).
+zero-copy torch CUDA, bf16).
 
-Run:  py -3.12 examples/demo.py   (build dir on PYTHONPATH, or pip-installed)
+Run from the repo root after a dev build (PYTHONPATH=build) or with the
+package pip-installed:
+
+    python examples/demo.py
 """
 
 import math
-import os
 import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
-import fusedtok  # noqa: E402
+try:
+    import fusedtok
+except ImportError:
+    # dev tree fallback: try the common CMake build dirs + python/ package,
+    # no install needed
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in ("build", "build2"):
+        sys.path.insert(0, os.path.join(here, "..", cand))
+    sys.path.insert(0, os.path.join(here, "..", "python"))
+    import fusedtok
 
 try:
     import torch
@@ -34,6 +45,7 @@ def check(name, got, expect, tol=1e-4):
 
 
 def main():
+    global ALL_OK
     have_cuda = fusedtok.cuda_available()
     print(f"fusedtok {fusedtok.__version__} | CUDA device: {have_cuda} | torch: {HAS_TORCH}\n")
 
@@ -145,6 +157,38 @@ def main():
     y = fusedtok.repetition_penalty(lg, [0, 2], 2.0, cuda=True) if have_cuda \
         else fusedtok.repetition_penalty(lg, [0, 2], 2.0)
     check("repetition penalty", y, [2.0, 4.0, 2.0, 4.0, 4.0])
+
+    print(SEP)
+    print("sample_topp: fused nucleus sampling (softmax -> top-p -> draw)")
+    if have_cuda:
+        logits = rng.standard_normal(1000).astype(np.float32) * 2.0
+        tok = fusedtok.sample_topp(logits, 0.9, seed=42, cuda=True)
+        tok2 = fusedtok.sample_topp(logits, 0.9, seed=42, cuda=True)
+        ok = tok == tok2 == fusedtok.sample_topp(logits, 0.9, seed=42)
+        print(f"  {'deterministic per seed':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+        if HAS_TORCH:
+            tl = torch.from_numpy(logits).cuda()
+            ok = fusedtok.sample_topp(tl, 0.9, seed=42) == tok
+            print(f"  {'zero-copy matches staged':<26} {'PASS' if ok else 'FAIL'}")
+            ALL_OK &= ok
+
+    print(SEP)
+    print("bfloat16: same math, half the memory (torch zero-copy path)")
+    if have_cuda and HAS_TORCH:
+        x32 = torch.randn(64, 512, device="cuda")
+        x16 = x32.to(torch.bfloat16)
+        w = torch.rand(512, device="cuda") + 0.5
+        y32 = fusedtok.rmsnorm(x32, w)
+        y16 = fusedtok.rmsnorm(x16, w)
+        ok = y16.dtype is torch.bfloat16 and \
+            torch.allclose(y16.float(), y32, rtol=2e-2, atol=2e-2)
+        print(f"  {'rmsnorm bf16 vs f32':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+        s16 = fusedtok.softmax(x16)
+        ok = bool((s16.float().sum(-1) - 1).abs().max() < 5e-3)
+        print(f"  {'softmax bf16 rows sum 1':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
 
     print(SEP)
     print("ALL PASS" if ALL_OK else "SOME CHECKS FAILED")

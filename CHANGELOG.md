@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-08-23
+
+### Fixed
+- `sample_topp` was missing from `__all__` (shadowed by star-imports)
+- demo.py: stale import fallback only probed `build/`; now probes both
+  common dev build dirs, declares `ALL_OK` global correctly, and tours the
+  v0.2 features (fused sampling determinism + zero-copy parity, bf16
+  rmsnorm/softmax)
+
+### Changed
+- removed a dead functor in activations.cu that raised nvcc warning
+  #177-D on every Linux build
+- benchmark chart filenames derive from the queried device; docs/
+  benchmark JSONs renamed per device (rt3060 / rt5060ti)
+
+### Added
+- READMEs: minimal per-token sampling loop example (English + Chinese)
+
 ## [0.2.0] - 2026-08-23
 
 ### Added

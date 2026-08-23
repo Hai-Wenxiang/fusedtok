@@ -102,9 +102,26 @@ yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch 张量
 q = torch.randn(1, 4096, device="cuda")          # 只传入新 token
 q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
 
-# 采样侧
+# 采样侧：惩罚 + 融合核采样（单 kernel，可复现种子）
 logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
-values, indices = fusedtok.topk(logits, k=50)
+token = fusedtok.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+```
+
+一个最小的逐 token 采样循环：
+
+```python
+import torch, fusedtok as ft
+
+h = torch.zeros(1, 4096, device="cuda")            # 解码状态
+w = torch.load("rms_weight.pt").cuda()             # float32 权重
+generated = []
+for step in range(256):
+    h = ft.rmsnorm(h, w, residual=h)               # 融合加 + 归一
+    q = ft.rope(q, k=None, pos_offset=step, neox=True)
+    logits = model_output(h)                       # 你的模型
+    logits = ft.repetition_penalty(logits, generated, 1.1)
+    tok = ft.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+    generated.append(int(tok))
 ```
 
 所有函数接受 float32 的 numpy 数组或 torch 张量（其他 dtype 会被拷贝转换），
@@ -122,7 +139,7 @@ values, indices = fusedtok.topk(logits, k=50)
 ## 性能基准
 
 RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时，对比等价的
-PyTorch eager 表达式（完整数据：`docs/benchmark_results.json`，可用
+PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 `python benchmarks/bench.py` 复现）：
 
 | 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |

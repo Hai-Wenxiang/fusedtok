@@ -190,6 +190,9 @@ def main():
 
     x = np.arange(len(ops))
     width = 0.38
+    # output filename derives from the actual device so charts from
+    # different GPUs never overwrite each other
+    dev_slug = dev_name.lower().replace(" ", "").replace("geforce", "")
     fig, ax = plt.subplots(figsize=(11.5, 6.0), dpi=150)
     b1 = ax.bar(x - width / 2, ft_times, width, label="fusedtok", color="#3b82f6")
     b2 = ax.bar(x + width / 2, tr_times, width, label="PyTorch eager", color="#9ca3af")
@@ -209,7 +212,7 @@ def main():
     ax.legend()
     ax.grid(axis="y", alpha=0.3, which="both")
     fig.tight_layout()
-    png_path = os.path.join(args.out, "benchmark_rt3060.png")
+    png_path = os.path.join(args.out, f"benchmark_{dev_slug}.png")
     fig.savefig(png_path)
 
     print(f"\nwrote {json_path}")
