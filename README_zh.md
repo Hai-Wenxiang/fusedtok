@@ -180,9 +180,10 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 
 ## 路线图
 
-- v0.2：bf16 支持、radix-select top-k/top-p（CUB 级速度）、融合采样
-  （softmax+top-p+抽样单趟完成）、CUDA graph 友好批处理
-- v0.3：INT8/FP8 量化路线、block size 自动调优
+- v0.2（已完成）：bf16 零拷贝、radix-select top-k/top-p、融合核采样、
+  单读 softmax、CUDA graph 验证
+- v0.3：INT8/FP8 量化路线、merge-sort 选择（CUB 级）、bf16x2 向量化、
+  block size 自动调优
 - v0.4+：轻量融合 attention；PyPI 预编译 wheel
 
 ## 社区

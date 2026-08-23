@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-08-23
 
 ### Added
 - `sample_topp(logits, p, *, temperature=1.0, seed=0)`: fused nucleus
@@ -54,6 +54,21 @@ adheres to [Semantic Versioning](https://semver.org/).
   1.42x vs PyTorch; top-p: 26x faster than v0.1 (still behind torch.sort at
   small vocab sizes - honest numbers, merge-sort upgrade planned).
   Host-driven per-round fallback retained for non-cooperative devices.
+
+### Verified
+- Linux/Blackwell validation: full suite (134 tests) green on RTX 5060 Ti
+  (sm_120, CUDA 13.2, torch 2.11/cu128), including torch zero-copy, bf16
+  and CUDA-graph cases.
+- Benchmarks on Blackwell: RMSNorm+res 3.3x, RoPE 8.3x, softmax 2.6x,
+  argmax 1.9x vs PyTorch eager (chart in docs/).
+- The released PyPI build (sm_86 cubins + compute_86 PTX) JIT-runs
+  correctly on sm_120 drivers.
+- CUDA graph capture+replay verified for elementwise, norms, softmax,
+  top-k and RoPE launchers (sample_topp documented as not capturable).
+- Windows wheel on CI: skipped - windows runners lack a CUDA toolkit
+  (3GB/30min install per run); local wheel builds are proven, GitHub
+  Releases ship a cp312 Windows wheel, and pip source-build fallback is
+  verified on Windows.
 
 ## [0.1.2] - 2026-08-23
 

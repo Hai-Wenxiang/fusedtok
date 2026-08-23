@@ -188,9 +188,10 @@ suite on every push.
 
 ## Roadmap
 
-- v0.2: bf16 support, radix-select top-k/top-p (CUB-class speed), fused
-  sampling (softmax+top-p+draw in one pass), CUDA graph-friendly batching
-- v0.3: INT8/FP8 quantized paths, block-size autotuning
+- v0.2 (done): bf16 zero-copy, radix-select top-k/top-p, fused nucleus
+  sampling, single-read softmax, CUDA-graph verified
+- v0.3: INT8/FP8 quantized paths, merge-sort selection (CUB-class),
+  bf16x2 vectorized elementwise, block-size autotuning
 - v0.4+: lightweight fused attention; prebuilt wheels on PyPI
 
 ## Community
