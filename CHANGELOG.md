@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - Unreleased
+
+### Changed
+- selection sort phase rewritten: per-block chunk sorts + merge-path levels
+  (one co-rank search per 256-output tile) replace the global bitonic;
+  barriers drop from O(log^2 m) to O(log nb). topk(131k) 1.62x vs torch on
+  Ampere; the topp nucleus count is now a grid-wide parallel scan (was a
+  ~0.9 ms single-thread loop at 131k vocab)
+- bf16 elementwise kernels vectorize 4 elements per thread (ushort4,
+  8B accesses) with scalar tail and misalignment fallback; bf16 element
+  throughput doubles vs the v0.2 scalar kernels at the same DRAM bandwidth
+
 ## [0.2.1] - 2026-08-23
 
 ### Fixed
