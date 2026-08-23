@@ -30,7 +30,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "cuda_available",

@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-08-23
+
+### Fixed
+- Chinese text and typographic dashes/micro signs in both READMEs were
+  mojibake on the PyPI 0.1.1 page (encoding mishap while editing). Both
+  READMEs are restored and verified UTF-8 clean; the PyPI description now
+  renders correctly.
+- Cross-links between the English and Chinese READMEs pointed at the wrong
+  file; both now reference each other correctly.
+
 ## [0.1.1] - 2026-08-23
 
 ### Fixed
