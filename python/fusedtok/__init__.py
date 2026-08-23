@@ -30,7 +30,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "cuda_available",
@@ -595,8 +595,10 @@ def quantize_int8(x):
 
 def dequantize_int8(q, scale):
     """Dequantize int8 to float32: ``x = q * scale``. Accepts the tuple
-    from :func:`quantize_int8` or separate (q, scale) values."""
-    if _is_torch(q) and q.is_cuda:
+    from :func:`quantize_int8` or separate (q, scale) values. CUDA int8
+    tensors take the zero-copy launcher; numpy and CPU tensors take the
+    C++ CPU reference."""
+    if _device_path(q, cuda=False) == "torch-cuda":
         x = torch.empty(q.shape, dtype=torch.float32, device=q.device)
         _fusedtok.dequantize_launch(q.data_ptr(), x.data_ptr(),
                                     float(scale), q.numel())
