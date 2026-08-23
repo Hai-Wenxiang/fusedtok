@@ -8,17 +8,21 @@ based on results) - documented limitation.
 """
 
 import pytest
-import torch
 
 import fusedtok
 
-pytestmark = pytest.mark.skipif(
-    not fusedtok.cuda_available(), reason="no GPU")
-
 try:
-    HAS_GRAPH = hasattr(torch.cuda, "CUDAGraph")
-except Exception:
-    HAS_GRAPH = False
+    import torch
+    HAS_TORCH = True
+except ImportError:          # torch is optional; CI runs without it
+    torch = None
+    HAS_TORCH = False
+
+pytestmark = pytest.mark.skipif(
+    not (HAS_TORCH and fusedtok.cuda_available()),
+    reason="no torch / no GPU")
+
+HAS_GRAPH = HAS_TORCH and hasattr(torch.cuda, "CUDAGraph")
 
 
 @pytest.mark.skipif(not HAS_GRAPH, reason="torch.cuda.CUDAGraph unavailable")
