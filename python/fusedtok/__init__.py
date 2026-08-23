@@ -53,6 +53,7 @@ __all__ = [
     "argmax",
     "topk",
     "topp",
+    "sample_topp",
 ]
 
 

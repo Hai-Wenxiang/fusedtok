@@ -107,9 +107,26 @@ yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch tensor
 q = torch.randn(1, 4096, device="cuda")          # new token only
 q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
 
-# sampling side
+# sampling side: penalty + fused nucleus draw (one kernel, seeded)
 logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
-values, indices = fusedtok.topk(logits, k=50)
+token = fusedtok.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+```
+
+A minimal per-token sampling loop:
+
+```python
+import torch, fusedtok as ft
+
+h = torch.zeros(1, 4096, device="cuda")            # decoder state
+w = torch.load("rms_weight.pt").cuda()             # float32 weights
+generated = []
+for step in range(256):
+    h = ft.rmsnorm(h, w, residual=h)               # fused add + norm
+    q = ft.rope(q, k=None, pos_offset=step, neox=True)
+    logits = model_output(h)                       # your model
+    logits = ft.repetition_penalty(logits, generated, 1.1)
+    tok = ft.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+    generated.append(int(tok))
 ```
 
 Every function accepts float32 numpy arrays or torch tensors (other dtypes
@@ -129,7 +146,7 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 ## Benchmarks
 
 RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing, vs the
-equivalent PyTorch eager expressions (full data: `docs/benchmark_results.json`,
+equivalent PyTorch eager expressions (full data: `docs/benchmark_rt3060.json`,
 reproduce with `python benchmarks/bench.py`):
 
 | Op | Shape | fusedtok | PyTorch eager | Speedup |

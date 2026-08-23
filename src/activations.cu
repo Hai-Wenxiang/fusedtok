@@ -60,10 +60,6 @@ struct TemperatureOp {
     float inv_t;
     __device__ __forceinline__ float operator()(float v) const { return v * inv_t; }
 };
-struct AxpyOp {
-    float a, b;
-    __device__ __forceinline__ float operator()(float v) const { return a * v + b; }
-};
 struct AddOp {
     __device__ __forceinline__ float operator()(float x, float y) const { return x + y; }
 };
