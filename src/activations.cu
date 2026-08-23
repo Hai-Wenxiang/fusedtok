@@ -139,6 +139,45 @@ __global__ void unary_b16x4_kernel(const ushort4* __restrict__ in,
     }
 }
 
+// bf16x8: uint4 = 8 bf16 = 16 bytes per access. 8B accesses saturate
+// Ampere-era GDDR6 but leave 2-3x on the table on GDDR7 parts (measured
+// 0.38x vs torch bf16 silu on RTX 5060 Ti with ushort4; 16B closes it).
+template <typename F>
+__global__ void unary_b16x8_kernel(const uint4* __restrict__ in,
+                                   uint4* __restrict__ out, long long n8, F f16) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n8) {
+        const uint4 v = in[i];
+        uint4 o;
+        unsigned short* po = reinterpret_cast<unsigned short*>(&o);
+        const unsigned short* pv = reinterpret_cast<const unsigned short*>(&v);
+        #pragma unroll
+        for (int l = 0; l < 8; ++l)
+            po[l] = __bfloat16_as_ushort(f16(__ushort_as_bfloat16(pv[l])));
+        out[i] = o;
+    }
+}
+
+template <typename F>
+__global__ void binary_b16x8_kernel(const uint4* __restrict__ a,
+                                    const uint4* __restrict__ b,
+                                    uint4* __restrict__ out, long long n8, F f16) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n8) {
+        const uint4 va = a[i];
+        const uint4 vb = b[i];
+        uint4 o;
+        unsigned short* po = reinterpret_cast<unsigned short*>(&o);
+        const unsigned short* pa = reinterpret_cast<const unsigned short*>(&va);
+        const unsigned short* pb = reinterpret_cast<const unsigned short*>(&vb);
+        #pragma unroll
+        for (int l = 0; l < 8; ++l)
+            po[l] = __bfloat16_as_ushort(f16(__ushort_as_bfloat16(pa[l]),
+                                              __ushort_as_bfloat16(pb[l])));
+        out[i] = o;
+    }
+}
+
 template <typename F>
 __global__ void binary_b16x4_kernel(const ushort4* __restrict__ a,
                                     const ushort4* __restrict__ b,
@@ -188,9 +227,18 @@ template <typename F>
 void launch_unary_bf16(const __nv_bfloat16* x, __nv_bfloat16* y,
                        long long n, F f) {
     if (n <= 0) return;
-    const bool aligned = ((reinterpret_cast<uintptr_t>(x) |
-                           reinterpret_cast<uintptr_t>(y)) & 0x7) == 0;
-    if (aligned && n >= 16) {
+    const uintptr_t bits = reinterpret_cast<uintptr_t>(x) |
+                           reinterpret_cast<uintptr_t>(y);
+    if ((bits & 0xF) == 0 && n >= 32) {
+        const long long n8 = n / 8;
+        unary_b16x8_kernel<F><<<(unsigned)((n8 + kBlock - 1) / kBlock), kBlock>>>(
+            reinterpret_cast<const uint4*>(x),
+            reinterpret_cast<uint4*>(y), n8, f);
+        const int tail = (int)(n - n8 * 8);
+        if (tail > 0)
+            unary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+                x + n8 * 8, y + n8 * 8, tail, f);
+    } else if ((bits & 0x7) == 0 && n >= 16) {
         const long long n4 = n / 4;
         unary_b16x4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock>>>(
             reinterpret_cast<const ushort4*>(x),
@@ -231,10 +279,20 @@ template <typename F>
 void launch_binary_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
                         __nv_bfloat16* y, long long n, F f) {
     if (n <= 0) return;
-    const bool aligned = ((reinterpret_cast<uintptr_t>(a) |
+    const uintptr_t bits = reinterpret_cast<uintptr_t>(a) |
                            reinterpret_cast<uintptr_t>(b) |
-                           reinterpret_cast<uintptr_t>(y)) & 0x7) == 0;
-    if (aligned && n >= 16) {
+                           reinterpret_cast<uintptr_t>(y);
+    if ((bits & 0xF) == 0 && n >= 32) {
+        const long long n8 = n / 8;
+        binary_b16x8_kernel<F><<<(unsigned)((n8 + kBlock - 1) / kBlock), kBlock>>>(
+            reinterpret_cast<const uint4*>(a),
+            reinterpret_cast<const uint4*>(b),
+            reinterpret_cast<uint4*>(y), n8, f);
+        const int tail = (int)(n - n8 * 8);
+        if (tail > 0)
+            binary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+                a + n8 * 8, b + n8 * 8, y + n8 * 8, tail, f);
+    } else if ((bits & 0x7) == 0 && n >= 16) {
         const long long n4 = n / 4;
         binary_b16x4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock>>>(
             reinterpret_cast<const ushort4*>(a),
