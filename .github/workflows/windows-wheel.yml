@@ -32,7 +32,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.27
         with:
           cuda: "12.4.1"
-          method: "network"
+          method: "local"
 
       - name: Show toolkit
         shell: pwsh
