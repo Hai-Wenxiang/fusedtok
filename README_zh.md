@@ -149,15 +149,15 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 
 | 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
-| RMSNorm（含残差） | [1024×4096] | 260 µs | 538 µs | **2.1x** |
-| SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
-| top-k (k=50) | [131072] | 86 µs | 130 µs | **1.6x** |
+| RoPE NeoX (q+k) | [2048×4096] | 410 µs | 2564 µs | **6.2x** |
+| RMSNorm（含残差） | [1024×4096] | 256 µs | 526 µs | **2.1x** |
+| SwiGLU | [1024×4096] | 158 µs | 257 µs | **1.6x** |
+| top-k (k=50) | [131072] | 78 µs | 124 µs | **1.6x** |
 | decode_step（惩罚+采样） | [131072] | 309 µs | 354 µs（3 次调用） | **1.15x** |
-| LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
-| SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
-| Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
-| argmax | [131072] | 36 µs | 46 µs | **1.3x** |
+| Softmax | [1024×4096] | 105 µs | 115 µs | 1.1x |
+| LayerNorm | [1024×4096] | 167 µs | 159 µs | ~1.0x |
+| SiLU | [1024×4096] | 103 µs | 104 µs | ~1.0x |
+| argmax | [131072] | 39 µs | 43 µs | ~1.1x |
 | INT8 解码 GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs（fp16） | **2.0x** |
 
 ![fusedtok 对比 PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
@@ -166,12 +166,12 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 
 | 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
+| RoPE NeoX (q+k) | [512×4096] | 29 µs | 239 µs | **8.3x** |
 | RMSNorm（含残差） | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
 | Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
-| top-k (k=50) | [131072] | 27 µs | 40 µs（CUB） | **1.5x** |
-| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
-| argmax | [32000] | 11 µs | 22 µs | **1.9x** |
+| top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.5x** |
+| SwiGLU | [4096×4096] | 504 µs | 859 µs | **1.7x** |
+| argmax | [32000] | 15 µs | 22 µs | **1.5x** |
 | LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
 
 ![fusedtok 对比 PyTorch eager（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
