@@ -1,13 +1,15 @@
-# Windows wheel builder (v0.4.1 experiment; user-approved attempt).
+# Windows wheel builder (v0.4.1 experiment - OUTCOME: NOT VIABLE YET).
 #
-# Windows runners have no CUDA toolkit - this job installs one via the
-# community cuda-toolkit action (network-extracted, cached by the action
-# across runs) and builds a cp312 win_amd64 wheel. The workflow starts
-# MANUAL (workflow_dispatch) so the ~20-40 min job only runs on request;
-# once proven stable it can also attach the wheel to GitHub Releases or
-# join the PyPI publish job (trusted-publisher environment change).
-# Fallback that always works: the maintainer-built cp312 wheel attached
-# to each GitHub Release + the verified pip source-build path.
+# Three configurations were tried on 2026-08-29 (network + sub-packages,
+# network, local installer): all fail at the Jimver/cuda-toolkit action's
+# cache-path validation within ~2 minutes on windows-2022 runners
+# ("Path(s) specified in the action for caching do(es) not exist"),
+# before any CUDA download completes. The known workaround is a manual
+# curl + silent-install step (the documented enterprise deployment
+# route) - left for a future iteration if Windows PyPI wheels become a
+# priority. The maintained path today: the maintainer-built cp312 wheel
+# attached to every GitHub Release plus the verified pip source-build
+# fallback (see README install notes).
 
 name: windows-wheel
 
