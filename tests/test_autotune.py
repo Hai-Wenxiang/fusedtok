@@ -60,6 +60,20 @@ class TestAutotuneCorrectness:
         ref = fusedtok.softmax(x)
         np.testing.assert_allclose(y, ref, rtol=2e-5, atol=2e-6)
 
+    def test_softmax_coverage_floor(self):
+        # regression: the register-resident variant covers only
+        # BLOCK * 32 elements per row; a tuner that prefers small blocks
+        # (a 5060 Ti liked 128) used to silently drop the row tail for
+        # widths in (4096, 8192]. Walk the vulnerable band: every width
+        # must be covered regardless of which block the tuner picks.
+        for cols in range(4097, 8193, 257):
+            rng = np.random.default_rng(cols)
+            x = (rng.standard_normal((4, cols)) * 3).astype(np.float32)
+            y = fusedtok.softmax(x, cuda=True)
+            ref = fusedtok.softmax(x)
+            np.testing.assert_allclose(y, ref, rtol=3e-5, atol=1e-6,
+                                       err_msg=f"cols={cols}")
+
     def test_tuned_cache_bitidentical_repeats(self):
         # the tuning call and every cached call afterwards must produce
         # bit-identical output (same kernel, same block, same input)

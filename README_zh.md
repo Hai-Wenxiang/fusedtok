@@ -149,16 +149,19 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 
 | 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 410 µs | 2564 µs | **6.2x** |
-| RMSNorm（含残差） | [1024×4096] | 256 µs | 526 µs | **2.1x** |
-| SwiGLU | [1024×4096] | 158 µs | 257 µs | **1.6x** |
-| top-k (k=50) | [131072] | 78 µs | 124 µs | **1.6x** |
+| RoPE NeoX (q+k) | [2048×4096] | 418 µs | 2571 µs | **6.2x** |
+| RMSNorm（含残差） | [1024×4096] | 156 µs | 538 µs | **3.4x** |
+| LayerNorm | [1024×4096] | 115 µs | 161 µs | **1.4x** |
+| SwiGLU | [1024×4096] | 158 µs | 263 µs | **1.7x** |
+| top-k (k=50) | [131072] | 74 µs | 131 µs | **1.8x** |
 | decode_step（惩罚+采样） | [131072] | 309 µs | 354 µs（3 次调用） | **1.15x** |
-| Softmax | [1024×4096] | 105 µs | 115 µs | 1.1x |
-| LayerNorm | [1024×4096] | 167 µs | 159 µs | ~1.0x |
-| SiLU | [1024×4096] | 103 µs | 104 µs | ~1.0x |
-| argmax | [131072] | 39 µs | 43 µs | ~1.1x |
+| Softmax | [1024×4096] | 103 µs | 118 µs | 1.1x |
+| SiLU | [1024×4096] | 104 µs | 108 µs | ~1.0x |
+| argmax | [131072] | 67 µs | 40 µs | 0.6x（含主机回读） |
 | INT8 解码 GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs（fp16） | **2.0x** |
+
+按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
+线程块大小；上表为调优后的数字。
 
 ![fusedtok 对比 PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 

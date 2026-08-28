@@ -141,7 +141,7 @@ __device__ __forceinline__ void st_f(__nv_bfloat16* p, long long i, float v) {
 // instead of failing the call.
 inline int autotune_block(const char* tag, long long shape_key,
                           const std::function<void(int block)>& launch,
-                          cudaStream_t cs) {
+                          cudaStream_t cs, int min_block = 1) {
     static std::mutex mu;
     static std::map<std::pair<const char*, long long>, int> cache;
     std::lock_guard<std::mutex> lock(mu);
@@ -156,6 +156,8 @@ inline int autotune_block(const char* tag, long long shape_key,
     float best_ms = 1e30f;
     int best_block = 256;
     for (int b : cands) {
+        if (b < min_block)
+            continue;               // e.g. coverage floors from the caller
         // A candidate can be structurally unlaunchable (e.g. register
         // pressure at 1024 threads); score those as infinitely slow
         // instead of failing the call, and clear the sticky error.

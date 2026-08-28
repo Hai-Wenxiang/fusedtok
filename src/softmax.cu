@@ -219,15 +219,23 @@ void softmax_dispatch(const T* x, T* y, int rows, int cols, int block,
 }
 
 // Tuning on the caller's own buffers at full size (see the layernorm
-// note for why a truncated scratch problem misleads the choice).
+// note for why a truncated scratch problem misleads the choice). The
+// register-resident variant has a hard coverage ceiling of
+// BLOCK * kSmPerThread elements per row, so candidates below
+// ceil(cols / kSmPerThread) would silently drop the row tail - the
+// tuner never sees them (caught on a 5060 Ti that liked 128-thread
+// blocks; the RTX 3060 never picked one there).
 template <typename T>
 int softmax_pick_block(const char* tag, const T* x, T* y, int rows,
                        int cols, cudaStream_t cs) {
+    int min_block = 1;
+    if (cols <= kSmPerThread * kSmBlock)
+        min_block = (cols + kSmPerThread - 1) / kSmPerThread;
     return autotune_block(tag, ((long long)rows << 32) | (unsigned)cols,
                           [&](int b) {
                               softmax_dispatch<T>(x, y, rows, cols, b, cs);
                           },
-                          cs);
+                          cs, min_block);
 }
 
 } // namespace
