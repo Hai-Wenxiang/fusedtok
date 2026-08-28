@@ -43,6 +43,33 @@ CUDA cases skip automatically.
 6. Keep the CI green: `ubuntu-latest` + CUDA container build and CPU tests
    run on every push.
 
+## New-kernel checklist
+
+Lessons baked into the v0.3/v0.4 sprints - run through this before
+pushing any new GPU kernel:
+
+- [ ] **Sanitizer trio before review**: `compute-sanitizer --tool memcheck`
+      and `--tool racecheck` on a smoke that exercises every code path
+      (both kernels, fallbacks, boundary shapes). Cross-block
+      synchronization bugs only show up here.
+- [ ] **Dual-GPU evidence**: numbers (or at least test runs) from one
+      Ampere and one newer part (Blackwell exposes different occupancy /
+      atomic throughput; the v0.3 selection regression was invisible on
+      the dev GPU).
+- [ ] **Float-order tolerance**: if accumulation order can differ between
+      CPU and GPU paths, state the tolerance in the test and the docstring
+      (see the top-p count drift notes).
+- [ ] **Stream discipline**: launch on the caller's `stream` argument
+      (never the legacy default stream) and keep the launcher free of
+      allocations, syncs, and event queries so it stays CUDA-graph
+      capturable. If the kernel sequence is cached in a graph, remember
+      kernel *parameters* get baked - per-call values must travel through
+      device memory.
+- [ ] **Platform traps**: `1ULL << 64` is UB in device code; `char4`
+      fields are plain `char` (unsigned on MSVC - cast through
+      `(signed char)`); single-thread serial volatile loads are latency
+      poison (stage cooperatively through shared memory).
+
 ## Pull requests
 
 - One logical change per PR, with tests and README updates in the same PR.
