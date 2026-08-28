@@ -86,17 +86,17 @@ std::vector<float> layernorm_cpu(const std::vector<float>& x,
 }
 
 void layernorm_launch(const float* x, const float* w, const float* b,
-                      float* y, int rows, int cols, float eps) {
+                      float* y, int rows, int cols, float eps, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
-    layernorm_kernel<float><<<rows, kLnBlock>>>(x, w, b, y, cols, eps);
+    layernorm_kernel<float><<<rows, kLnBlock, 0, (cudaStream_t)stream>>>(x, w, b, y, cols, eps);
     check_launch("layernorm kernel launch");
 }
 
 void layernorm_launch_bf16(const __nv_bfloat16* x, const float* w,
                            const float* b, __nv_bfloat16* y,
-                           int rows, int cols, float eps) {
+                           int rows, int cols, float eps, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
-    layernorm_kernel<__nv_bfloat16><<<rows, kLnBlock>>>(x, w, b, y, cols, eps);
+    layernorm_kernel<__nv_bfloat16><<<rows, kLnBlock, 0, (cudaStream_t)stream>>>(x, w, b, y, cols, eps);
     check_launch("layernorm bf16 kernel launch");
 }
 

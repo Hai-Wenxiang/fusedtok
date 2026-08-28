@@ -1,4 +1,4 @@
-﻿// pybind11 binding layer for the fusedtok native module.
+// pybind11 binding layer for the fusedtok native module.
 //
 // Three entry styles per operator:
 //   1. "<op>_cpu"  - numpy in / numpy out, runs the std::vector CPU reference
@@ -141,8 +141,10 @@ int* dim_(py::int_ p) { return reinterpret_cast<int*>((uintptr_t)p); }
 // Staged CUDA drivers for elementwise ops (numpy in -> numpy out)
 // ---------------------------------------------------------------------------
 
-using UnaryLauncher = void (*)(const float*, float*, long long);
-using BinaryLauncher = void (*)(const float*, const float*, float*, long long);
+using UnaryLauncher = void (*)(const float*, float*, long long,
+                               std::uintptr_t);
+using BinaryLauncher = void (*)(const float*, const float*, float*, long long,
+                                std::uintptr_t);
 
 // Templated so captured lambdas (parameterized launches) work too.
 template <typename F>
@@ -152,7 +154,7 @@ py::array_t<float> staged_unary(const FArray& x, F launch) {
     if (n == 0) return y;
     DevBuf dx(n * sizeof(float)), dy(n * sizeof(float));
     h2d(dx.get(), x.data(), n * sizeof(float));
-    launch(dx.fget(), dy.fget(), n);
+    launch(dx.fget(), dy.fget(), n, 0);
     d2h(y.mutable_data(), dy.get(), n * sizeof(float));
     sync_device("elementwise kernel");
     return y;
@@ -168,7 +170,7 @@ py::array_t<float> staged_binary(const FArray& a, const FArray& b,
     DevBuf da(n * sizeof(float)), db(n * sizeof(float)), dy(n * sizeof(float));
     h2d(da.get(), a.data(), n * sizeof(float));
     h2d(db.get(), b.data(), n * sizeof(float));
-    launch(da.fget(), db.fget(), dy.fget(), n);
+    launch(da.fget(), db.fget(), dy.fget(), n, 0);
     d2h(y.mutable_data(), dy.get(), n * sizeof(float));
     sync_device("elementwise kernel");
     return y;
@@ -190,8 +192,9 @@ PYBIND11_MODULE(_fusedtok, m) {
         return wrap_vec(ft::axpy_cpu(to_vec(x), a, b), shape_of(x));
     }, py::arg("x"), py::arg("a"), py::arg("b"));
     m.def("axpy", [](FArray x, float a, float b) {
-        return staged_unary(x, [a, b](const float* in, float* out, long long n) {
-            ft::axpy_launch(in, out, n, a, b);
+        return staged_unary(x, [a, b](const float* in, float* out, long long n,
+                                      std::uintptr_t stream) {
+            ft::axpy_launch(in, out, n, a, b, stream);
         });
     }, py::arg("x"), py::arg("a"), py::arg("b"));
 
@@ -227,8 +230,9 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("t"));
     m.def("temperature", [](FArray x, float t) {
         if (!(t > 0.0f)) throw std::invalid_argument("temperature must be > 0");
-        return staged_unary(x, [t](const float* in, float* out, long long n) {
-            ft::temperature_launch(in, out, (int)n, t);
+        return staged_unary(x, [t](const float* in, float* out, long long n,
+                                   std::uintptr_t stream) {
+            ft::temperature_launch(in, out, (int)n, t, stream);
         });
     }, py::arg("x"), py::arg("t"));
 
@@ -259,86 +263,87 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("gate"), py::arg("up"));
 
     // Raw launchers for the zero-copy torch path -------------------------
-    m.def("axpy_launch", [](py::int_ in, py::int_ out, long long n, float a, float b) {
-        ft::axpy_launch(df(in), dfm(out), n, a, b);
-    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("a"), py::arg("b"));
-    m.def("silu_launch", [](py::int_ in, py::int_ out, long long n) {
-        ft::silu_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("gelu_launch", [](py::int_ in, py::int_ out, long long n) {
-        ft::gelu_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("gelu_tanh_launch", [](py::int_ in, py::int_ out, long long n) {
-        ft::gelu_tanh_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("relu_launch", [](py::int_ in, py::int_ out, long long n) {
-        ft::relu_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("tanh_launch", [](py::int_ in, py::int_ out, long long n) {
-        ft::tanh_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("sigmoid_launch", [](py::int_ in, py::int_ out, long long n) {
-        ft::sigmoid_launch(df(in), dfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("temperature_launch", [](py::int_ in, py::int_ out, int n, float t) {
-        ft::temperature_launch(df(in), dfm(out), n, t); }, py::arg("in"), py::arg("out"),
-        py::arg("n"), py::arg("t"));
-    m.def("add_launch", [](py::int_ a, py::int_ b, py::int_ out, long long n) {
-        ft::add_launch(df(a), df(b), dfm(out), n); }, py::arg("a"), py::arg("b"),
-        py::arg("out"), py::arg("n"));
-    m.def("mul_launch", [](py::int_ a, py::int_ b, py::int_ out, long long n) {
-        ft::mul_launch(df(a), df(b), dfm(out), n); }, py::arg("a"), py::arg("b"),
-        py::arg("out"), py::arg("n"));
-    m.def("swiglu_launch", [](py::int_ g, py::int_ u, py::int_ out, long long n) {
-        ft::swiglu_launch(df(g), df(u), dfm(out), n); }, py::arg("gate"), py::arg("up"),
-        py::arg("out"), py::arg("n"));
+    m.def("axpy_launch", [](py::int_ in, py::int_ out, long long n, float a, float b, std::uintptr_t stream) {
+        ft::axpy_launch(df(in), dfm(out), n, a, b, stream);
+    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("a"), py::arg("b"), py::arg("stream") = 0);
+    m.def("silu_launch", [](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::silu_launch(df(in), dfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("gelu_launch", [](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::gelu_launch(df(in), dfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("gelu_tanh_launch", [](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::gelu_tanh_launch(df(in), dfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("relu_launch", [](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::relu_launch(df(in), dfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("tanh_launch", [](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::tanh_launch(df(in), dfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("sigmoid_launch", [](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::sigmoid_launch(df(in), dfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("temperature_launch", [](py::int_ in, py::int_ out, int n, float t, std::uintptr_t stream) {
+        ft::temperature_launch(df(in), dfm(out), n, t, stream); }, py::arg("in"), py::arg("out"),
+        py::arg("n"), py::arg("t"), py::arg("stream") = 0);
+    m.def("add_launch", [](py::int_ a, py::int_ b, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::add_launch(df(a), df(b), dfm(out), n, stream); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("mul_launch", [](py::int_ a, py::int_ b, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::mul_launch(df(a), df(b), dfm(out), n, stream); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("swiglu_launch", [](py::int_ g, py::int_ u, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::swiglu_launch(df(g), df(u), dfm(out), n, stream); }, py::arg("gate"), py::arg("up"),
+        py::arg("out"), py::arg("n"), py::arg("stream") = 0);
 
     // bf16 zero-copy launchers (torch bf16 tensors; compute stays float32)
     using BF = __nv_bfloat16;
     auto dbf = [](py::int_ p) { return reinterpret_cast<const BF*>((uintptr_t)p); };
     auto dbfm = [](py::int_ p) { return reinterpret_cast<BF*>((uintptr_t)p); };
-    m.def("silu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
-        ft::silu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("gelu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
-        ft::gelu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("gelu_tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
-        ft::gelu_tanh_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("relu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
-        ft::relu_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
-        ft::tanh_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("sigmoid_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n) {
-        ft::sigmoid_launch_bf16(dbf(in), dbfm(out), n); }, py::arg("in"), py::arg("out"), py::arg("n"));
-    m.def("add_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n) {
-        ft::add_launch_bf16(dbf(a), dbf(b), dbfm(out), n); }, py::arg("a"), py::arg("b"),
-        py::arg("out"), py::arg("n"));
-    m.def("mul_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n) {
-        ft::mul_launch_bf16(dbf(a), dbf(b), dbfm(out), n); }, py::arg("a"), py::arg("b"),
-        py::arg("out"), py::arg("n"));
-    m.def("swiglu_launch_bf16", [dbf, dbfm](py::int_ g, py::int_ u, py::int_ out, long long n) {
-        ft::swiglu_launch_bf16(dbf(g), dbf(u), dbfm(out), n); }, py::arg("gate"), py::arg("up"),
-        py::arg("out"), py::arg("n"));
+    m.def("silu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::silu_launch_bf16(dbf(in), dbfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("gelu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::gelu_launch_bf16(dbf(in), dbfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("gelu_tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::gelu_tanh_launch_bf16(dbf(in), dbfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("relu_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::relu_launch_bf16(dbf(in), dbfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("tanh_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::tanh_launch_bf16(dbf(in), dbfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("sigmoid_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::sigmoid_launch_bf16(dbf(in), dbfm(out), n, stream); }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("add_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::add_launch_bf16(dbf(a), dbf(b), dbfm(out), n, stream); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("mul_launch_bf16", [dbf, dbfm](py::int_ a, py::int_ b, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::mul_launch_bf16(dbf(a), dbf(b), dbfm(out), n, stream); }, py::arg("a"), py::arg("b"),
+        py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("swiglu_launch_bf16", [dbf, dbfm](py::int_ g, py::int_ u, py::int_ out, long long n, std::uintptr_t stream) {
+        ft::swiglu_launch_bf16(dbf(g), dbf(u), dbfm(out), n, stream); }, py::arg("gate"), py::arg("up"),
+        py::arg("out"), py::arg("n"), py::arg("stream") = 0);
     m.def("rmsnorm_launch_bf16", [dbf, dbfm](py::int_ x, py::int_ w, py::object r,
-                                             py::int_ out, int rows, int cols, float eps) {
+                                             py::int_ out, int rows, int cols, float eps, std::uintptr_t stream) {
         const float* rp_f = nullptr;   // residual is bf16 like x
         const BF* rp = r.is_none()
             ? nullptr
             : reinterpret_cast<const BF*>((uintptr_t)py::int_(r));
-        ft::rmsnorm_launch_bf16(dbf(x), df(w), rp, dbfm(out), rows, cols, eps);
+        ft::rmsnorm_launch_bf16(dbf(x), df(w), rp, dbfm(out), rows, cols, eps, stream);
     }, py::arg("x"), py::arg("weight"), py::arg("residual"), py::arg("out"),
-       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+       py::arg("rows"), py::arg("cols"), py::arg("eps"),
+       py::arg("stream") = 0);
     m.def("layernorm_launch_bf16", [dbf, dbfm](py::int_ x, py::int_ w, py::int_ b,
-                                               py::int_ out, int rows, int cols, float eps) {
-        ft::layernorm_launch_bf16(dbf(x), df(w), df(b), dbfm(out), rows, cols, eps);
+                                               py::int_ out, int rows, int cols, float eps, std::uintptr_t stream) {
+        ft::layernorm_launch_bf16(dbf(x), df(w), df(b), dbfm(out), rows, cols, eps, stream);
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
-       py::arg("rows"), py::arg("cols"), py::arg("eps"));
-    m.def("softmax_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int rows, int cols) {
-        ft::softmax_launch_bf16(dbf(in), dbfm(out), rows, cols);
-    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("cols"));
+       py::arg("rows"), py::arg("cols"), py::arg("eps"), py::arg("stream") = 0);
+    m.def("softmax_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int rows, int cols, std::uintptr_t stream) {
+        ft::softmax_launch_bf16(dbf(in), dbfm(out), rows, cols, stream);
+    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
     m.def("rope_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int seq, int dim,
-                                          double theta, int pos_offset) {
-        ft::rope_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset);
+                                          double theta, int pos_offset, std::uintptr_t stream) {
+        ft::rope_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset, stream);
     }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
-       py::arg("theta"), py::arg("pos_offset"));
+       py::arg("theta"), py::arg("pos_offset"), py::arg("stream") = 0);
     m.def("rope_neox_launch_bf16", [dbf, dbfm](py::int_ in, py::int_ out, int seq, int dim,
-                                               double theta, int pos_offset) {
-        ft::rope_neox_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset);
+                                               double theta, int pos_offset, std::uintptr_t stream) {
+        ft::rope_neox_launch_bf16(dbf(in), dbfm(out), seq, dim, (float)theta, pos_offset, stream);
     }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
-       py::arg("theta"), py::arg("pos_offset"));
+       py::arg("theta"), py::arg("pos_offset"), py::arg("stream") = 0);
 
     // ==================================================================
     // RMSNorm / LayerNorm / softmax (row-major 2-D)
@@ -390,13 +395,13 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("eps") = 1e-6f);
 
     m.def("rmsnorm_launch", [](py::int_ x, py::int_ w, py::object r, py::int_ out,
-                               int rows, int cols, float eps) {
+                               int rows, int cols, float eps, std::uintptr_t stream) {
         const float* rp = r.is_none()
             ? nullptr
             : reinterpret_cast<const float*>((uintptr_t)py::int_(r));
-        ft::rmsnorm_launch(df(x), df(w), rp, dfm(out), rows, cols, eps);
+        ft::rmsnorm_launch(df(x), df(w), rp, dfm(out), rows, cols, eps, stream);
     }, py::arg("x"), py::arg("weight"), py::arg("residual"), py::arg("out"),
-       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+       py::arg("rows"), py::arg("cols"), py::arg("eps"), py::arg("stream") = 0);
 
     m.def("layernorm_cpu", [](FArray x, FArray w, FArray b, float eps) {
         long long rows, cols;
@@ -427,10 +432,10 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("eps") = 1e-6f);
 
     m.def("layernorm_launch", [](py::int_ x, py::int_ w, py::int_ b, py::int_ out,
-                                 int rows, int cols, float eps) {
-        ft::layernorm_launch(df(x), df(w), df(b), dfm(out), rows, cols, eps);
+                                 int rows, int cols, float eps, std::uintptr_t stream) {
+        ft::layernorm_launch(df(x), df(w), df(b), dfm(out), rows, cols, eps, stream);
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
-       py::arg("rows"), py::arg("cols"), py::arg("eps"));
+       py::arg("rows"), py::arg("cols"), py::arg("eps"), py::arg("stream") = 0);
 
     m.def("softmax_cpu", [](FArray x) {
         long long rows, cols;
@@ -452,9 +457,9 @@ PYBIND11_MODULE(_fusedtok, m) {
         return y;
     }, py::arg("x"));
 
-    m.def("softmax_launch", [](py::int_ in, py::int_ out, int rows, int cols) {
-        ft::softmax_launch(df(in), dfm(out), rows, cols);
-    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("cols"));
+    m.def("softmax_launch", [](py::int_ in, py::int_ out, int rows, int cols, std::uintptr_t stream) {
+        ft::softmax_launch(df(in), dfm(out), rows, cols, stream);
+    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
     // ==================================================================
     // RoPE (both layouts, optional position offset for kv-cache decoding)
@@ -529,20 +534,20 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("pos_offset") = 0);
 
     m.def("rope_launch", [](bool neox, py::int_ in, py::int_ out, int seq, int dim,
-                            double theta, int pos_offset) {
+                            double theta, int pos_offset, std::uintptr_t stream) {
         if (neox)
-            ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
+            ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset, stream);
         else
-            ft::rope_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
+            ft::rope_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset, stream);
     }, py::arg("neox"), py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
-       py::arg("theta"), py::arg("pos_offset"));
+       py::arg("theta"), py::arg("pos_offset"), py::arg("stream") = 0);
 
     // explicit-layout aliases (float32)
     m.def("rope_neox_launch", [](py::int_ in, py::int_ out, int seq, int dim,
-                                 double theta, int pos_offset) {
-        ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset);
+                                 double theta, int pos_offset, std::uintptr_t stream) {
+        ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset, stream);
     }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
-       py::arg("theta"), py::arg("pos_offset"));
+       py::arg("theta"), py::arg("pos_offset"), py::arg("stream") = 0);
 
     // ==================================================================
     // Sampling / logits post-processing
@@ -626,19 +631,19 @@ PYBIND11_MODULE(_fusedtok, m) {
         return py::make_tuple(vals, idxs);
     }, py::arg("probs"), py::arg("p"));
 
-    m.def("topk_launch", [](py::int_ x, py::int_ vals, py::int_ idxs, int n, int k) {
-        ft::topk_launch(df(x), dfm(vals), dllm(idxs), n, k);
-    }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("k"));
+    m.def("topk_launch", [](py::int_ x, py::int_ vals, py::int_ idxs, int n, int k, std::uintptr_t stream) {
+        ft::topk_launch(df(x), dfm(vals), dllm(idxs), n, k, stream);
+    }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("k"), py::arg("stream") = 0);
 
     m.def("topp_select_launch", [](py::int_ x, py::int_ vals, py::int_ idxs,
-                                   int n, double p, py::int_ count) {
-        ft::topp_select_launch(df(x), dfm(vals), dllm(idxs), n, (float)p, dim_(count));
+                                   int n, double p, py::int_ count, std::uintptr_t stream) {
+        ft::topp_select_launch(df(x), dfm(vals), dllm(idxs), n, (float)p, dim_(count), stream);
     }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("p"),
-       py::arg("count"));
+       py::arg("count"), py::arg("stream") = 0);
 
-    m.def("argmax_launch", [](py::int_ x, py::int_ out, int n) {
-        ft::argmax_launch(df(x), n, dim_(out));
-    }, py::arg("x"), py::arg("out"), py::arg("n"));
+    m.def("argmax_launch", [](py::int_ x, py::int_ out, int n, std::uintptr_t stream) {
+        ft::argmax_launch(df(x), n, dim_(out), stream);
+    }, py::arg("x"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
 
     // ==================================================================
     // repetition penalty
@@ -681,10 +686,10 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("logits"), py::arg("token_ids"), py::arg("penalty"));
 
     m.def("repetition_penalty_launch", [](py::int_ logits, py::int_ ids, py::int_ out,
-                                          int n, int m, float penalty) {
-        ft::repetition_penalty_launch(df(logits), dll(ids), n, m, penalty, dfm(out));
+                                          int n, int m, float penalty, std::uintptr_t stream) {
+        ft::repetition_penalty_launch(df(logits), dll(ids), n, m, penalty, dfm(out), stream);
     }, py::arg("logits"), py::arg("token_ids"), py::arg("out"), py::arg("n"),
-       py::arg("m"), py::arg("penalty"));
+       py::arg("m"), py::arg("penalty"), py::arg("stream") = 0);
 
     // ==================================================================
     // fused nucleus sampling: softmax -> nucleus -> inverse-CDF draw
@@ -737,36 +742,37 @@ PYBIND11_MODULE(_fusedtok, m) {
         return wrap_vec(x, shape_of(q));
     }, py::arg("q"), py::arg("scale"));
 
-    m.def("quantize_launch", [](py::int_ x, py::int_ q, py::int_ scale, long long n) {
+    m.def("quantize_launch", [](py::int_ x, py::int_ q, py::int_ scale, long long n, std::uintptr_t stream) {
         ft::quantize_int8_launch(df(x),
                                  reinterpret_cast<signed char*>((uintptr_t)q),
-                                 dfm(scale), n);
-    }, py::arg("x"), py::arg("q"), py::arg("scale"), py::arg("n"));
+                                 dfm(scale), n, stream);
+    }, py::arg("x"), py::arg("q"), py::arg("scale"), py::arg("n"), py::arg("stream") = 0);
 
-    m.def("dequantize_launch", [](py::int_ q, py::int_ x, float scale, long long n) {
+    m.def("dequantize_launch", [](py::int_ q, py::int_ x, float scale, long long n, std::uintptr_t stream) {
         ft::dequantize_int8_launch(
             reinterpret_cast<const signed char*>((uintptr_t)q),
-            dfm(x), scale, n);
-    }, py::arg("q"), py::arg("x"), py::arg("scale"), py::arg("n"));
+            dfm(x), scale, n, stream);
+    }, py::arg("q"), py::arg("x"), py::arg("scale"), py::arg("n"), py::arg("stream") = 0);
 
     m.def("qadd_launch", [](py::int_ qa, py::int_ qb, float sa, float sb,
-                            py::int_ qy, py::int_ out_scale, long long n) {
+                            py::int_ qy, py::int_ out_scale, long long n, std::uintptr_t stream) {
         ft::qadd_int8_launch(
             reinterpret_cast<const signed char*>((uintptr_t)qa),
             reinterpret_cast<const signed char*>((uintptr_t)qb),
             sa, sb,
             reinterpret_cast<signed char*>((uintptr_t)qy),
-            dfm(out_scale), n);
+            dfm(out_scale), n, stream);
     }, py::arg("qa"), py::arg("qb"), py::arg("sa"), py::arg("sb"),
-       py::arg("qy"), py::arg("out_scale"), py::arg("n"));
+       py::arg("qy"), py::arg("out_scale"), py::arg("n"), py::arg("stream") = 0);
 
     m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
-                                   unsigned long long seed) -> long long {
+                                   unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
         if (!(p > 0.0 && p <= 1.0))
             throw std::invalid_argument("p must be in (0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        return ft::sample_topp_launch(df(x), n, (float)p, (float)t, seed);
+        return ft::sample_topp_launch(df(x), n, (float)p, (float)t, seed, stream);
     }, py::arg("logits"), py::arg("n"), py::arg("p"), py::arg("t"),
-       py::arg("seed"));
+       py::arg("seed"), py::arg("stream") = 0);
 }

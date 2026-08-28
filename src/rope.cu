@@ -140,37 +140,37 @@ rope_neox_cpu(const std::vector<float>& q, const std::vector<float>* k,
 }
 
 void rope_launch(const float* x, float* y, int seq, int dim, float theta,
-                 int pos_offset) {
+                 int pos_offset, std::uintptr_t stream) {
     if (seq <= 0 || dim <= 0) return;
     int pairs = seq * (dim / 2);
-    rope_kernel<float><<<(pairs + kBlock - 1) / kBlock, kBlock>>>(
+    rope_kernel<float><<<(pairs + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
         x, y, seq, dim, theta, pos_offset);
     check_launch("rope kernel launch");
 }
 
 void rope_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, int seq,
-                      int dim, float theta, int pos_offset) {
+                      int dim, float theta, int pos_offset, std::uintptr_t stream) {
     if (seq <= 0 || dim <= 0) return;
     int pairs = seq * (dim / 2);
-    rope_kernel<__nv_bfloat16><<<(pairs + kBlock - 1) / kBlock, kBlock>>>(
+    rope_kernel<__nv_bfloat16><<<(pairs + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
         x, y, seq, dim, theta, pos_offset);
     check_launch("rope bf16 kernel launch");
 }
 
 void rope_neox_launch(const float* x, float* y, int seq, int dim, float theta,
-                      int pos_offset) {
+                      int pos_offset, std::uintptr_t stream) {
     if (seq <= 0 || dim <= 0) return;
     int threads_needed = seq * (dim / 2);
-    rope_neox_kernel<float><<<(threads_needed + kBlock - 1) / kBlock, kBlock>>>(
+    rope_neox_kernel<float><<<(threads_needed + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
         x, y, seq, dim, theta, pos_offset);
     check_launch("rope_neox kernel launch");
 }
 
 void rope_neox_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, int seq,
-                           int dim, float theta, int pos_offset) {
+                           int dim, float theta, int pos_offset, std::uintptr_t stream) {
     if (seq <= 0 || dim <= 0) return;
     int threads_needed = seq * (dim / 2);
-    rope_neox_kernel<__nv_bfloat16><<<(threads_needed + kBlock - 1) / kBlock, kBlock>>>(
+    rope_neox_kernel<__nv_bfloat16><<<(threads_needed + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
         x, y, seq, dim, theta, pos_offset);
     check_launch("rope_neox bf16 kernel launch");
 }

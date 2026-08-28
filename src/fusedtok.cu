@@ -24,9 +24,9 @@ std::vector<float> axpy_cpu(const std::vector<float>& x, float a, float b) {
     return y;
 }
 
-void axpy_launch(const float* x, float* y, long long n, float a, float b) {
+void axpy_launch(const float* x, float* y, long long n, float a, float b, std::uintptr_t stream) {
     if (n <= 0) return;
-    axpy_kernel<<<(unsigned)grid_for(n), kBlock>>>(x, y, a, b, (int)n);
+    axpy_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(x, y, a, b, (int)n);
     check_launch("axpy kernel launch");
 }
 

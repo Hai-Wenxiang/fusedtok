@@ -195,25 +195,25 @@ std::vector<float> softmax_cpu(const std::vector<float>& x, int rows, int cols) 
     return y;
 }
 
-void softmax_launch(const float* x, float* y, int rows, int cols) {
+void softmax_launch(const float* x, float* y, int rows, int cols, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
     if (cols <= kSmPerThread * kSmBlock) {
-        softmax_reg_kernel<float><<<rows, kSmBlock>>>(x, y, cols);
+        softmax_reg_kernel<float><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
         check_launch("softmax kernel launch");
     } else {
-        softmax_online_kernel<float><<<rows, kSmBlock>>>(x, y, cols);
+        softmax_online_kernel<float><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
         check_launch("softmax kernel launch");
     }
 }
 
 void softmax_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y,
-                         int rows, int cols) {
+                         int rows, int cols, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
     if (cols <= kSmPerThread * kSmBlock) {
-        softmax_reg_kernel<__nv_bfloat16><<<rows, kSmBlock>>>(x, y, cols);
+        softmax_reg_kernel<__nv_bfloat16><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
         check_launch("softmax bf16 kernel launch");
     } else {
-        softmax_online_kernel<__nv_bfloat16><<<rows, kSmBlock>>>(x, y, cols);
+        softmax_online_kernel<__nv_bfloat16><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
         check_launch("softmax bf16 kernel launch");
     }
 }

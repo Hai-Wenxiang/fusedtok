@@ -119,6 +119,16 @@ def _norm_weight_f32(weight, ref):
     return weight.to(torch.float32)
 
 
+
+def _cuda_stream():
+    """Current torch CUDA stream handle (0 = legacy default stream).
+
+    Passing the live stream keeps the zero-copy launchers ordered with
+    surrounding torch work and makes them CUDA-graph capturable.
+    """
+    return torch.cuda.current_stream().cuda_stream
+
+
 def _as_numpy(x, name):
     """Anything -> float32 C-contiguous numpy array (copy only if needed)."""
     if isinstance(x, np.ndarray):
@@ -154,9 +164,9 @@ def _unary(x, cuda, staged, cpu, launch, launch_bf16=None):
         _check_torch_float(x, "x")
         out = torch.empty_like(x)
         if x.dtype is torch.bfloat16 and launch_bf16 is not None:
-            launch_bf16(x.data_ptr(), out.data_ptr(), x.numel())
+            launch_bf16(x.data_ptr(), out.data_ptr(), x.numel(), _cuda_stream())
         else:
-            launch(x.data_ptr(), out.data_ptr(), x.numel())
+            launch(x.data_ptr(), out.data_ptr(), x.numel(), _cuda_stream())
         return out
     arr = _as_numpy(x, "x")
     res = staged(arr) if path == "staged" else cpu(arr)
@@ -210,7 +220,7 @@ def temperature(x, t, *, cuda=False):
     if path == "torch-cuda":
         _check_torch_f32(x, "x")
         out = torch.empty_like(x)
-        _fusedtok.temperature_launch(x.data_ptr(), out.data_ptr(), x.numel(), t)
+        _fusedtok.temperature_launch(x.data_ptr(), out.data_ptr(), x.numel(), t, _cuda_stream())
         return out
     arr = _as_numpy(x, "x")
     res = _fusedtok.temperature(arr, t) if path == "staged" else _fusedtok.temperature_cpu(arr, t)
@@ -223,7 +233,7 @@ def axpy(x, a=1.0, b=0.0, *, cuda=False):
     if path == "torch-cuda":
         _check_torch_f32(x, "x")
         out = torch.empty_like(x)
-        _fusedtok.axpy_launch(x.data_ptr(), out.data_ptr(), x.numel(), a, b)
+        _fusedtok.axpy_launch(x.data_ptr(), out.data_ptr(), x.numel(), a, b, _cuda_stream())
         return out
     arr = _as_numpy(x, "x")
     res = _fusedtok.axpy(arr, a, b) if path == "staged" else _fusedtok.axpy_cpu(arr, a, b)
@@ -247,9 +257,9 @@ def _binary(a, b, cuda, staged, cpu, launch, name, launch_bf16=None):
             raise ValueError("inputs must have the same shape")
         out = torch.empty_like(a)
         if a.dtype is torch.bfloat16 and launch_bf16 is not None:
-            launch_bf16(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel())
+            launch_bf16(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel(), _cuda_stream())
         else:
-            launch(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel())
+            launch(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel(), _cuda_stream())
         return out
     arr_a = _as_numpy(a, name)
     arr_b = _as_numpy(b, name)
@@ -309,10 +319,12 @@ def rmsnorm(x, weight, *, residual=None, eps=1e-6, cuda=False):
         out = torch.empty_like(x)
         if x.dtype is torch.bfloat16:
             _fusedtok.rmsnorm_launch_bf16(x.data_ptr(), weight.data_ptr(),
-                                          r_ptr, out.data_ptr(), rows, cols, eps)
+                                          r_ptr, out.data_ptr(), rows, cols, eps,
+                                          _cuda_stream())
         else:
             _fusedtok.rmsnorm_launch(x.data_ptr(), weight.data_ptr(), r_ptr,
-                                     out.data_ptr(), rows, cols, eps)
+                                     out.data_ptr(), rows, cols, eps,
+                                     _cuda_stream())
         return out
     arr_x = _as_numpy(x, "x")
     res = (
@@ -355,11 +367,11 @@ def layernorm(x, weight, bias, *, eps=1e-6, cuda=False):
         if x.dtype is torch.bfloat16:
             _fusedtok.layernorm_launch_bf16(x.data_ptr(), weight.data_ptr(),
                                             bias.data_ptr(), out.data_ptr(),
-                                            rows, cols, eps)
+                                            rows, cols, eps, _cuda_stream())
         else:
             _fusedtok.layernorm_launch(x.data_ptr(), weight.data_ptr(),
                                        bias.data_ptr(), out.data_ptr(),
-                                       rows, cols, eps)
+                                       rows, cols, eps, _cuda_stream())
         return out
     arr_x = _as_numpy(x, "x")
     args = (arr_x, _as_numpy(weight, "weight"), _as_numpy(bias, "bias"), eps)
@@ -375,9 +387,9 @@ def softmax(x, *, cuda=False):
         rows, cols = _shape_rows_cols(x)
         out = torch.empty_like(x)
         if x.dtype is torch.bfloat16:
-            _fusedtok.softmax_launch_bf16(x.data_ptr(), out.data_ptr(), rows, cols)
+            _fusedtok.softmax_launch_bf16(x.data_ptr(), out.data_ptr(), rows, cols, _cuda_stream())
         else:
-            _fusedtok.softmax_launch(x.data_ptr(), out.data_ptr(), rows, cols)
+            _fusedtok.softmax_launch(x.data_ptr(), out.data_ptr(), rows, cols, _cuda_stream())
         return out
     arr_x = _as_numpy(x, "x")
     res = _fusedtok.softmax(arr_x) if path == "staged" else _fusedtok.softmax_cpu(arr_x)
@@ -426,12 +438,12 @@ def rope(q, k=None, *, theta=10000.0, pos_offset=0, neox=False, cuda=False):
         if q.dtype is torch.bfloat16:
             def _launch_rope(neox_flag, src, dst, s, d, th, off):
                 if neox_flag:
-                    _fusedtok.rope_neox_launch_bf16(src, dst, s, d, th, off)
+                    _fusedtok.rope_neox_launch_bf16(src, dst, s, d, th, off, _cuda_stream())
                 else:
-                    _fusedtok.rope_launch_bf16(src, dst, s, d, th, off)
+                    _fusedtok.rope_launch_bf16(src, dst, s, d, th, off, _cuda_stream())
         else:
             def _launch_rope(neox_flag, src, dst, s, d, th, off):
-                _fusedtok.rope_launch(neox_flag, src, dst, s, d, th, off)
+                _fusedtok.rope_launch(neox_flag, src, dst, s, d, th, off, _cuda_stream())
         _launch_rope(neox, q.data_ptr(), q_out.data_ptr(), seq, dim,
                      theta, pos_offset)
         if k_out is not None:
@@ -462,7 +474,7 @@ def argmax(x, *, cuda=False):
         if x.ndim != 1:
             raise ValueError("argmax expects 1-D input")
         out = torch.empty(1, dtype=torch.int32, device=x.device)
-        _fusedtok.argmax_launch(x.data_ptr(), out.data_ptr(), x.numel())
+        _fusedtok.argmax_launch(x.data_ptr(), out.data_ptr(), x.numel(), _cuda_stream())
         return int(out.item())
     arr = _as_numpy(x, "x")
     if arr.ndim != 1:
@@ -485,7 +497,7 @@ def topk(x, k, *, cuda=False):
         idxs = torch.empty(k, dtype=torch.int64, device=x.device)
         if k > 0:
             _fusedtok.topk_launch(x.data_ptr(), vals.data_ptr(),
-                                  idxs.data_ptr(), n, k)
+                                  idxs.data_ptr(), n, k, _cuda_stream())
         return vals, idxs
     arr = _as_numpy(x, "x")
     if arr.ndim != 1:
@@ -517,7 +529,8 @@ def topp(probs, p, *, cuda=False):
         idxs = torch.empty(n, dtype=torch.int64, device=probs.device)
         cnt = torch.empty(1, dtype=torch.int32, device=probs.device)
         _fusedtok.topp_select_launch(probs.data_ptr(), vals.data_ptr(),
-                                     idxs.data_ptr(), n, p, cnt.data_ptr())
+                                     idxs.data_ptr(), n, p, cnt.data_ptr(),
+                                     _cuda_stream())
         c = int(cnt.item())
         return vals[:c], idxs[:c]
     arr = _as_numpy(probs, "probs")
@@ -561,7 +574,7 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
         out = torch.empty_like(logits)
         _fusedtok.repetition_penalty_launch(
             logits.data_ptr(), ids.data_ptr(), out.data_ptr(),
-            n, ids.numel(), penalty)
+            n, ids.numel(), penalty, _cuda_stream())
         return out
     arr = _as_numpy(logits, "logits")
     ids = np.asarray(token_ids, dtype=np.int64).ravel()
@@ -584,7 +597,8 @@ def quantize_int8(x):
         q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
         scale = torch.empty(1, dtype=torch.float32, device=x.device)
         _fusedtok.quantize_launch(x.data_ptr(), q.data_ptr(),
-                                  scale.data_ptr(), x.numel())
+                                  scale.data_ptr(), x.numel(),
+                                  _cuda_stream())
         return q, scale
     arr = _as_numpy(x, "x")
     q, s = _fusedtok.quantize_int8_cpu(arr)
@@ -601,7 +615,8 @@ def dequantize_int8(q, scale):
     if _device_path(q, cuda=False) == "torch-cuda":
         x = torch.empty(q.shape, dtype=torch.float32, device=q.device)
         _fusedtok.dequantize_launch(q.data_ptr(), x.data_ptr(),
-                                    float(scale), q.numel())
+                                    float(scale), q.numel(),
+                                    _cuda_stream())
         return x
     arr = np.asarray(q)
     out = _fusedtok.dequantize_int8_cpu(arr, float(scale))
@@ -622,7 +637,8 @@ def qadd_int8(qa, sa, qb, sb):
     qy = torch.empty(qa.shape, dtype=torch.int8, device=qa.device)
     out_scale = torch.empty(1, dtype=torch.float32, device=qa.device)
     _fusedtok.qadd_launch(qa.data_ptr(), qb.data_ptr(), float(sa), float(sb),
-                          qy.data_ptr(), out_scale.data_ptr(), qa.numel())
+                          qy.data_ptr(), out_scale.data_ptr(), qa.numel(),
+                          _cuda_stream())
     return qy, out_scale
 
 
@@ -647,7 +663,8 @@ def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
             raise ValueError("logits must be 1-D")
         return int(_fusedtok.sample_topp_launch(logits.data_ptr(),
                                                 logits.numel(), p,
-                                                temperature, seed))
+                                                temperature, seed,
+                                                _cuda_stream()))
     arr = _as_numpy(logits, "logits")
     if arr.ndim != 1:
         raise ValueError("logits must be 1-D")
