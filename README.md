@@ -28,11 +28,13 @@ traffic and launch overhead.
 | ✅ | Softmax (row-wise) | numerically stable |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
 | ✅ | add / mul | elementwise binary (fused add+residual pattern) |
-| ✅ | top-k / top-p (nucleus) | chunk-merge select, deterministic ties (1.6x vs torch @131k) |
+| ✅ | top-k / top-p (nucleus) | arrival-ticket radix + early-exit compaction, replayed from a cached CUDA graph; deterministic ties (1.5x vs torch/CUB @131k on a 36-SM RTX 5060 Ti) |
 | ✅ | argmax / temperature | greedy decoding helpers |
-| ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, one kernel |
+| ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, global-mass threshold |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
-| ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant (INT8 GEMM: v0.4) |
+| ✅ | decode_step | the whole decode step fused: penalty -> temperature -> nucleus sample, one call, one readback |
+| ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
+| ✅ | qgemm | INT8 matmul, int32-exact: tensor-core IMMA GEMM + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
 
 ## Install
 
@@ -107,7 +109,10 @@ yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch tensor
 q = torch.randn(1, 4096, device="cuda")          # new token only
 q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
 
-# sampling side: penalty + fused nucleus draw (one kernel, seeded)
+# sampling side: the whole decode step in one fused call
+token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,
+                             p=0.9, temperature=0.8, seed=step)
+# or step by step:
 logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
 token = fusedtok.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
 ```
@@ -119,13 +124,14 @@ import torch, fusedtok as ft
 
 h = torch.zeros(1, 4096, device="cuda")            # decoder state
 w = torch.load("rms_weight.pt").cuda()             # float32 weights
+wq, wscale = ft.quantize_int8(weight_f32.ravel())  # int8 weights
 generated = []
 for step in range(256):
     h = ft.rmsnorm(h, w, residual=h)               # fused add + norm
     q = ft.rope(q, k=None, pos_offset=step, neox=True)
     logits = model_output(h)                       # your model
-    logits = ft.repetition_penalty(logits, generated, 1.1)
-    tok = ft.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+    tok = ft.decode_step(logits, generated, penalty=1.1,
+                         p=0.9, temperature=0.8, seed=step)
     generated.append(int(tok))
 ```
 
@@ -154,11 +160,13 @@ reproduce with `python benchmarks/bench.py`):
 | RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
 | RMSNorm (+residual) | [1024×4096] | 260 µs | 538 µs | **2.1x** |
 | SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
+| top-k (k=50) | [131072] | 86 µs | 130 µs | **1.6x** |
+| decode_step (penalty+sample) | [131072] | 309 µs | 354 µs (3 calls) | **1.15x** |
 | LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
 | SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
 | Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
 | argmax | [131072] | 36 µs | 46 µs | **1.3x** |
-| top-k (k=50) | [131072] | 168 µs | 129 µs | 0.8x |
+| INT8 decode GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs (fp16) | **2.0x** |
 
 ![fusedtok vs PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
@@ -169,6 +177,7 @@ reproduce with `python benchmarks/bench.py`):
 | RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
 | RMSNorm (+residual) | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
 | Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| top-k (k=50) | [131072] | 27 µs | 40 µs (CUB) | **1.5x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
 | argmax | [32000] | 11 µs | 22 µs | **1.9x** |
 | LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
@@ -179,10 +188,14 @@ The PyPI wheel ships sm_80/sm_86 cubins plus a compute_86 PTX fallback —
 verified to JIT and run correctly on Blackwell (sm_120) drivers.
 
 Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
-intermediate tensors through global memory. Pure memory-bound elementwise ops
-run at the same ~330-500 GB/s as PyTorch's tuned kernels (silu, gelu, add ≈
-parity). Softmax and top-k remain behind PyTorch's CUB-based kernels —
-honest numbers, on the v0.4 roadmap (decoupled-lookback selection).
+intermediate tensors through global memory. The v0.4 selection pipeline
+(arrival-ticket radix rounds + early-exit compaction, replayed from a
+cached CUDA graph) beats torch's CUB radix select at small k on both
+GPUs; mid-range k (2048..n) stays at or below parity — honest numbers,
+a pipelined tensor-core sort stays future work. The INT8 decode GEMV
+moves half the bytes of an fp16 projection and runs at full memory
+bandwidth (2x); the IMMA GEMM path (~17 TOPS) is correctness-first —
+cuBLASLt (`torch._int_mm`) remains faster for large prefill matmuls.
 
 ## Development
 
@@ -209,9 +222,12 @@ suite on every push.
   sampling, single-read softmax, CUDA-graph verified
 - v0.3 (done): chunk-merge selection sort + parallel nucleus count,
   bf16x4/x8 vectorized elementwise, INT8 quantize/dequantize utilities
-- v0.4: decoupled-lookback selection (CUB-class on many-SM GPUs),
-  INT8 GEMM path, block-size autotuning
-- v0.4+: lightweight fused attention; prebuilt wheels on PyPI
+- v0.4 (done): arrival-ticket selection pipeline (no cooperative
+  launch, early-exit compaction, cached CUDA graphs), stream-aware
+  launchers everywhere (real CUDA-graph capture), INT8 compute path
+  (IMMA qgemm + decode GEMV), fused decode_step sampling
+- v0.4+: lightweight fused attention; prebuilt wheels on PyPI;
+  pipelined tensor-core INT8 GEMM
 
 ## Community
 

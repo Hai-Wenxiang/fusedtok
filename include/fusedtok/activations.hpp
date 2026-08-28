@@ -98,4 +98,14 @@ quantize_int8_cpu(const std::vector<float>& x);
 std::vector<float> dequantize_int8_cpu(const std::vector<signed char>& q,
                                        float scale);
 
+// ---------------------------------------------------------------------------
+// INT8 matmul (compute path): y = (A_q . B_q^T) int32-exact * (sa*sb).
+// Exact integer accumulation, one float scale at the end - GPU and CPU
+// results are bit-identical.
+// ---------------------------------------------------------------------------
+
+std::vector<float> qgemm_cpu(const std::vector<signed char>& aq,
+                             const std::vector<signed char>& bq,
+                             int m, int n, int k, float sa, float sb);
+
 } // namespace fusedtok

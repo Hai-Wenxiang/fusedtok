@@ -28,11 +28,13 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | Softmax（按行） | 数值稳定版 |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | 逐元素 |
 | ✅ | add / mul | 逐元素二元（融合加残差模式） |
-| ✅ | top-k / top-p（核采样） | chunk-merge 选择，平局取先下标（131k 词表 1.6x） |
+| ✅ | top-k / top-p（核采样） | 到达票据 radix + 早退压缩，缓存 CUDA 图整管线回放；平局取先下标（36 SM 的 RTX 5060 Ti 上 131k 词表 1.5x vs torch/CUB） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
-| ✅ | sample_topp | 融合核采样：softmax -> top-p -> 种子抽取，单 kernel |
+| ✅ | sample_topp | 融合核采样：softmax -> top-p -> 种子抽取，全局质量阈值 |
 | ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
-| ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称 per-tensor INT8，融合反量化-加-重量化（INT8 GEMM：v0.4） |
+| ✅ | decode_step | 整个解码步融合：惩罚 -> 温度 -> 核采样，一次调用一次回读 |
+| ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称 per-tensor INT8，融合反量化-加-重量化 |
+| ✅ | qgemm | INT8 矩阵乘，int32 精确：tensor-core IMMA GEMM + 每 warp 一行的 GEMV（M=1 解码；比 fp16 投影快 2 倍） |
 
 ## 安装
 
@@ -102,7 +104,10 @@ yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch 张量
 q = torch.randn(1, 4096, device="cuda")          # 只传入新 token
 q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
 
-# 采样侧：惩罚 + 融合核采样（单 kernel，可复现种子）
+# 采样侧：整个解码步一次融合调用
+token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,
+                             p=0.9, temperature=0.8, seed=step)
+# 或分步执行：
 logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
 token = fusedtok.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
 ```
@@ -119,8 +124,8 @@ for step in range(256):
     h = ft.rmsnorm(h, w, residual=h)               # 融合加 + 归一
     q = ft.rope(q, k=None, pos_offset=step, neox=True)
     logits = model_output(h)                       # 你的模型
-    logits = ft.repetition_penalty(logits, generated, 1.1)
-    tok = ft.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+    tok = ft.decode_step(logits, generated, penalty=1.1,
+                         p=0.9, temperature=0.8, seed=step)
     generated.append(int(tok))
 ```
 
@@ -147,11 +152,13 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 | RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
 | RMSNorm（含残差） | [1024×4096] | 260 µs | 538 µs | **2.1x** |
 | SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
+| top-k (k=50) | [131072] | 86 µs | 130 µs | **1.6x** |
+| decode_step（惩罚+采样） | [131072] | 309 µs | 354 µs（3 次调用） | **1.15x** |
 | LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
 | SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
 | Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
 | argmax | [131072] | 36 µs | 46 µs | **1.3x** |
-| top-k (k=50) | [131072] | 168 µs | 129 µs | 0.8x |
+| INT8 解码 GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs（fp16） | **2.0x** |
 
 ![fusedtok 对比 PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
@@ -162,6 +169,7 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 | RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
 | RMSNorm（含残差） | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
 | Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| top-k (k=50) | [131072] | 27 µs | 40 µs（CUB） | **1.5x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
 | argmax | [32000] | 11 µs | 22 µs | **1.9x** |
 | LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
@@ -172,9 +180,12 @@ PyPI wheel 附带 sm_80/sm_86 原生 cubin 与 compute_86 PTX 回退 —— 已�
 Blackwell（sm_120）驱动上验证 JIT 运行正确。
 
 融合算子（RoPE / RMSNorm / SwiGLU）优势明显：eager 模式的中间张量要在显存间
-来回搬运。纯带宽受限的逐元素算子与 PyTorch 调优 kernel 跑出相同的
-~330-500 GB/s（silu、gelu、add ≈ 持平）。Softmax 与 top-k 仍落后于 PyTorch
-的 CUB 内核 —— 数字诚实，改进列入 v0.4 规划（decoupled-lookback 选择）。
+来回搬运。v0.4 选择管线（到达票据 radix 轮 + 早退压缩，缓存 CUDA 图整管线
+回放）在两张卡上小 k 场景均超过 torch 的 CUB radix select；中等 k
+（2048..n）仍持平或落后 —— 数字诚实，流水线化 tensor-core 排序留作后续
+工作。INT8 解码 GEMV 只搬运 fp16 投影一半的字节并跑满内存带宽（2 倍）；
+IMMA GEMM 路径（约 17 TOPS）以正确性优先 —— 大规模 prefill 矩阵乘仍以
+cuBLASLt（torch._int_mm）更快。
 
 ## 开发
 
@@ -201,8 +212,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
   单读 softmax、CUDA graph 验证
 - v0.3（已完成）：chunk-merge 选择排序 + 并行核计数、bf16x4/x8 向量化、
   INT8 量化/反量化工具
-- v0.4：decoupled-lookback 选择（多 SM 卡达 CUB 级）、INT8 GEMM、
-  block size 自动调优
+- v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
 - v0.4+：轻量融合 attention；PyPI 预编译 wheel
 
 ## 社区

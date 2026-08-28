@@ -214,6 +214,38 @@ def main():
         print(f"  {'fused qadd within one step':<26} {'PASS' if ok else 'FAIL'}")
         ALL_OK &= ok
 
+        print("INT8: qgemm (int32-exact matmul, M=1 dispatches to GEMV)")
+        a = torch.randint(-127, 128, (129, 500), device="cuda", dtype=torch.int8)
+        bmat = torch.randint(-127, 128, (260, 500), device="cuda", dtype=torch.int8)
+        y = fusedtok.qgemm(a, 0.03, bmat, 0.02)
+        an = a.cpu().numpy().astype(np.int64)
+        bn = bmat.cpu().numpy().astype(np.int64)
+        ref_y = (an @ bn.T).astype(np.float32) * np.float32(0.0006)
+        ok = y.shape == (129, 260) and np.abs(y.cpu().numpy() - ref_y).max() < 1e-3
+        print(f"  {'GEMM integer parity':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+        x1 = torch.randint(-127, 128, (1, 1024), device="cuda", dtype=torch.int8)
+        w1 = torch.randint(-127, 128, (4096, 1024), device="cuda", dtype=torch.int8)
+        yv = fusedtok.qgemm(x1, 0.05, w1, 0.01)
+        ref_v = (x1.cpu().numpy().astype(np.int64) @
+                 w1.cpu().numpy().astype(np.int64).T).astype(np.float32)
+        ok = yv.shape == (1, 4096) and np.array_equal(yv.cpu().numpy(), ref_v * 0.0005)
+        print(f"  {'GEMV decode shape parity':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+
+        print("decode_step: fused penalty -> temperature -> nucleus sample")
+        lg = torch.from_numpy((rng.standard_normal(4096) * 2).astype(np.float32)).cuda()
+        lgn = lg.cpu().numpy()
+        ids = rng.integers(0, 4096, size=40).tolist()
+        ti = torch.tensor(ids, dtype=torch.int64).cuda()
+        for seed in (0, 7):
+            tok = fusedtok.decode_step(lg, ti, 1.2, p=0.9, temperature=0.8, seed=seed)
+            pen = fusedtok.repetition_penalty(lgn, ids, 1.2)
+            reftok = fusedtok.sample_topp(pen, 0.9, temperature=0.8, seed=seed)
+            ok = tok == reftok
+            print(f"  {f'seed {seed} matches composed':<26} {'PASS' if ok else 'FAIL'}")
+            ALL_OK &= ok
+
     print(SEP)
     print("ALL PASS" if ALL_OK else "SOME CHECKS FAILED")
     return 0 if ALL_OK else 1

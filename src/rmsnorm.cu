@@ -84,17 +84,17 @@ std::vector<float> rmsnorm_cpu(const std::vector<float>& x,
 }
 
 void rmsnorm_launch(const float* x, const float* w, const float* r,
-                    float* y, int rows, int cols, float eps) {
+                    float* y, int rows, int cols, float eps, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
-    rmsnorm_kernel<float><<<rows, kRmsBlock>>>(x, r, w, y, cols, eps);
+    rmsnorm_kernel<float><<<rows, kRmsBlock, 0, (cudaStream_t)stream>>>(x, r, w, y, cols, eps);
     check_launch("rmsnorm kernel launch");
 }
 
 void rmsnorm_launch_bf16(const __nv_bfloat16* x, const float* w,
                          const __nv_bfloat16* r, __nv_bfloat16* y,
-                         int rows, int cols, float eps) {
+                         int rows, int cols, float eps, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
-    rmsnorm_kernel<__nv_bfloat16><<<rows, kRmsBlock>>>(x, r, w, y, cols, eps);
+    rmsnorm_kernel<__nv_bfloat16><<<rows, kRmsBlock, 0, (cudaStream_t)stream>>>(x, r, w, y, cols, eps);
     check_launch("rmsnorm bf16 kernel launch");
 }
 

@@ -103,10 +103,10 @@ struct DevMax {
     DevMax& operator=(const DevMax&) = delete;
 };
 
-float device_absmax(const float* x, long long n, DevMax& dm) {
+float device_absmax(const float* x, long long n, DevMax& dm, std::uintptr_t stream = 0) {
     const float zero = 0.0f;
     cudaMemcpy(dm.p, &zero, sizeof(float), cudaMemcpyHostToDevice);
-    absmax_kernel<<<(unsigned)grid_for(n), kBlock>>>(x, dm.p, n);
+    absmax_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(x, dm.p, n);
     check_launch("absmax kernel launch");
     float m = 0.0f;
     cudaMemcpy(&m, dm.p, sizeof(float), cudaMemcpyDeviceToHost);
@@ -138,38 +138,38 @@ std::vector<float> dequantize_int8_cpu(const std::vector<signed char>& q,
 }
 
 void quantize_int8_launch(const float* x, signed char* q,
-                          float* scale_out, long long n) {
+                          float* scale_out, long long n, std::uintptr_t stream) {
     if (n <= 0) return;
     static DevMax dm;                      // process-cached scratch
-    const float m = device_absmax(x, n, dm);
+    const float m = device_absmax(x, n, dm, stream);
     const float scale = m > 0.0f ? m / 127.0f : 1.0f;
     cudaMemcpy(scale_out, &scale, sizeof(float), cudaMemcpyHostToDevice);
-    quantize_kernel<<<(unsigned)grid_for(n), kBlock>>>(
+    quantize_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(
         x, q, 1.0f / scale, n);
     check_launch("quantize kernel launch");
 }
 
 void dequantize_int8_launch(const signed char* q, float* x,
-                            float scale, long long n) {
+                            float scale, long long n, std::uintptr_t stream) {
     if (n <= 0) return;
-    dequantize_kernel<<<(unsigned)grid_for(n), kBlock>>>(q, x, scale, n);
+    dequantize_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(q, x, scale, n);
     check_launch("dequantize kernel launch");
 }
 
 void qadd_int8_launch(const signed char* qa, const signed char* qb,
                       float sa, float sb,
-                      signed char* qy, float* out_scale, long long n) {
+                      signed char* qy, float* out_scale, long long n, std::uintptr_t stream) {
     if (n <= 0) return;
     static DevMax dm;
     const float zero = 0.0f;
     cudaMemcpy(dm.p, &zero, sizeof(float), cudaMemcpyHostToDevice);
-    qadd_absmax_kernel<<<(unsigned)grid_for(n), kBlock>>>(qa, qb, sa, sb, dm.p, n);
+    qadd_absmax_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(qa, qb, sa, sb, dm.p, n);
     check_launch("qadd absmax kernel launch");
     float m = 0.0f;
     cudaMemcpy(&m, dm.p, sizeof(float), cudaMemcpyDeviceToHost);
     const float scale = m > 0.0f ? m / 127.0f : 1.0f;
     cudaMemcpy(out_scale, &scale, sizeof(float), cudaMemcpyHostToDevice);
-    qadd_kernel<<<(unsigned)grid_for(n), kBlock>>>(qa, qb, sa, sb,
+    qadd_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(qa, qb, sa, sb,
                                                    1.0f / scale, qy, n);
     check_launch("qadd kernel launch");
 }

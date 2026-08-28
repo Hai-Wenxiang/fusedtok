@@ -4,6 +4,96 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-08-29
+
+### Added
+- qgemm(a_q, a_scale, b_q, b_scale): INT8 matmul closing the v0.4
+  quantized-compute loop - y = (A_q[M,K] int8 @ B_q[N,K] int8^T) *
+  (sa*sb) with int32-exact accumulation (CPU / staged / zero-copy
+  results are bit-identical; the integer math has no tolerance games and
+  the single float scale differs from a numpy float64 reference by at
+  most one rounding). Both operands row-major along K (the LLM
+  activations @ weight.T layout); M == 1 dispatches to a warp-per-row
+  GEMV kernel. The GEMM path uses tensor-core IMMA (wmma s8xs8->s32,
+  64x64 tile, 32x16 per warp). Honest numbers (RTX 3060): decode GEMV
+  [1x4096 @ 131072x4096] runs at 337 GB/s effective - exactly 2x faster
+  than the same projection in fp16, which is the point of INT8 weights;
+  mid-size GEMM reaches ~17 TOPS vs cuBLASLt torch._int_mm's 83 TOPS (a
+  pipelined/CUTLASS-class kernel stays future work; correctness and
+  stream/graph integration are complete). All launchers are
+  stream-aware and CUDA-graph capturable.
+- tests/test_qgemm.py: exact integer parity across shapes (tile
+  boundaries, K tails, k=1), int8 extremes, end-to-end quantized error
+  bound, decode-shaped GEMV, and graph capture-replay with mutation.
+
+- decode_step(logits, sampled_ids, penalty, p=0.9, temperature=1.0,
+  seed=0): the fused decode loop - repetition penalty (vocab bitmap,
+  applied to the raw logit before the temperature scale, matching the
+  composed reference order), temperature, and nucleus sampling, all
+  inside the selection pipeline with a single host readback. Same seed
+  gives the same token as the composed repetition_penalty ->
+  temperature -> sample_topp calls on CPU and every GPU path. 131k-vocab
+  decode: 309us/token vs 354us for the composed three calls (1.15x, and
+  one API call instead of three); the launch is raw (no internal graph -
+  the penalty rides as a kernel parameter, which cached graphs would
+  bake stale).
+- tests/test_decode_step.py: composed-reference parity across penalties
+  and seeds, distribution shift under heavy penalty, empty/disabled
+  penalty paths, a 40-token generation loop, torch zero-copy parity.
+
+### Changed
+- selection kernels (top-k / top-p / sampling) rewritten as a multi-launch
+  pipeline of plain kernels: per-round arrival-ticket radix refinement (the
+  last block to arrive decides the round - no grid-wide barriers, no
+  cooperative launch), early-exit compaction when a boundary bin holds at
+  most 2048 candidates (one block sorts the survivors in shared memory),
+  two-level emit counting (one global atomic per block; k = n skips
+  counting entirely), and a merge-path sort ladder with one launch per
+  level for k > 2048. The whole sequence is captured into a process-cached
+  CUDA graph per (n, k, mode), so a call submits as ONE graph launch;
+  per-call pointers and p travel through a pinned argument ring copied
+  into a device-side argument block that the kernels dereference at
+  runtime (graph nodes stay pointer-stable). Devices without cooperative
+  launch no longer need the v0.1 host-rounds fallback (removed).
+- every `_launch` entry point (and the staged drivers' signatures) gained
+  a trailing `stream` argument; the Python layer passes the live torch
+  stream on zero-copy paths. This FIXES CUDA-graph capture library-wide:
+  the previous launchers used the legacy default stream, so
+  `torch.cuda.graph` captures came back EMPTY and the graph tests passed
+  vacuously against stale warm-up results. The capture tests now mutate
+  inputs between replays and assert recomputation.
+- `sample_topp` nucleus threshold now compares against the GLOBAL softmax
+  mass (computed by two new reduction kernels) instead of the window-local
+  total. The old window-local renormalization silently shrank the nucleus
+  whenever the distribution was flat enough that the widening window did
+  not yet cover it (semantic bug present since v0.2; exposed by a new
+  flat-logits widening test). Flat distributions now widen correctly up to
+  the full vocabulary; realistic peaked logits typically sample from the
+  first 2048-token window.
+
+### Performance (dual-GPU, CUDA events, honest)
+- top-k k=50 @131k: RTX 5060 Ti 26.7us vs torch.topk (CUB radix) 40.7us =
+  1.53x (v0.3: 132us, 0.31x - the many-SM grid.sync barrier pathology is
+  gone); RTX 3060 85.6us wall = 1.56x (v0.3 absolute time roughly halved;
+  the remaining Windows/WDDM gap is CUDA API submission cost, ~44us/call
+  for graph launch + argument copy, not GPU work).
+- top-p @131k: 5060 Ti 158us (v0.3: 672us, 4.3x faster), 0.44x vs a
+  torch sort+cumsum composite; 3060 351us (v0.3: 1146us).
+- sample_topp (realistic peaked logits, p=0.9): 3060 299us including the
+  host readback (v0.3: 976us with the old, incorrect window semantics);
+  flat worst-case distributions honestly cost milliseconds (full-vocab
+  serial scan is the price of the corrected global-mass semantics).
+- top-k mid-range k (2048..5000) remains at or below parity on both GPUs
+  (honest numbers; the CUB radix select is hard to beat when k is large
+  relative to n).
+
+### Added
+- tests/test_select_pipeline.py: deep-prefix distributions that force
+  several radix rounds, tie groups spanning the k boundary, the k > 2048
+  merge ladder, interleaved calls sharing the process workspace, top-p at
+  p = 1.0 over a full 131k vocab, sampling that forces window widening,
+  and torch zero-copy variants of the big paths.
+
 ## [0.3.1] - 2026-08-24
 
 ### Fixed

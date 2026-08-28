@@ -59,14 +59,14 @@ std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
 }
 
 void repetition_penalty_launch(const float* logits, const long long* ids,
-                               int n, int m, float penalty, float* y) {
+                               int n, int m, float penalty, float* y, std::uintptr_t stream) {
     if (n <= 0) return;
     // Non-listed logits pass through unchanged: copy first, then scale the
     // listed ids in place (two stream-ordered launches, still async).
-    copy_kernel<<<(unsigned)grid_for(n), kBlock>>>(logits, y, n);
+    copy_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(logits, y, n);
     cudaError_t err = cudaGetLastError();
     if (err == cudaSuccess && m > 0) {
-        repetition_penalty_kernel<<<(unsigned)grid_for(m), kBlock>>>(
+        repetition_penalty_kernel<<<(unsigned)grid_for(m), kBlock, 0, (cudaStream_t)stream>>>(
             logits, ids, n, m, penalty, y);
         err = cudaGetLastError();
     }

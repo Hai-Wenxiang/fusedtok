@@ -203,20 +203,20 @@ __global__ void binary_b16x4_kernel(const ushort4* __restrict__ a,
 
 // float32 driver: float4 vectorized with scalar tail when aligned.
 template <typename F>
-void launch_unary(const float* x, float* y, long long n, F f) {
+void launch_unary(const float* x, float* y, long long n, F f, std::uintptr_t stream) {
     if (n <= 0) return;
     const bool aligned = ((reinterpret_cast<uintptr_t>(x) |
                            reinterpret_cast<uintptr_t>(y)) & 0xF) == 0;
     if (aligned && n >= 8) {
         const long long n4 = n / 4;
-        unary_f4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock>>>(
+        unary_f4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock, 0, (cudaStream_t)stream>>>(
             reinterpret_cast<const float4*>(x), reinterpret_cast<float4*>(y), n4, f);
         const int tail = (int)(n - n4 * 4);
         if (tail > 0)
-            unary_f1_kernel<float, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            unary_f1_kernel<float, F><<<(tail + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
                 x + n4 * 4, y + n4 * 4, tail, f);
     } else {
-        unary_f1_kernel<float, F><<<(unsigned)grid_for(n), kBlock>>>(x, y, (int)n, f);
+        unary_f1_kernel<float, F><<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(x, y, (int)n, f);
     }
     check_launch("elementwise kernel launch");
 }
@@ -225,85 +225,85 @@ void launch_unary(const float* x, float* y, long long n, F f) {
 // scalar tail otherwise. Element math stays float32.
 template <typename F>
 void launch_unary_bf16(const __nv_bfloat16* x, __nv_bfloat16* y,
-                       long long n, F f) {
+                          long long n, F f, std::uintptr_t stream) {
     if (n <= 0) return;
     const uintptr_t bits = reinterpret_cast<uintptr_t>(x) |
                            reinterpret_cast<uintptr_t>(y);
     if ((bits & 0xF) == 0 && n >= 32) {
         const long long n8 = n / 8;
-        unary_b16x8_kernel<F><<<(unsigned)((n8 + kBlock - 1) / kBlock), kBlock>>>(
+        unary_b16x8_kernel<F><<<(unsigned)((n8 + kBlock - 1) / kBlock), kBlock, 0, (cudaStream_t)stream>>>(
             reinterpret_cast<const uint4*>(x),
             reinterpret_cast<uint4*>(y), n8, f);
         const int tail = (int)(n - n8 * 8);
         if (tail > 0)
-            unary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            unary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
                 x + n8 * 8, y + n8 * 8, tail, f);
     } else if ((bits & 0x7) == 0 && n >= 16) {
         const long long n4 = n / 4;
-        unary_b16x4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock>>>(
+        unary_b16x4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock, 0, (cudaStream_t)stream>>>(
             reinterpret_cast<const ushort4*>(x),
             reinterpret_cast<ushort4*>(y), n4, f);
         const int tail = (int)(n - n4 * 4);
         if (tail > 0)
-            unary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            unary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
                 x + n4 * 4, y + n4 * 4, tail, f);
     } else {
-        unary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n), kBlock>>>(
+        unary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(
             x, y, (int)n, f);
     }
     check_launch("elementwise bf16 kernel launch");
 }
 
 template <typename F>
-void launch_binary(const float* a, const float* b, float* y, long long n, F f) {
+void launch_binary(const float* a, const float* b, float* y, long long n, F f, std::uintptr_t stream) {
     if (n <= 0) return;
     const bool aligned = ((reinterpret_cast<uintptr_t>(a) |
                            reinterpret_cast<uintptr_t>(b) |
                            reinterpret_cast<uintptr_t>(y)) & 0xF) == 0;
     if (aligned && n >= 8) {
         const long long n4 = n / 4;
-        binary_f4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock>>>(
+        binary_f4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock, 0, (cudaStream_t)stream>>>(
             reinterpret_cast<const float4*>(a), reinterpret_cast<const float4*>(b),
             reinterpret_cast<float4*>(y), n4, f);
         const int tail = (int)(n - n4 * 4);
         if (tail > 0)
-            binary_f1_kernel<float, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            binary_f1_kernel<float, F><<<(tail + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
                 a + n4 * 4, b + n4 * 4, y + n4 * 4, tail, f);
     } else {
-        binary_f1_kernel<float, F><<<(unsigned)grid_for(n), kBlock>>>(a, b, y, (int)n, f);
+        binary_f1_kernel<float, F><<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(a, b, y, (int)n, f);
     }
     check_launch("elementwise kernel launch");
 }
 
 template <typename F>
 void launch_binary_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
-                        __nv_bfloat16* y, long long n, F f) {
+                           __nv_bfloat16* y, long long n, F f, std::uintptr_t stream) {
     if (n <= 0) return;
     const uintptr_t bits = reinterpret_cast<uintptr_t>(a) |
                            reinterpret_cast<uintptr_t>(b) |
                            reinterpret_cast<uintptr_t>(y);
     if ((bits & 0xF) == 0 && n >= 32) {
         const long long n8 = n / 8;
-        binary_b16x8_kernel<F><<<(unsigned)((n8 + kBlock - 1) / kBlock), kBlock>>>(
+        binary_b16x8_kernel<F><<<(unsigned)((n8 + kBlock - 1) / kBlock), kBlock, 0, (cudaStream_t)stream>>>(
             reinterpret_cast<const uint4*>(a),
             reinterpret_cast<const uint4*>(b),
             reinterpret_cast<uint4*>(y), n8, f);
         const int tail = (int)(n - n8 * 8);
         if (tail > 0)
-            binary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            binary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
                 a + n8 * 8, b + n8 * 8, y + n8 * 8, tail, f);
     } else if ((bits & 0x7) == 0 && n >= 16) {
         const long long n4 = n / 4;
-        binary_b16x4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock>>>(
+        binary_b16x4_kernel<F><<<(unsigned)((n4 + kBlock - 1) / kBlock), kBlock, 0, (cudaStream_t)stream>>>(
             reinterpret_cast<const ushort4*>(a),
             reinterpret_cast<const ushort4*>(b),
             reinterpret_cast<ushort4*>(y), n4, f);
         const int tail = (int)(n - n4 * 4);
         if (tail > 0)
-            binary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock>>>(
+            binary_f1_kernel<__nv_bfloat16, F><<<(tail + kBlock - 1) / kBlock, kBlock, 0, (cudaStream_t)stream>>>(
                 a + n4 * 4, b + n4 * 4, y + n4 * 4, tail, f);
     } else {
-        binary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n), kBlock>>>(
+        binary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(
             a, b, y, (int)n, f);
     }
     check_launch("elementwise bf16 kernel launch");
@@ -322,12 +322,12 @@ std::vector<float> silu_cpu(const std::vector<float>& x) {
     return y;
 }
 
-void silu_launch(const float* x, float* y, long long n) {
-    launch_unary(x, y, n, SiluOp{});
+void silu_launch(const float* x, float* y, long long n, std::uintptr_t stream) {
+    launch_unary(x, y, n, SiluOp{}, stream);
 }
 
-void silu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
-    launch_unary_bf16(x, y, n, SiluOp{});
+void silu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_unary_bf16(x, y, n, SiluOp{}, stream);
 }
 
 // --- GeLU (exact erf form) -------------------------------------------------------
@@ -341,12 +341,12 @@ std::vector<float> gelu_cpu(const std::vector<float>& x) {
     return y;
 }
 
-void gelu_launch(const float* x, float* y, long long n) {
-    launch_unary(x, y, n, GeluOp{});
+void gelu_launch(const float* x, float* y, long long n, std::uintptr_t stream) {
+    launch_unary(x, y, n, GeluOp{}, stream);
 }
 
-void gelu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
-    launch_unary_bf16(x, y, n, GeluOp{});
+void gelu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_unary_bf16(x, y, n, GeluOp{}, stream);
 }
 
 // --- GeLU (tanh approximation) ----------------------------------------------------
@@ -361,12 +361,12 @@ std::vector<float> gelu_tanh_cpu(const std::vector<float>& x) {
     return y;
 }
 
-void gelu_tanh_launch(const float* x, float* y, long long n) {
-    launch_unary(x, y, n, GeluTanhOp{});
+void gelu_tanh_launch(const float* x, float* y, long long n, std::uintptr_t stream) {
+    launch_unary(x, y, n, GeluTanhOp{}, stream);
 }
 
-void gelu_tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
-    launch_unary_bf16(x, y, n, GeluTanhOp{});
+void gelu_tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_unary_bf16(x, y, n, GeluTanhOp{}, stream);
 }
 
 // --- ReLU --------------------------------------------------------------------------
@@ -378,12 +378,12 @@ std::vector<float> relu_cpu(const std::vector<float>& x) {
     return y;
 }
 
-void relu_launch(const float* x, float* y, long long n) {
-    launch_unary(x, y, n, ReluOp{});
+void relu_launch(const float* x, float* y, long long n, std::uintptr_t stream) {
+    launch_unary(x, y, n, ReluOp{}, stream);
 }
 
-void relu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
-    launch_unary_bf16(x, y, n, ReluOp{});
+void relu_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_unary_bf16(x, y, n, ReluOp{}, stream);
 }
 
 // --- Tanh --------------------------------------------------------------------------
@@ -395,12 +395,12 @@ std::vector<float> tanh_cpu(const std::vector<float>& x) {
     return y;
 }
 
-void tanh_launch(const float* x, float* y, long long n) {
-    launch_unary(x, y, n, TanhOp{});
+void tanh_launch(const float* x, float* y, long long n, std::uintptr_t stream) {
+    launch_unary(x, y, n, TanhOp{}, stream);
 }
 
-void tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
-    launch_unary_bf16(x, y, n, TanhOp{});
+void tanh_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_unary_bf16(x, y, n, TanhOp{}, stream);
 }
 
 // --- Sigmoid ----------------------------------------------------------------------
@@ -414,12 +414,12 @@ std::vector<float> sigmoid_cpu(const std::vector<float>& x) {
     return y;
 }
 
-void sigmoid_launch(const float* x, float* y, long long n) {
-    launch_unary(x, y, n, SigmoidOp{});
+void sigmoid_launch(const float* x, float* y, long long n, std::uintptr_t stream) {
+    launch_unary(x, y, n, SigmoidOp{}, stream);
 }
 
-void sigmoid_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n) {
-    launch_unary_bf16(x, y, n, SigmoidOp{});
+void sigmoid_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_unary_bf16(x, y, n, SigmoidOp{}, stream);
 }
 
 // --- Temperature scaling --------------------------------------------------------------
@@ -432,9 +432,9 @@ std::vector<float> temperature_cpu(const std::vector<float>& x, float t) {
     return y;
 }
 
-void temperature_launch(const float* x, float* y, int n, float t) {
+void temperature_launch(const float* x, float* y, int n, float t, std::uintptr_t stream) {
     TemperatureOp op{1.0f / t};
-    launch_unary(x, y, n, op);
+    launch_unary(x, y, n, op, stream);
 }
 
 // --- Add / Mul ------------------------------------------------------------------------
@@ -447,13 +447,13 @@ std::vector<float> add_cpu(const std::vector<float>& a, const std::vector<float>
     return y;
 }
 
-void add_launch(const float* a, const float* b, float* y, long long n) {
-    launch_binary(a, b, y, n, AddOp{});
+void add_launch(const float* a, const float* b, float* y, long long n, std::uintptr_t stream) {
+    launch_binary(a, b, y, n, AddOp{}, stream);
 }
 
 void add_launch_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
-                     __nv_bfloat16* y, long long n) {
-    launch_binary_bf16(a, b, y, n, AddOp{});
+                     __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_binary_bf16(a, b, y, n, AddOp{}, stream);
 }
 
 std::vector<float> mul_cpu(const std::vector<float>& a, const std::vector<float>& b) {
@@ -464,13 +464,13 @@ std::vector<float> mul_cpu(const std::vector<float>& a, const std::vector<float>
     return y;
 }
 
-void mul_launch(const float* a, const float* b, float* y, long long n) {
-    launch_binary(a, b, y, n, MulOp{});
+void mul_launch(const float* a, const float* b, float* y, long long n, std::uintptr_t stream) {
+    launch_binary(a, b, y, n, MulOp{}, stream);
 }
 
 void mul_launch_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
-                     __nv_bfloat16* y, long long n) {
-    launch_binary_bf16(a, b, y, n, MulOp{});
+                     __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_binary_bf16(a, b, y, n, MulOp{}, stream);
 }
 
 // --- SwiGLU --------------------------------------------------------------------------
@@ -487,13 +487,13 @@ std::vector<float> swiglu_cpu(const std::vector<float>& gate,
     return out;
 }
 
-void swiglu_launch(const float* gate, const float* up, float* y, long long n) {
-    launch_binary(gate, up, y, n, SwigluOp{});
+void swiglu_launch(const float* gate, const float* up, float* y, long long n, std::uintptr_t stream) {
+    launch_binary(gate, up, y, n, SwigluOp{}, stream);
 }
 
 void swiglu_launch_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up,
-                        __nv_bfloat16* y, long long n) {
-    launch_binary_bf16(gate, up, y, n, SwigluOp{});
+                        __nv_bfloat16* y, long long n, std::uintptr_t stream) {
+    launch_binary_bf16(gate, up, y, n, SwigluOp{}, stream);
 }
 
 } // namespace fusedtok

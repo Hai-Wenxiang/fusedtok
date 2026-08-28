@@ -1,4 +1,4 @@
-﻿// Top-k / top-p selection and greedy decoding helpers.
+// Top-k / top-p selection and greedy decoding helpers.
 //
 // Selection contract (identical across all paths):
 //   - results sorted descending by value
@@ -10,29 +10,47 @@
 // required result order, so selecting and sorting keys yields both the
 // ordering and the deterministic tie resolution for free.
 //
-// GPU main path - a single cooperative kernel per call:
-//   phase 1: 8 rounds of 256-bin radix refinement over the packed keys
-//            (byte 7 down to 0). Each round histograms one byte of the
-//            candidates still matching the prefix, block 0 scans bins from
-//            the top to find which bin contains the k-th largest key, and
-//            the prefix tightens. After 8 rounds the k-th largest key
-//            K_min is known exactly, plus `remaining` = how many keys equal
-//            to K_min belong to the result.
-//   phase 2: single emit scan. Keys > K_min take slots via an atomic
-//            counter; keys == K_min fill the tail slots (their relative
-//            order is restored by the sort below). Exactly k slots written.
-//   phase 3: bitonic sort of the k keys. k <= 2048 uses a shared-memory
-//            fast path inside one block; larger k (e.g. nucleus mode with
-//            k = n) sorts in global memory with grid participation.
-//   phase 4 (nucleus mode only): cumulative sum over the sorted values
-//            until mass >= p, written to count_out.
+// GPU path - a pipeline of PLAIN kernels on the caller's stream (v0.4).
+// The v0.1-v0.3 single cooperative kernel synchronized every radix round
+// with grid.sync() barriers (24 per call); on many-SM GPUs the barrier
+// storms dominated the runtime (bare topk 0.31x vs torch's CUB on a
+// 36-SM part). The v0.4 pipeline removes cooperative launch entirely:
 //
-// Workspace (histogram, counters, key buffer) is process-cached and grown
-// on demand: per-call cudaMalloc/cudaFree would synchronize the device
-// and serialize repeated invocations (and break CUDA graph capture).
+//   stage 1 - radix refinement: one small kernel per byte level (7..0).
+//     Every block histograms its share of the surviving candidates into
+//     shared memory, merges the nonzero bins into a global histogram
+//     (device atomics), then bumps an arrival ticket (release fence
+//     before the ticket). The LAST block to arrive - and only it - scans
+//     the 256 bins top-down, tightens the prefix, and resets the
+//     histogram + ticket for the next launch. Inter-kernel visibility
+//     comes from stream ordering; intra-kernel cross-block visibility
+//     comes from the fence+ticket release/acquire pair. No block ever
+//     waits: the decider is simply the last one to arrive.
+//   stage 2 - early exit: when a round's boundary bin holds at most
+//     kSelEarlyOut candidates, the next launch skips histogramming and
+//     instead COMPACTS the survivors into a small buffer; its last block
+//     bitonic-sorts them in shared memory and publishes the final k-th
+//     key directly. Remaining round launches self-disable (cheap no-ops).
+//     Typical spread data exits after two rounds regardless of k.
+//   stage 3 - emit: a parallel pass writes key > k_min into result slots
+//     via an atomic counter (keys are unique, so exactly one key equals
+//     k_min; it fills the last slot through the tie counter).
+//   stage 4a - k <= kSelEarlyOut: the emit kernel's last block sorts the
+//     k keys in shared memory, decodes values/indices, and (in nucleus /
+//     sampling mode) runs the serial mass scan - one launch finishes.
+//   stage 4b - k > kSelEarlyOut: chunk sort (per-block 2048-key shared
+//     bitonic) + a merge ladder with ONE plain launch per level
+//     (merge-path co-rank tiles), then an elementwise decode kernel and,
+//     for top-p, a two-kernel parallel nucleus count.
 //
-// Devices without cooperative launch fall back to a host-driven per-round
-// selection loop with identical semantics.
+// Workspace (histogram, tickets, counters, key buffers) is process-cached
+// and grown on demand: per-call cudaMalloc/cudaFree would synchronize the
+// device and serialize repeated invocations (and break CUDA graph
+// capture). A fixed 265-word head is zeroed with one async memset per
+// call; all later state flows through that region.
+//
+// Devices without cooperative launch: no longer special-cased - plain
+// launches run everywhere (the v0.1 host-rounds fallback is gone).
 //
 // NaN inputs are not order-preserving (undefined result), matching common
 // library behavior.
@@ -42,21 +60,21 @@
 #include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
 
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace fusedtok {
 
 namespace {
-
-namespace cg = cooperative_groups;
 
 void topk_check(const std::vector<float>& x, int k) {
     if (k < 0)
@@ -70,27 +88,49 @@ constexpr int kSelWarps = kSelBlock / 32;
 // Per-block sort chunk (shared-memory bitonic): 2048 keys = 16KB shared.
 // Powers of two keep the chunk-merge arithmetic exact.
 constexpr int kSelSortChunk = 2048;
-// per-block scan chunk for the parallel nucleus count
-constexpr int kSelScanChunk = 2048;
-
+// Early-exit threshold: a radix boundary bin with at most this many
+// survivors is resolved by an in-block sort instead of further rounds.
+constexpr int kSelEarlyOut = 2048;
 // merge tile: one co-rank search + shared staging per this many outputs
 constexpr int kSelMergeTile = 256;
+// grid cap for the pipelined kernels (ticket scans stay short)
+constexpr int kMaxGrid = 1024;
+
+// Workspace head layout (unsigned long long words). The head is zeroed
+// by one async memset at the start of every call; the tail (candidates +
+// key buffers + scan scratch) is rewritten before every read.
+constexpr int kWsTicket = 256;      // arrival ticket (current stage)
+constexpr int kWsEmit = 257;        // emit counter
+constexpr int kWsTie = 258;         // tie counter
+constexpr int kWsPrefix = 259;      // refinement prefix / final k_min
+constexpr int kWsRemaining = 260;   // keys still needed / tie_take
+constexpr int kWsSurvivors = 261;   // boundary-bin population (info)
+constexpr int kWsStage = 262;       // 0 refine | 1 compact next | 2 done
+constexpr int kWsCandCnt = 263;     // compaction counter
+constexpr int kWsToken = 264;       // sampled token slot (int)
+constexpr int kWsExpMax = 265;      // global logit max, fkey bits (sample)
+constexpr int kWsTotal = 266;       // global softmax total (float, sample)
+constexpr int kWsLevelDone = 267;   // level of the last completed round
+constexpr int kWsHead = 268;
+constexpr int kWsCand = kWsHead;               // candidates [0, 2048)
+constexpr int kWsKeys = kWsHead + kSelEarlyOut;  // key buffer A (m words)
 
 // ---------------------------------------------------------------------------
 // process-cached workspace
 // ---------------------------------------------------------------------------
 
-// Layout: [0..255] histogram, [256] emit counter, [257] tie counter,
-// [258] radix prefix, [259] radix remaining, [260..] key buffer (grown to
-// the largest padded size seen). Guarded by a mutex; never freed (bounded
-// by the largest call). Not safe for concurrent selection launches on
-// different streams (documented limitation).
-unsigned long long* selection_workspace(size_t key_capacity) {
+// Layout: [0..kWsHead) control head (zeroed per call), [kWsCand..+2048)
+// early-exit candidates, then key buffer A (m words), key buffer B (m
+// words, merge scratch), then 1024 floats of block-sum scratch for the
+// big-path nucleus count. Guarded by a mutex; never freed (bounded by the
+// largest call). Not safe for concurrent selection launches on different
+// streams (documented limitation).
+unsigned long long* selection_workspace(size_t extra_words) {
     static unsigned long long* buf = nullptr;
     static size_t capacity = 0;
     static std::mutex mu;
     std::lock_guard<std::mutex> lock(mu);
-    const size_t words = 260 + key_capacity;
+    const size_t words = kWsHead + extra_words;
     if (words > capacity) {
         unsigned long long* nb = nullptr;
         if (cudaMalloc(&nb, words * sizeof(unsigned long long)) != cudaSuccess)
@@ -107,444 +147,667 @@ inline __device__ unsigned long long pack_key(float v, int i) {
     return ((unsigned long long)fkey(v) << 32) | (0xFFFFFFFFULL - (unsigned)i);
 }
 
-// Separate process cache for the fallback path's taken-bitmap: sized by n
-// and independent of the key buffer, so the radix layout stays fixed.
-unsigned long long* fallback_bitmap(size_t bitmap_words) {
-    static unsigned long long* buf = nullptr;
-    static size_t capacity = 0;
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lock(mu);
-    if (bitmap_words > capacity) {
-        unsigned long long* nb = nullptr;
-        if (cudaMalloc(&nb, bitmap_words * sizeof(unsigned long long)) != cudaSuccess)
-            throw std::runtime_error(std::string("fallback bitmap alloc failed: ") +
-                                     cudaGetErrorString(cudaGetLastError()));
-        if (buf) cudaFree(buf);
-        buf = nb;
-        capacity = bitmap_words;
+// Repetition-penalty context for the fused decode_step path: a vocab
+// bitmap (built once per step from the sampled ids) plus the penalty.
+// use == 0 selects the plain path (no bitmap traffic). The penalty
+// applies to the RAW logit before the temperature scale, matching the
+// composed repetition_penalty -> temperature -> sample reference order.
+struct PenCtx {
+    const unsigned long long* bm;
+    float penalty;
+    int use;
+};
+
+__device__ __forceinline__ float step_logit(const float* __restrict__ x,
+                                            int i, float inv_t, PenCtx pen) {
+    float v = x[i];
+    if (pen.use) {
+        if ((pen.bm[i >> 6] >> (i & 63)) & 1ULL)
+            v = v > 0.0f ? v / pen.penalty : v * pen.penalty;
     }
-    return buf;
+    return v * inv_t;
+}
+
+// Marks the sampled ids in the vocab bitmap (one bit per token).
+__global__ void penalty_bitmap_kernel(const long long* __restrict__ ids,
+                                      int m,
+                                      unsigned long long* __restrict__ bm) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    const int id = (int)ids[j];
+    atomicOr(&bm[id >> 6], 1ULL << (id & 63));
 }
 
 // ---------------------------------------------------------------------------
-// cooperative radix-select + sort kernel
+// per-call pointer block (graph-indirect arguments)
 // ---------------------------------------------------------------------------
 
-// Zero the workspace head (histogram + counters) and the key-buffer padding
-// region [k, m) so bitonic sorting sees well-defined pad keys (0 = smallest).
-//
-// Modes driven by the trailing parameters:
-//   selection (top-k / top-p): p_stop > 0 requests the nucleus count in
-//     count_out; sample mode additionally samples a token inside the nucleus.
-//   sample mode (sample_seed != 0): the input is treated as RAW LOGITS scaled
-//     by inv_T (temperature); phase 4 converts to softmax probabilities,
-//     finds the nucleus at mass p, then inverse-CDF samples within it using
-//     a hash-derived uniform draw (deterministic per seed). The winning
-//     token goes to token_out.
-// Kernel argument bundle: passing ONE struct by pointer through the
-// cooperative-launch args array sidesteps the runtime's per-parameter
-// marshalling (which silently dropped the tail parameter for this
-// 12-argument signature on CUDA 13 / Windows).
-struct RadixArgs {
+// The selection pipeline is captured into a process-cached CUDA graph so
+// the whole multi-kernel sequence submits as ONE launch (per-kernel
+// submission costs 2-8us depending on platform and otherwise dominates
+// the pipeline). A graph bakes pointer VALUES into its nodes, so the
+// per-call pointers (input x, outputs vals/idxs/count_out) travel
+// through this small block instead: the host writes a pinned mirror,
+// one async H2D copy ships it to a fixed workspace slot, and the kernels
+// dereference it at entry. Raw launches (first call / outer capture)
+// use the exact same path.
+struct SelArgs {
     const float* x;
     float* vals;
     long long* idxs;
     int* count_out;
-    int* token_out;
-    int n, k, m;
     float p_stop;
-    float inv_t;
-    unsigned long long sample_seed;
-    int sample;                                  // 1 = sampling mode (seed may be 0)
-    unsigned long long* ws;
 };
 
-// NOTE: count_out / token_out carry NO __restrict__ - they may point INTO
-// the workspace (the sample path stores its token slot at ws+256), which
-// aliases ws. Promising non-aliasing via __restrict__ would be undefined
-// behavior.
-__global__ void radix_topk_kernel(const RadixArgs a) {
-    const int grid_blocks = gridDim.x;
-    cg::grid_group grid = cg::this_grid();
+// Device-side arg slot for a given pad size m (after the scan scratch).
+inline size_t sel_args_off(int m) {
+    return kWsHead + (size_t)kSelEarlyOut + 2 * (size_t)m + 256;
+}
 
-    __shared__ unsigned long long sh_hist[256];    // per-block histogram stage
-    unsigned long long* hist = a.ws;                 // 256 bins
-    unsigned long long* emit_cnt = a.ws + 256;
-    unsigned long long* tie_cnt = a.ws + 257;
-    unsigned long long* g_prefix = a.ws + 258;       // refinement state in GLOBAL
-    unsigned long long* g_remaining = a.ws + 259;    // memory: every block must
-    unsigned long long* keys = a.ws + 260;           // see the same prefix
+// Pinned host mirror as a rotating ring: the CPU may rewrite the args
+// while a PREVIOUS call's async H2D copy is still queued (host-ahead
+// submission), so each call gets its own slot and a slot is reused only
+// after an event proves its prior copy executed. 32 slots keep steady
+// decode loops running without CPU stalls.
+constexpr int kArgRing = 32;
 
-    if (blockIdx.x == 0) {
-        for (int i = threadIdx.x; i < 260; i += blockDim.x) a.ws[i] = 0ULL;
-        if (threadIdx.x == 0) *g_remaining = (unsigned long long)a.k;
-        // count_out is an external buffer: preset to INT_MAX so the
-        // atomicMin-based nucleus count starts from a clean sentinel
-        // (sample mode overwrites it directly in phase 4)
-        if (threadIdx.x == 0 && a.count_out) *a.count_out = INT_MAX;
-        // zero the pads of BOTH key buffers: merges read both, and every
-        // real key is > 0 (index bits), so 0 pads always sink to the tail
-        for (long long i = a.k + threadIdx.x; i < a.m; i += blockDim.x) {
-            keys[i] = 0ULL;
-            (a.ws + 260 + a.m)[i] = 0ULL;
-        }
-    }
-    grid.sync();
-
-    // ---- phase 1: 8-round radix refinement -----------------------------------
-    for (int level = 7; level >= 0; --level) {
-        const unsigned long long prefix = *g_prefix;    // stable until the scan
-        const long long remaining = (long long)*g_remaining;
-        // histogram one byte of every key whose bytes ABOVE this level
-        // already match the prefix. At level 7 there are no higher bytes,
-        // so every key participates (mask 0). For level < 7 the mask
-        // covers bytes level+1 .. 7. In sample mode the key is built from
-        // the temperature-scaled logit (identical ordering for T > 0).
-        const unsigned long long topmask =
-            (level == 7) ? 0ULL : ~((1ULL << (8 * (level + 1))) - 1ULL);
-        // two-stage histogram: accumulate into per-block SHARED bins, then
-        // merge once per block - a global atomic per element serializes on
-        // hot bins, this keeps the hot loop shared-memory-only
-        for (int b = threadIdx.x; b < 256; b += kSelBlock) sh_hist[b] = 0ULL;
-        __syncthreads();
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < a.n;
-             i += grid_blocks * blockDim.x) {
-            const unsigned long long key = pack_key(a.x[i] * a.inv_t, i);
-            if ((key & topmask) != prefix) continue;
-            atomicAdd(&sh_hist[(key >> (8 * level)) & 0xFF], 1ULL);
-        }
-        __syncthreads();
-        for (int b = threadIdx.x; b < 256; b += kSelBlock)
-            if (sh_hist[b]) atomicAdd(&hist[b], sh_hist[b]);
-        grid.sync();
-
-        // block 0 thread 0 scans bins top-down to locate the boundary bin
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-            unsigned long long acc = 0;
-            for (int b = 255; b >= 0; --b) {
-                const unsigned long long c = hist[b];
-                if (acc + c >= (unsigned long long)remaining) {
-                    *g_prefix = prefix | ((unsigned long long)b << (8 * level));
-                    *g_remaining = (unsigned long long)remaining - acc;
-                    break;
-                }
-                acc += c;
+// Ship one call's pointers: guard a ring slot (its previous H2D copy
+// must have EXECUTED before the CPU overwrites it), write the args,
+// issue the copy, then record the completion event AFTER the copy so the
+// event truly fences the read. Used on the internal-graph path (never
+// during an outer capture).
+void ship_args(cudaStream_t cs, SelArgs* dargs, const float* x,
+               float* vals, long long* idxs, int* count_out, float p_stop) {
+    struct Ring {
+        SelArgs* slots = nullptr;      // one pinned block, kArgRing entries
+        cudaEvent_t ev[kArgRing];
+        int cur = 0;
+        std::mutex mu;
+        Ring() {
+            if (cudaHostAlloc(&slots, kArgRing * sizeof(SelArgs),
+                              cudaHostAllocDefault) != cudaSuccess) {
+                slots = nullptr;
+                throw std::runtime_error(
+                    std::string("pinned arg ring alloc failed: ") +
+                    cudaGetErrorString(cudaGetLastError()));
             }
+            for (int i = 0; i < kArgRing; ++i)
+                if (cudaEventCreate(&ev[i]) != cudaSuccess)
+                    throw std::runtime_error("arg ring event create failed");
         }
-        grid.sync();                               // publish the new prefix
-
-        // clear histogram for the next level
-        if (blockIdx.x == 0) {
-            for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0ULL;
+        ~Ring() {
+            if (slots) cudaFreeHost(slots);
+            for (int i = 0; i < kArgRing; ++i)
+                if (ev[i]) cudaEventDestroy(ev[i]);
         }
-        grid.sync();
-    }
-    const unsigned long long k_min = *g_prefix;    // a.k-th largest key
-    const long long tie_take = (long long)*g_remaining;  // keys == k_min to include
+    };
+    static Ring ring;
+    std::lock_guard<std::mutex> lock(ring.mu);
+    const int i = ring.cur;
+    ring.cur = (i + 1) % kArgRing;
+    // wait until the copy that last read this slot has executed
+    cudaError_t st = cudaEventQuery(ring.ev[i]);
+    if (st == cudaErrorNotReady)
+        cudaEventSynchronize(ring.ev[i]);
+    else if (st != cudaSuccess)
+        cudaGetLastError();          // clear a sticky error, keep going
+    SelArgs& a = ring.slots[i];
+    a.x = x;
+    a.vals = vals;
+    a.idxs = idxs;
+    a.count_out = count_out;
+    a.p_stop = p_stop;
+    cudaMemcpyAsync(dargs, &a, sizeof(SelArgs), cudaMemcpyHostToDevice, cs);
+    cudaEventRecord(ring.ev[i], cs);   // fences the copy for the next reuse
+}
 
-    // ---- phase 2: emit selected keys -----------------------------------------
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < a.n;
-         i += grid_blocks * blockDim.x) {
-        const unsigned long long key = pack_key(a.x[i] * a.inv_t, i);
-        if (key > k_min) {
-            const unsigned long long pos = atomicAdd(emit_cnt, 1ULL);
-            if (pos < (unsigned long long)a.k) keys[pos] = key;
-        } else if (key == k_min && tie_take > 0) {
-            const unsigned long long pos = atomicAdd(tie_cnt, 1ULL);
-            if (pos < (unsigned long long)tie_take)
-                keys[(unsigned long long)a.k - tie_take + pos] = key;
-        }
-    }
-    grid.sync();
-
-    // ---- phase 3: parallel chunk sort + pairwise merge ------------------------
-    // v0.3: replaces the global bitonic (O(log^2 m) grid.sync barriers, most
-    // blocks idle at high strides) with two structured stages:
-    //   3a) every block independently sorts one kSelSortChunk-key chunk in
-    //       shared memory (no grid participation inside the sort)
-    //   3b) log2(nb) pairwise merge levels; each output element finds its
-    //       source via a merge-path co-rank binary search over the two runs
-    //       (arrays are strictly descending with unique keys, so the search
-    //       predicate is monotone). Buffers ping-pong between the primary
-    //       key array and the scratch array; pads are 0 and every real key
-    //       is > 0 (index bits), so zeros always merge to the tail.
-    {
-        __shared__ unsigned long long sk[kSelSortChunk];
-        __shared__ unsigned long long sA[kSelMergeTile];
-        __shared__ unsigned long long sB[kSelMergeTile];
-        unsigned long long* keys_a = keys;                 // primary buffer
-        unsigned long long* keys_b = a.ws + 260 + a.m;       // scratch buffer
-
-        // 3a) per-block chunk sort (blocks beyond nb_sort only wait)
-        const int c = kSelSortChunk;
-        const int nb_sort = (a.m + c - 1) / c;
-        // blocks may FEWER than chunks (grid is capped by cooperative-launch
-        // occupancy): stride blocks over chunks so every chunk gets sorted
-        for (int chunk = blockIdx.x; chunk < nb_sort; chunk += grid_blocks) {
-            const int base = chunk * c;
-            // one chunk covers all of m -> sort exactly m (a power of two);
-            // running the full 2048 network on tiny k wastes ~4x passes
-            const int len = (nb_sort == 1) ? a.m : c;
-            for (int i = threadIdx.x; i < len; i += kSelBlock)
-                sk[i] = keys[base + i];
+// Descending shared-memory bitonic sort over `len` (power of two) keys.
+// Within one stride pass each index joins exactly one (i, i^stride) pair,
+// so plain shared loads/stores race nowhere. Call from all block threads.
+__device__ __forceinline__ void bitonic_desc_shared(unsigned long long* sk,
+                                                    int len) {
+    for (int size = 2; size <= len; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
             __syncthreads();
-            for (int size = 2; size <= len; size <<= 1) {
-                for (int stride = size >> 1; stride > 0; stride >>= 1) {
-                    __syncthreads();
-                    for (int i = threadIdx.x; i < len; i += kSelBlock) {
-                        const int j = i ^ stride;
-                        if (j > i && j < len) {
-                            const bool up = (i & size) == 0;   // descending
-                            const unsigned long long v0 = sk[i];
-                            const unsigned long long v1 = sk[j];
-                            if ((up && v0 < v1) || (!up && v0 > v1)) {
-                                sk[i] = v1;
-                                sk[j] = v0;
-                            }
-                        }
+            for (int i = threadIdx.x; i < len; i += blockDim.x) {
+                const int j = i ^ stride;
+                if (j > i && j < len) {
+                    const bool up = (i & size) == 0;   // descending
+                    const unsigned long long v0 = sk[i];
+                    const unsigned long long v1 = sk[j];
+                    if ((up && v0 < v1) || (!up && v0 > v1)) {
+                        sk[i] = v1;
+                        sk[j] = v0;
                     }
                 }
             }
-            __syncthreads();
-            for (int i = threadIdx.x; i < len; i += kSelBlock)
-                if (base + i < a.m) keys[base + i] = sk[i];
-            __syncthreads();   // sk reused by the next chunk of this block
-        }
-        grid.sync();
-
-        // 3b) pairwise merges, tile-based merge path: each block handles
-        // tiles of kSelMergeTile outputs. ONE global-memory co-rank binary
-        // search per tile locates the (i, j) split of the two source runs;
-        // the tile's inputs are staged into shared memory and each thread
-        // resolves its element with a cheap in-shared search. Global reads
-        // stay coalesced and per-element binary search over global memory
-        // (the v0.3 first cut, 3x slower than bitonic at 131k) is avoided.
-        unsigned long long* src_buf = keys_a;
-        unsigned long long* dst_buf = keys_b;
-        int run = c;
-        while (run < a.m) {
-            grid.sync();   // all reads target the previous level's output
-            const long long ntiles = a.m / kSelMergeTile;
-            for (long long tile = blockIdx.x; tile < ntiles;
-                 tile += grid_blocks) {
-                const long long p0 = tile * kSelMergeTile;
-                const long long pair = p0 / (2 * run);
-                const long long lo0 = p0 - pair * 2 * run;
-                const long long a_base = pair * 2 * run;
-                const long long b_base = a_base + run;
-                // co-rank for the tile start: largest i with
-                // (i == 0 || A[i-1] > B[lo0-i])
-                long long l = lo0 > run ? lo0 - run : 0;
-                long long h = lo0 < run ? lo0 : run;
-                while (l < h) {
-                    const long long mid = (l + h + 1) >> 1;
-                    const bool pred =
-                        mid == 0 ||
-                        src_buf[a_base + mid - 1] > src_buf[b_base + lo0 - mid];
-                    if (pred) l = mid; else h = mid - 1;
-                }
-                const long long i0 = l, j0 = lo0 - i0;
-                // stage up to kSelMergeTile inputs from each run (0-padded;
-                // real keys are > 0 so pads sort to the tail)
-                for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
-                    sA[u] = (i0 + u < run) ? src_buf[a_base + i0 + u] : 0ULL;
-                    sB[u] = (j0 + u < run) ? src_buf[b_base + j0 + u] : 0ULL;
-                }
-                __syncthreads();
-                // in-tile co-rank per thread (shared memory, log T steps)
-                for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
-                    long long l2 = u > kSelMergeTile ? 0 : 0;   // clamp below
-                    l2 = 0;
-                    long long h2 = u < kSelMergeTile ? u : kSelMergeTile;
-                    while (l2 < h2) {
-                        const long long mid = (l2 + h2 + 1) >> 1;
-                        const bool pred =
-                            mid == 0 || sA[mid - 1] > sB[u - mid];
-                        if (pred) l2 = mid; else h2 = mid - 1;
-                    }
-                    const long long i = l2, j = u - i;
-                    const bool take_a =
-                        (i < kSelMergeTile) &&
-                        (j >= kSelMergeTile || sA[i] > sB[j]);
-                    dst_buf[p0 + u] = take_a ? sA[i] : sB[j];
-                }
-                __syncthreads();
-            }
-            unsigned long long* tmp = src_buf; src_buf = dst_buf; dst_buf = tmp;
-            run <<= 1;
-        }
-        grid.sync();
-
-        // 3c) ensure the sorted result lives in the primary buffer (decode
-        // below reads `keys`); an odd number of merge levels ends in scratch
-        if (src_buf != keys_a) {
-            for (int i = blockIdx.x * kSelBlock + threadIdx.x; i < a.k;
-                 i += grid_blocks * kSelBlock)
-                keys[i] = keys_b[i];
-            grid.sync();
         }
     }
-    // ---- phase 4: decode / nucleus count / sample ------------------------------
-    if (blockIdx.x == 0) {
-        for (int i = threadIdx.x; i < a.k; i += blockDim.x) {
-            const unsigned long long key = keys[i];
-            const int idx = (int)(0xFFFFFFFFu - (unsigned)(key & 0xFFFFFFFFu));
-            if (a.vals) a.vals[i] = unfkey((unsigned)(key >> 32));
-            if (a.idxs) a.idxs[i] = idx;
-        }
-        if (a.sample != 0 && threadIdx.x == 0) {
-            // fused nucleus sampling over the sorted keys:
-            //   probs = softmax(logits * a.inv_t); keys are already sorted by
-            //   logit, and the running softmax numerator exp(v - a.m) shares
-            //   the row max a.m = key[0]'s value, so probabilities come out as
-            //   plain exp of the gap. Pass 1 totals the mass and the nucleus
-            //   size (cum >= a.p_stop); pass 2 inverse-CDFs a hash-uniform
-            //   draw scaled to the nucleus mass.
-            const float row_max = unfkey((unsigned)(keys[0] >> 32));
-            float total = 0.0f;
-            for (int i = 0; i < a.k; ++i)
-                total += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
-            float cum = 0.0f;
-            int nucleus = 0;
-            float nucleus_mass = 0.0f;
-            bool covered = false;
-            for (int i = 0; i < a.k; ++i) {
-                cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
-                nucleus = i + 1;
-                if (cum >= a.p_stop * total) { nucleus_mass = cum; covered = true; break; }
+    __syncthreads();
+}
+
+// ---------------------------------------------------------------------------
+// stage 1/2: radix refinement rounds + early-exit compaction
+// ---------------------------------------------------------------------------
+
+// One launch per byte level (7..0), plus one extra "finalize" launch with
+// level == -1. Behavior is driven by the stage word so the host can issue
+// the full fixed sequence unconditionally (CUDA-graph friendly):
+//   stage 0 (refine)  - histogram byte `level` of the candidates whose
+//                       bytes above this level match the prefix; the last
+//                       arriving block scans the global histogram and
+//                       tightens the prefix. level == -1 refines nothing:
+//                       the prefix is already the full k-th key.
+//   stage 1 (compact) - gather every key matching the full prefix into
+//                       the candidate buffer; the last block sorts it in
+//                       shared memory and publishes k_min / tie_take = 1.
+//   stage 2 (done)    - return immediately (post-early-exit no-op).
+// `remaining0` carries k for the first round (the head memset left the
+// remaining slot at zero). `inv_t` scales logits in sampling mode; any
+// positive scale preserves the key order.
+// One launch per byte level (7..0). Behavior is driven by the stage word
+// so the host can issue the full fixed sequence unconditionally
+// (CUDA-graph friendly):
+//   stage 0 (refine)  - histogram byte `level` of the candidates whose
+//                       bytes above this level match the prefix; the last
+//                       arriving block scans the global histogram and
+//                       tightens the prefix.
+//   stage 1/2         - return immediately (the finalize launch handles
+//                       compaction; post-settled rounds are no-ops).
+// `remaining0` carries k for the first round (the head memset left the
+// remaining slot at zero). `inv_t` scales logits in sampling mode; any
+// positive scale preserves the key order.
+__global__ void select_round_kernel(const SelArgs* __restrict__ a,
+                                    unsigned long long* __restrict__ ws,
+                                    int n, int level,
+                                    unsigned long long remaining0,
+                                    float inv_t, PenCtx pen) {
+    const float* __restrict__ x = a->x;
+    __shared__ unsigned long long sh_hist[256];
+    __shared__ int sh_ticket;
+
+    const unsigned long long stage = ws[kWsStage];
+    if (stage != 0ULL) return;                       // settle/compact elsewhere
+    if (level < 0) return;                           // finalize: not here
+
+    unsigned long long* hist = ws;
+    unsigned long long* ticket = ws + kWsTicket;
+
+    const unsigned long long prefix = ws[kWsPrefix];          // 0 at level 7
+    const unsigned long long remaining =
+        (level == 7) ? remaining0 : ws[kWsRemaining];
+    // Histogram byte `level` of every key whose bytes ABOVE this level
+    // already match the prefix. At level 7 there are no higher bytes, so
+    // every key participates (mask 0). In sampling mode the key is built
+    // from the temperature-scaled logit (identical ordering for T > 0).
+    const unsigned long long topmask =
+        (level == 7) ? 0ULL : ~((1ULL << (8 * (level + 1))) - 1ULL);
+    // two-stage histogram: accumulate into per-block SHARED bins, then
+    // merge once per block - a global atomic per element serializes on
+    // hot bins, this keeps the hot loop shared-memory-only. Within a
+    // warp, lanes hitting the same bin aggregate FIRST (__match_any_sync)
+    // and only the group leader adds once: concentrated distributions
+    // would otherwise serialize every lane on a handful of shared
+    // addresses (measured 3-5x of the whole kernel on byte-7 rounds).
+    for (int b = threadIdx.x; b < 256; b += kSelBlock) sh_hist[b] = 0ULL;
+    __syncthreads();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        const unsigned long long key = pack_key(step_logit(x, i, inv_t, pen), i);
+        if ((key & topmask) != prefix) continue;
+        const int bin = (int)((key >> (8 * level)) & 0xFF);
+        const unsigned grp = __match_any_sync(__activemask(), bin);
+        if (__ffs(grp) - 1 == (int)(threadIdx.x & 31))
+            atomicAdd(&sh_hist[bin], (unsigned long long)__popc(grp));
+    }
+    __syncthreads();
+    for (int b = threadIdx.x; b < 256; b += kSelBlock)
+        if (sh_hist[b]) atomicAdd(&hist[b], sh_hist[b]);
+    __syncthreads();                                // my atomics are issued
+    if (threadIdx.x == 0) {
+        __threadfence();                            // release: hist visible
+        sh_ticket = (int)atomicAdd(ticket, 1ULL);
+    }
+    __syncthreads();
+    if (sh_ticket != (int)gridDim.x - 1) return;    // decider = last arrival
+    __threadfence();                                // acquire: hist visible
+
+    // Stage the histogram through shared memory with a COOPERATIVE
+    // volatile load: one volatile read per thread (~600ns L2 latency,
+    // fully parallel) instead of 256 serial reads by one thread, which
+    // latency-dominated the whole pipeline.
+    const volatile unsigned long long* vhist =
+        (const volatile unsigned long long*)hist;
+    for (int b = threadIdx.x; b < 256; b += kSelBlock)
+        sh_hist[b] = vhist[b];
+    __syncthreads();
+
+    // Scan bins top-down (shared memory now) to locate the boundary bin:
+    // the first bin where the accumulated count reaches `remaining`.
+    if (threadIdx.x == 0) {
+        unsigned long long acc = 0;
+        for (int b = 255; b >= 0; --b) {
+            const unsigned long long c = sh_hist[b];
+            if (acc + c >= remaining) {
+                ws[kWsPrefix] = prefix | ((unsigned long long)b << (8 * level));
+                ws[kWsRemaining] = remaining - acc;
+                ws[kWsSurvivors] = c;
+                ws[kWsLevelDone] = (unsigned long long)level;
+                // Small boundary bin: the finalize launch compacts + sorts
+                // these survivors instead of histogramming again.
+                if (c <= (unsigned long long)kSelEarlyOut) ws[kWsStage] = 1ULL;
+                break;
             }
-            if (!covered) return;   // window too small; host retries wider
-            // splitmix64-finalized uniform in [0, 1): deterministic per seed
-            unsigned long long z = a.sample_seed + 0x9E3779B97F4A7C15ULL;
-            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-            z ^= z >> 31;
-            const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
-            float target = u * nucleus_mass;
-            cum = 0.0f;
-            for (int i = 0; i < nucleus; ++i) {
-                cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
-                if (cum >= target) {
-                    *a.token_out = (int)(0xFFFFFFFFu -
-                                       (unsigned)(keys[i] & 0xFFFFFFFFu));
-                    break;
-                }
-            }
-            if (a.count_out) *a.count_out = nucleus;
+            acc += c;
         }
     }
+    // reset histogram + ticket for the next round launch (cooperative)
+    for (int b = threadIdx.x; b < 256; b += kSelBlock) hist[b] = 0ULL;
+    if (threadIdx.x == 0) *ticket = 0ULL;
+}
 
-    // ---- phase 4b: parallel nucleus count (ALL blocks participate) ------
-    // Must live OUTSIDE the block-0-only decode scope: the grid scan calls
-    // grid.sync(), which deadlocks unless every block reaches it.
-    if (a.sample == 0 && a.p_stop > 0.0f) {
-        float* bsums = reinterpret_cast<float*>(a.ws + 260 + 2 * a.m);
-        const int scan_len = a.k;
-        const long long per =
-            (scan_len + (long long)grid_blocks - 1) / grid_blocks;
-        const long long b0 = (long long)blockIdx.x * per;
-        const long long b1 = min((long long)scan_len, b0 + per);
+// ---------------------------------------------------------------------------
+// stage 3/4a: emit (+ in-block finish for k <= kSelEarlyOut)
+// ---------------------------------------------------------------------------
 
-        float bsum = 0.0f;
-        for (long long i = b0 + threadIdx.x; i < b1; i += kSelBlock)
-            bsum += unfkey((unsigned)(keys[i] >> 32));
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            bsum += __shfl_down_sync(0xffffffffu, bsum, off);
-        __shared__ float sh_warp[kSelWarps];
-        const int lane = threadIdx.x & 31;
-        const int warp = threadIdx.x >> 5;
-        if (lane == 0) sh_warp[warp] = bsum;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float s = 0.0f;
-            #pragma unroll
-            for (int w = 0; w < kSelWarps; ++w) s += sh_warp[w];
-            bsums[blockIdx.x] = s;
-        }
-        grid.sync();
+// Emit selected keys: keys > k_min take slots through the emit counter;
+// the single key == k_min fills the last slot through the tie counter.
+// Exactly k slots are written (full-key uniqueness).
+//
+// Counting is TWO-LEVEL: selections stage into a shared-memory buffer (a
+// bounded batch of blockDim.x per grid-stride step), then each block
+// grabs ONE global slot range with a single atomicAdd of its batch count.
+// A flat per-key global atomic serializes the whole grid on one L2
+// address (~260us at 131k keys); the two-level scheme costs one atomic
+// per block. The k == n full-selection case skips counting entirely -
+// every key ranks, so the element index IS the slot.
+__device__ __forceinline__ void emit_selected(
+    const float* __restrict__ x, unsigned long long* __restrict__ ws,
+    int n, int k, float inv_t, PenCtx pen) {
+    const unsigned long long k_min = ws[kWsPrefix];
+    const unsigned long long tie_take = ws[kWsRemaining];
+    unsigned long long* keys = ws + kWsKeys;
+    unsigned long long* emit_cnt = ws + kWsEmit;
+    unsigned long long* tie_cnt = ws + kWsTie;
 
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-            float acc = 0.0f;
-            for (int b = 0; b < (int)grid_blocks; ++b) {
-                const float s = bsums[b];
-                bsums[b] = acc;
-                acc += s;
+    if (k == n) {
+        // full selection: every key ranks (k_min is the minimum key)
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+             i += gridDim.x * blockDim.x)
+            keys[i] = pack_key(step_logit(x, i, inv_t, pen), i);
+        return;
+    }
+
+    __shared__ unsigned long long sh_keys[kSelBlock];
+    __shared__ unsigned long long sh_cnt;
+    __shared__ unsigned long long sh_base;
+    if (threadIdx.x == 0) sh_cnt = 0ULL;
+    __syncthreads();
+    // grid-stride in batches of blockDim.x elements per block: each batch
+    // stages at most blockDim.x keys before the flush
+    for (int base = blockIdx.x * blockDim.x; base < n;
+         base += gridDim.x * blockDim.x) {
+        const int i = base + threadIdx.x;
+        if (i < n) {
+            const unsigned long long key = pack_key(step_logit(x, i, inv_t, pen), i);
+            if (key > k_min) {
+                const unsigned long long pos = atomicAdd(&sh_cnt, 1ULL);
+                if (pos < (unsigned long long)kSelBlock) sh_keys[pos] = key;
+            } else if (key == k_min && tie_take > 0) {
+                const unsigned long long pos = atomicAdd(tie_cnt, 1ULL);
+                if (pos < tie_take) keys[k - tie_take + pos] = key;
             }
         }
-        grid.sync();
-
-        const float carry = bsums[blockIdx.x];
-        const int cnt = (int)(b1 - b0);
-        __shared__ float loc[2][kSelScanChunk];
-        __shared__ int sh_first;
-        if (threadIdx.x == 0) sh_first = INT_MAX;
         __syncthreads();
-        if (cnt > kSelScanChunk) {
-            // only when the grid is tiny; serial fallback stays correct.
-            // A block whose slice never crosses p must NOT publish its
-            // end-of-slice index - only report an actual crossing.
+        const unsigned long long cnt = sh_cnt;
+        if (cnt > 0ULL) {
             if (threadIdx.x == 0) {
-                float cum = carry;
-                bool found = false;
-                for (int i = 0; i < cnt; ++i) {
-                    cum += unfkey((unsigned)(keys[b0 + i] >> 32));
-                    if (cum >= a.p_stop) {
-                        atomicMin(a.count_out, (int)b0 + i + 1);
-                        found = true;
-                        break;
-                    }
-                }
-                (void)found;
-            }
-        } else if (cnt > 0) {
-            // double-buffered Hillis-Steele: within one round, address x is
-            // WRITTEN (as dst[i]) and READ (as src[i-stride]) by different
-            // threads - a single shared array races (verified by
-            // compute-sanitizer racecheck). Ping-pong between loc0/loc1.
-            float* cur = loc[0];
-            float* nxt = loc[1];
-            for (int i = threadIdx.x; i < cnt; i += kSelBlock)
-                cur[i] = unfkey((unsigned)(keys[b0 + i] >> 32));
-            __syncthreads();
-            for (int stride = 1; stride < cnt; stride <<= 1) {
-                for (int i = threadIdx.x; i < cnt; i += kSelBlock)
-                    nxt[i] = cur[i] + ((i >= stride) ? cur[i - stride] : 0.0f);
-                __syncthreads();
-                float* tmp = cur; cur = nxt; nxt = tmp;
-            }
-            for (int i = threadIdx.x; i < cnt; i += kSelBlock) {
-                if (carry + cur[i] >= a.p_stop) {
-                    atomicMin(&sh_first, (int)(b0 + i));
-                    break;   // later i in this thread are larger
-                }
+                __threadfence();        // stage stores before the claim
+                sh_base = atomicAdd(emit_cnt, cnt);
             }
             __syncthreads();
-            if (threadIdx.x == 0 && sh_first != INT_MAX)
-                atomicMin(a.count_out, sh_first + 1);
+            const unsigned long long out = sh_base + threadIdx.x;
+            if (threadIdx.x < cnt && out < (unsigned long long)k)
+                keys[out] = sh_keys[threadIdx.x];
         }
-        grid.sync();
-        // no crossing anywhere (p > total mass): the nucleus is everything
-        if (blockIdx.x == 0 && threadIdx.x == 0 && *a.count_out == INT_MAX)
-            *a.count_out = scan_len;
+        __syncthreads();
+        if (threadIdx.x == 0) sh_cnt = 0ULL;
+        __syncthreads();
+    }
+}
+
+// Modes driven by the trailing parameters (identical to v0.3 semantics):
+//   selection: p_stop > 0 requests the nucleus count in count_out
+//   sampling:  sample != 0 treats the input as RAW LOGITS scaled by
+//     inv_T; the finisher converts the sorted keys to softmax
+//     probabilities, finds the nucleus at mass p, then inverse-CDF
+//     samples within it using a hash-derived uniform (deterministic per
+//     seed). The winning token goes to token_out; an uncovered nucleus
+//     leaves it untouched (host retries with a wider window).
+// The serial mass scans deliberately accumulate in the SAME order as the
+// CPU reference so per-seed GPU/CPU token parity is bit-stable away from
+// exact mass-boundary draws.
+__global__ void emit_finish_kernel(const SelArgs* __restrict__ a,
+                                   unsigned long long* __restrict__ ws,
+                                   int n, int k, float inv_t,
+                                   unsigned long long seed, int sample,
+                                   PenCtx pen) {
+    const float p_stop = a->p_stop;
+    const float* __restrict__ x = a->x;
+    float* vals = a->vals;
+    long long* idxs = a->idxs;
+    int* count_out = a->count_out;
+    int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+    __shared__ int sh_ticket;
+    emit_selected(x, ws, n, k, inv_t, pen);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();                            // publish my key stores
+        sh_ticket = (int)atomicAdd(ws + kWsTicket, 1ULL);
+    }
+    __syncthreads();
+    if (sh_ticket != (int)gridDim.x - 1) return;    // finisher = last block
+    __threadfence();                                // acquire: keys visible
+
+    // sort the k emitted keys in shared memory (0-pad to a power of two)
+    __shared__ unsigned long long sk[kSelEarlyOut];
+    const volatile unsigned long long* vkeys =
+        (const volatile unsigned long long*)(ws + kWsKeys);
+    int len = 1;
+    while (len < k) len <<= 1;
+    for (int i = threadIdx.x; i < len; i += blockDim.x)
+        sk[i] = (i < k) ? vkeys[i] : 0ULL;
+    __syncthreads();
+    bitonic_desc_shared(sk, len);
+
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        const unsigned long long key = sk[i];
+        const int idx = (int)(0xFFFFFFFFu - (unsigned)(key & 0xFFFFFFFFu));
+        if (vals) vals[i] = unfkey((unsigned)(key >> 32));
+        if (idxs) idxs[i] = idx;
+    }
+
+    if (threadIdx.x != 0) return;
+    if (sample != 0) {
+        // fused nucleus sampling over the sorted window keys (see header
+        // note). The threshold uses the GLOBAL softmax total computed by
+        // exptotal_kernel: cum is a prefix of the global CDF, so the
+        // crossing may fall beyond the window - that is the host's cue
+        // to widen (the token stays untouched).
+        const float row_max = unfkey((unsigned)(sk[0] >> 32));
+        const float total =
+            *reinterpret_cast<const float*>(&ws[kWsTotal]);
+        float cum = 0.0f;
+        int nucleus = 0;
+        float nucleus_mass = 0.0f;
+        bool covered = false;
+        for (int i = 0; i < k; ++i) {
+            cum += __expf(unfkey((unsigned)(sk[i] >> 32)) - row_max);
+            nucleus = i + 1;
+            if (cum >= p_stop * total) { nucleus_mass = cum; covered = true; break; }
+        }
+        if (!covered) {
+            if (k < n) return;      // window too small; host retries wider
+            nucleus = k;            // full window IS the vocabulary
+            nucleus_mass = cum;
+        }
+        // splitmix64-finalized uniform in [0, 1): deterministic per seed
+        unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z ^= z >> 31;
+        const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+        const float target = u * nucleus_mass;
+        cum = 0.0f;
+        for (int i = 0; i < nucleus; ++i) {
+            cum += __expf(unfkey((unsigned)(sk[i] >> 32)) - row_max);
+            if (cum >= target) {
+                *token_out = (int)(0xFFFFFFFFu -
+                                   (unsigned)(sk[i] & 0xFFFFFFFFu));
+                break;
+            }
+        }
+        if (count_out) *count_out = nucleus;
+        return;
+    }
+    if (p_stop > 0.0f) {
+        // nucleus count over the sorted probabilities: first prefix whose
+        // mass reaches p_stop (crossing element included)
+        float cum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            cum += unfkey((unsigned)(sk[i] >> 32));
+            if (cum >= p_stop) {
+                *count_out = i + 1;
+                return;
+            }
+        }
+        *count_out = k;    // p exceeds the total mass (float rounding)
     }
 }
 
 // ---------------------------------------------------------------------------
-// fallback path for devices without cooperative launch: one plain kernel
-// per round, host reads back the winner each round. Kept from v0.1.
+// stage 3/4b: big-k pipeline (emit, chunk sort, merge ladder, decode)
 // ---------------------------------------------------------------------------
 
-__global__ void select_round_kernel(const float* __restrict__ x,
-                                    const unsigned long long* __restrict__ taken,
-                                    unsigned long long* best, int n) {
-    __shared__ unsigned long long warp_best[kSelWarps];
-    unsigned long long local = 0;
+__global__ void emit_kernel(const SelArgs* __restrict__ a,
+                            unsigned long long* __restrict__ ws,
+                            int n, int k, float inv_t, PenCtx pen) {
+    emit_selected(a->x, ws, n, k, inv_t, pen);
+}
+
+// Sort one kSelSortChunk-key chunk per block (shared-memory bitonic).
+// Elements beyond k load as zero pads; real keys are always > 0 (index
+// bits), so pads sink to the tail of the descending order.
+__global__ void chunk_sort_kernel(unsigned long long* __restrict__ keys,
+                                  int k, int m) {
+    __shared__ unsigned long long sk[kSelSortChunk];
+    const int chunks = (m + kSelSortChunk - 1) / kSelSortChunk;
+    for (int chunk = blockIdx.x; chunk < chunks; chunk += gridDim.x) {
+        const int base = chunk * kSelSortChunk;
+        const int len = min(kSelSortChunk, m - base);
+        for (int i = threadIdx.x; i < len; i += blockDim.x)
+            sk[i] = (base + i < k) ? keys[base + i] : 0ULL;
+        __syncthreads();
+        bitonic_desc_shared(sk, len);
+        for (int i = threadIdx.x; i < len; i += blockDim.x)
+            keys[base + i] = sk[i];
+        __syncthreads();    // sk reused by the next chunk of this block
+    }
+}
+
+// One merge level of the ladder: pairwise merges of `run`-sized sorted
+// runs, tile-based merge path. ONE global-memory co-rank binary search
+// per tile locates the (i, j) split of the two source runs; the tile's
+// inputs are staged into shared memory and each thread resolves its
+// element with a cheap in-shared search. Global reads stay coalesced.
+// Buffers ping-pong; the host tracks which side holds the result.
+__global__ void merge_level_kernel(const unsigned long long* __restrict__ src,
+                                   unsigned long long* __restrict__ dst,
+                                   int m, int run) {
+    __shared__ unsigned long long sA[kSelMergeTile];
+    __shared__ unsigned long long sB[kSelMergeTile];
+    const long long ntiles = m / kSelMergeTile;
+    for (long long tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        const long long p0 = tile * kSelMergeTile;
+        const long long pair = p0 / (2 * run);
+        const long long lo0 = p0 - pair * 2 * run;
+        const long long a_base = pair * 2 * run;
+        const long long b_base = a_base + run;
+        // co-rank for the tile start: largest i with
+        // (i == 0 || A[i-1] > B[lo0-i])
+        long long l = lo0 > run ? lo0 - run : 0;
+        long long h = lo0 < run ? lo0 : run;
+        while (l < h) {
+            const long long mid = (l + h + 1) >> 1;
+            const bool pred =
+                mid == 0 || src[a_base + mid - 1] > src[b_base + lo0 - mid];
+            if (pred) l = mid; else h = mid - 1;
+        }
+        const long long i0 = l, j0 = lo0 - i0;
+        // stage up to kSelMergeTile inputs from each run (0-padded;
+        // real keys are > 0 so pads sort to the tail)
+        for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
+            sA[u] = (i0 + u < run) ? src[a_base + i0 + u] : 0ULL;
+            sB[u] = (j0 + u < run) ? src[b_base + j0 + u] : 0ULL;
+        }
+        __syncthreads();
+        // in-tile co-rank per thread (shared memory, log T steps)
+        for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
+            long long l2 = 0;
+            long long h2 = u < kSelMergeTile ? u : kSelMergeTile;
+            while (l2 < h2) {
+                const long long mid = (l2 + h2 + 1) >> 1;
+                const bool pred = mid == 0 || sA[mid - 1] > sB[u - mid];
+                if (pred) l2 = mid; else h2 = mid - 1;
+            }
+            const long long i = l2, j = u - i;
+            const bool take_a =
+                (i < kSelMergeTile) &&
+                (j >= kSelMergeTile || sA[i] > sB[j]);
+            dst[p0 + u] = take_a ? sA[i] : sB[j];
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void decode_kernel(const SelArgs* __restrict__ a,
+                              const unsigned long long* __restrict__ keys,
+                              int k) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < k;
+         i += gridDim.x * blockDim.x) {
+        const unsigned long long key = keys[i];
+        if (a->vals) a->vals[i] = unfkey((unsigned)(key >> 32));
+        if (a->idxs) a->idxs[i] = (int)(0xFFFFFFFFu - (unsigned)(key & 0xFFFFFFFFu));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stage 4b tail: parallel nucleus count (two kernels)
+// ---------------------------------------------------------------------------
+
+// Per-block partial sums of the sorted probabilities.
+__global__ void topp_partial_kernel(const unsigned long long* __restrict__ keys,
+                                    float* __restrict__ partials, int k,
+                                    int per) {
+    const long long b0 = (long long)blockIdx.x * per;
+    const long long b1 = min((long long)k, b0 + per);
+    float s = 0.0f;
+    for (long long i = b0 + threadIdx.x; i < b1; i += kSelBlock)
+        s += unfkey((unsigned)(keys[i] >> 32));
+    s = warp_reduce_sum(s);
+    __shared__ float sh_warp[kSelWarps];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) sh_warp[warp] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < kSelWarps; ++w) t += sh_warp[w];
+        partials[blockIdx.x] = t;
+    }
+}
+
+// Single-block decision: walk the block partials to the block containing
+// the p_stop crossing, then resolve the exact index inside that block's
+// slice. The float accumulation order differs from the serial CPU loop
+// (block-tree partials), so boundary draws may differ by a couple of
+// elements at 131k-scale vocabularies - same contract as v0.3.
+__global__ void topp_crossing_kernel(const SelArgs* __restrict__ a,
+                                     const unsigned long long* __restrict__ keys,
+                                     const float* __restrict__ partials,
+                                     int k, int per, int nblocks) {
+    int* count_out = a->count_out;
+    const float p_stop = a->p_stop;
+    __shared__ float sh_p[kMaxGrid];
+    for (int i = threadIdx.x; i < nblocks; i += kSelBlock) sh_p[i] = partials[i];
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    float carry = 0.0f;
+    int tb = -1;
+    for (int b = 0; b < nblocks; ++b) {
+        if (carry + sh_p[b] >= p_stop) { tb = b; break; }
+        carry += sh_p[b];
+    }
+    if (tb < 0) { *count_out = k; return; }   // p > total mass
+    const long long b0 = (long long)tb * per;
+    const long long b1 = min((long long)k, b0 + per);
+    float cum = carry;
+    for (long long i = b0; i < b1; ++i) {
+        cum += unfkey((unsigned)(keys[i] >> 32));
+        if (cum >= p_stop) { *count_out = (int)i + 1; return; }
+    }
+    *count_out = k;    // partial-sum said crossing, serial scan didn't
+}
+
+// ---------------------------------------------------------------------------
+// stage 4b tail: serial sampling scan (window > kSelEarlyOut)
+// ---------------------------------------------------------------------------
+
+// Identical arithmetic and accumulation order to the in-finisher sample
+// scan (and to the CPU reference): one thread walks the sorted keys. The
+// serial walk is what keeps per-seed CPU/GPU token parity stable; big
+// windows only occur for flat distributions (the host widening loop).
+__global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys,
+                                     unsigned long long* __restrict__ ws,
+                                     int k, int n, float p_stop,
+                                     unsigned long long seed,
+                                     int* token_out, int* count_out) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // threshold against the GLOBAL softmax total (exptotal_kernel) so a
+    // window that cannot contain the nucleus reports "not covered"
+    // instead of silently renormalizing (see exptotal_kernel note).
+    // window == n with float-drift cum < p*total: the nucleus is
+    // everything by definition - force coverage (matches the CPU
+    // reference, which compares an identical serial accumulation).
+    const float row_max = unfkey((unsigned)(keys[0] >> 32));
+    const float total = *reinterpret_cast<const float*>(&ws[kWsTotal]);
+    float cum = 0.0f;
+    int nucleus = 0;
+    float nucleus_mass = 0.0f;
+    bool covered = false;
+    for (int i = 0; i < k; ++i) {
+        cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+        nucleus = i + 1;
+        if (cum >= p_stop * total) { nucleus_mass = cum; covered = true; break; }
+    }
+    if (!covered) {
+        if (k < n) return;          // window too small; host retries wider
+        nucleus = k;                // full window IS the vocabulary
+        nucleus_mass = cum;
+    }
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+    const float target = u * nucleus_mass;
+    cum = 0.0f;
+    for (int i = 0; i < nucleus; ++i) {
+        cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+        if (cum >= target) {
+            *token_out = (int)(0xFFFFFFFFu - (unsigned)(keys[i] & 0xFFFFFFFFu));
+            break;
+        }
+    }
+    if (count_out) *count_out = nucleus;
+}
+
+// ---------------------------------------------------------------------------
+// sample-mode prerequisites: GLOBAL softmax mass
+// ---------------------------------------------------------------------------
+
+// Global max of the scaled logits as fkey bits (monotone unsigned order,
+// so a plain integer atomicMax finds the float max of any-sign values).
+__global__ void expmax_kernel(const float* __restrict__ x,
+                              unsigned long long* __restrict__ ws,
+                              int n, float inv_t, PenCtx pen) {
+    __shared__ unsigned int warp_best[kSelWarps];
+    unsigned int local = 0u;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += gridDim.x * blockDim.x) {
-        if (taken && ((taken[i >> 6] >> (i & 63)) & 1ULL)) continue;
-        unsigned long long key = pack_key(x[i], i);
-        if (key > local) local = key;
+        const unsigned int fk = fkey(step_logit(x, i, inv_t, pen));
+        if (fk > local) local = fk;
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -553,113 +816,318 @@ __global__ void select_round_kernel(const float* __restrict__ x,
     const int warp = threadIdx.x >> 5;
     if (lane == 0) warp_best[warp] = local;
     __syncthreads();
-    if (warp == 0) {
-        local = (threadIdx.x < kSelWarps) ? warp_best[lane] : 0ULL;
+    if (threadIdx.x == 0) {
+        unsigned int b = warp_best[0];
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            local = max(local, __shfl_down_sync(0xffffffffu, local, off));
-        if (lane == 0) atomicMax(best, local);
+        for (int w = 1; w < kSelWarps; ++w) b = max(b, warp_best[w]);
+        atomicMax(&ws[kWsExpMax], (unsigned long long)b);
     }
 }
 
-__global__ void mark_taken_kernel(unsigned long long* taken, int index) {
-    atomicOr(&taken[index >> 6], 1ULL << (index & 63));
+// Global softmax total: sum of __expf(v - max) over ALL n logits. The
+// nucleus threshold must use the GLOBAL mass - a window-local total
+// silently renormalizes the softmax and shrinks the nucleus whenever the
+// distribution is flat enough that the tail carries real mass (bug found
+// by the v0.4 widening test; v0.3 had the same flaw). Launched right
+// after expmax_kernel: the kernel boundary publishes the max.
+__global__ void exptotal_kernel(const float* __restrict__ x,
+                                unsigned long long* __restrict__ ws,
+                                int n, float inv_t, PenCtx pen) {
+    const float row_max = unfkey((unsigned)ws[kWsExpMax]);
+    float s = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x)
+        s += __expf(step_logit(x, i, inv_t, pen) - row_max);
+    __shared__ float warp_sum[kSelWarps];
+    s = warp_reduce_sum(s);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sum[warp] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < kSelWarps; ++w) t += warp_sum[w];
+        atomicAdd(reinterpret_cast<float*>(&ws[kWsTotal]), t);
+    }
 }
 
-int select_rounds_host(const float* dx, float* vals, long long* idxs,
-                       int* count_out, int n, int max_rounds, float p_stop,
-                       unsigned long long* best, unsigned long long* taken,
-                       size_t bitmap_words) {
-    cudaMemset(taken, 0, bitmap_words * sizeof(unsigned long long));
-    const int grid = (int)((n + kSelBlock - 1) / kSelBlock);
-    float cumulative = 0.0f;
-    int selected = 0;
-    for (int sel = 0; sel < max_rounds; ++sel) {
-        cudaMemset(best, 0, sizeof(unsigned long long));
-        select_round_kernel<<<grid, kSelBlock>>>(dx, taken, best, n);
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-            throw std::runtime_error(std::string("selection round launch failed: ") +
-                                     cudaGetErrorString(err));
-        unsigned long long key = 0;
-        if (cudaMemcpy(&key, best, sizeof(unsigned long long),
-                       cudaMemcpyDeviceToHost) != cudaSuccess)
-            throw std::runtime_error("selection winner readback failed");
-        const int idx = (int)(0xFFFFFFFFu - (unsigned)(key & 0xFFFFFFFFu));
-        // host-side mirror of unfkey(): reconstruct the float from the
-        // monotone-mapped bits
-        const unsigned int u = (unsigned)(key >> 32);
-        const unsigned int bits = (u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u;
-        float value;
-        std::memcpy(&value, &bits, sizeof(float));
-        if (vals) vals[sel] = value;
-        if (idxs) idxs[sel] = idx;
-        mark_taken_kernel<<<1, 1>>>(taken, idx);
-        ++selected;
-        if (p_stop > 0.0f) {
-            cumulative += value;
-            if (cumulative >= p_stop) break;
+// Finalize launch (after the eight round launches):
+//   stage 2 - nothing to do (early exit already settled k_min)
+//   stage 0 - eight full rounds completed: the prefix already IS the
+//             full k-th key and remaining already collapsed to 1 (keys
+//             are unique) - just publish the settled state
+//   stage 1 - early exit fired: COMPACT the survivors (every key matching
+//             the refined prefix) into the candidate buffer; the last
+//             block sorts them in shared memory and publishes k_min /
+//             tie_take = 1. Keeping this stage out of the round kernel
+//             lets the rounds run with 2KB of static shared memory
+//             (higher occupancy) and only this kernel pays the 16KB.
+__global__ void select_finalize_kernel(const SelArgs* __restrict__ a,
+                                       unsigned long long* __restrict__ ws,
+                                       int n, float inv_t, PenCtx pen) {
+    __shared__ int sh_ticket;
+    const unsigned long long stage = ws[kWsStage];
+    if (stage == 2ULL) return;
+    if (stage == 0ULL) {
+        if (threadIdx.x == 0 && blockIdx.x == 0) ws[kWsStage] = 2ULL;
+        return;
+    }
+
+    const float* __restrict__ x = a->x;
+    unsigned long long* ticket = ws + kWsTicket;
+    const unsigned long long prefix = ws[kWsPrefix];
+    const int level_done = (int)ws[kWsLevelDone];
+    // prefix covers bytes [level_done..7]; match exactly those bytes
+    // (shift by 8*level_done: 0 for a fully refined prefix, 56 for a
+    // single high byte - no undefined shifts either way)
+    const unsigned long long mask =
+        ~((1ULL << (8 * level_done)) - 1ULL);
+    unsigned long long* cand = ws + kWsCand;
+    unsigned long long* cand_cnt = ws + kWsCandCnt;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        const unsigned long long key = pack_key(step_logit(x, i, inv_t, pen), i);
+        if ((key & mask) == prefix) {
+            const unsigned long long pos = atomicAdd(cand_cnt, 1ULL);
+            // survivors <= kSelEarlyOut is guaranteed by the early-exit
+            // condition; the bound keeps a bug from smashing memory
+            if (pos < (unsigned long long)kSelEarlyOut) cand[pos] = key;
         }
     }
-    if (count_out)
-        cudaMemcpy(count_out, &selected, sizeof(int), cudaMemcpyHostToDevice);
-    return selected;
-}
-
-bool coop_supported() {
-    static int cached = -1;
-    if (cached < 0) {
-        int dev = 0, support = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&support, cudaDevAttrCooperativeLaunch, dev);
-        cached = support;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();                            // publish my stores
+        sh_ticket = (int)atomicAdd(ticket, 1ULL);
     }
-    return cached != 0;
+    __syncthreads();
+    if (sh_ticket != (int)gridDim.x - 1) return;    // finisher = last block
+    __threadfence();                                // acquire: cand visible
+
+    int cnt = (int)(
+        *(const volatile unsigned long long*)&ws[kWsCandCnt]);
+    if (cnt > kSelEarlyOut) cnt = kSelEarlyOut;     // defensive clamp
+    const unsigned long long remaining = ws[kWsRemaining];
+    __shared__ unsigned long long sk[kSelEarlyOut];
+    int len = 1;
+    while (len < cnt) len <<= 1;
+    const volatile unsigned long long* vcand =
+        (const volatile unsigned long long*)cand;
+    for (int i = threadIdx.x; i < len; i += blockDim.x)
+        sk[i] = (i < cnt) ? vcand[i] : 0ULL;
+    __syncthreads();
+    bitonic_desc_shared(sk, len);
+    // The remaining-th largest survivor is the k-th largest key overall;
+    // every full key is unique, so exactly one key equals it.
+    ws[kWsPrefix] = sk[remaining - 1];
+    ws[kWsRemaining] = 1ULL;
+    ws[kWsStage] = 2ULL;
+    *ticket = 0ULL;                                  // defensive reset
 }
 
-void launch_radix_topk(const float* x, float* vals, long long* idxs,
-                       int* count_out, int* token_out,
-                       int n, int k, float p_stop, float inv_t,
-                       unsigned long long sample_seed, int sample) {
-    int m = 1;
-    while (m < k) m <<= 1;                        // bitonic pad size
-    // two m-word key buffers (ping-pong) + 256 words of block-sum scratch
-    // for the parallel nucleus count (writes past 2*m otherwise)
-    unsigned long long* ws = selection_workspace(2 * (size_t)m + 256);
-
-    int dev = 0, num_sms = 0, blocks_per_sm = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm, radix_topk_kernel, kSelBlock, 0);
-    if (blocks_per_sm < 1) blocks_per_sm = 1;
-    const long long want = (n + kSelBlock - 1) / kSelBlock;
-    const int grid = (int)std::min<long long>((long long)num_sms * blocks_per_sm,
-                                              std::max<long long>(want, 1));
-
-    RadixArgs args{x, vals, idxs, count_out, token_out,
-                   n, k, m, p_stop, inv_t, sample_seed, sample, ws};
-    void* arg_ptrs[] = {&args};
-    cudaError_t err = cudaLaunchCooperativeKernel(
-        (void*)radix_topk_kernel, dim3((unsigned)grid), dim3(kSelBlock),
-        arg_ptrs, 0, nullptr);
-    if (err != cudaSuccess)
-        throw std::runtime_error(std::string("radix selection launch failed: ") +
-                                 cudaGetErrorString(err));
+// Device-side argument loader: writes the per-call pointers into the
+// args block. Used ONLY on the outer-capture path, where the pointers
+// ride as kernel parameters and get baked into the CALLER'S graph (the
+// torch.cuda.graph contract: captures use fixed tensors, replays mutate
+// them in place). One thread, one 32-byte store - effectively free.
+__global__ void set_args_kernel(SelArgs* __restrict__ dargs,
+                                const float* x, float* vals,
+                                long long* idxs, int* count_out) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        dargs->x = x;
+        dargs->vals = vals;
+        dargs->idxs = idxs;
+        dargs->count_out = count_out;
+    }
 }
 
+// ---------------------------------------------------------------------------
+// shared launcher plumbing
+// ---------------------------------------------------------------------------
+
+// ~4 elements per thread: small inputs launch ONE resident wave (the
+// arrival-ticket tail dominates when blocks are cheap and many), large
+// inputs cap at kMaxGrid with grid-stride loops covering the rest.
+int selection_grid(int n) {
+    long long want = (n + 4 * kSelBlock - 1) / (4 * kSelBlock);
+    return (int)std::max<long long>(1LL, std::min<long long>(want, kMaxGrid));
+}
+
+// The full pipeline as plain stream-ordered launches (device args block
+// already populated). Used directly when the caller's stream is being
+// captured by an OUTER graph (torch.cuda.graph) - in that case `src` is
+// non-null and a one-thread loader kernel bakes this call's pointers
+// into the caller's graph as its leading node - and once per (n, k,
+// mode) to record our internal cached graph (src == nullptr; the args
+// arrive through the per-call H2D ring copy instead).
+constexpr PenCtx kNoPen{nullptr, 1.0f, 0};
+
+void select_raw_pipeline(const SelArgs* dargs, unsigned long long* ws,
+                         int n, int k, int m, bool with_nucleus,
+                         cudaStream_t cs, const SelArgs* src = nullptr,
+                         PenCtx pen = kNoPen) {
+    if (src)
+        set_args_kernel<<<1, 32, 0, cs>>>(
+            const_cast<SelArgs*>(dargs), src->x, src->vals, src->idxs,
+            src->count_out);
+    const int grid = selection_grid(n);
+    // per-call state reset
+    cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+    for (int level = 7; level >= 0; --level)
+        select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+            dargs, ws, n, level, (unsigned long long)k, 1.0f, pen);
+    // finalize: compacts when the early exit fired, otherwise just
+    // publishes the settled state (prefix == full k-th key)
+    select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, 1.0f, pen);
+    check_launch("selection round launch");
+
+    if (k <= kSelEarlyOut) {
+        emit_finish_kernel<<<grid, kSelBlock, 0, cs>>>(
+            dargs, ws, n, k, 1.0f, 0ULL, /*sample=*/0, pen);
+        check_launch("selection emit+finish launch");
+        return;
+    }
+
+    emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, k, 1.0f, pen);
+    chunk_sort_kernel<<<(int)((m + kSelSortChunk - 1) / kSelSortChunk),
+                        kSelBlock, 0, cs>>>(ws + kWsKeys, k, m);
+    check_launch("selection chunk sort launch");
+    unsigned long long* bufs[2] = {ws + kWsKeys,
+                                   ws + kWsKeys + (size_t)m};
+    int cur = 0;
+    for (int run = kSelSortChunk; run < m; run <<= 1) {
+        const long long ntiles = m / kSelMergeTile;
+        const int gmerge = (int)std::max<long long>(
+            1LL, std::min<long long>(ntiles, kMaxGrid));
+        merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
+                                                         bufs[cur ^ 1],
+                                                         m, run);
+        check_launch("selection merge launch");
+        cur ^= 1;
+    }
+    decode_kernel<<<selection_grid(k), kSelBlock, 0, cs>>>(dargs, bufs[cur],
+                                                           k);
+    check_launch("selection decode launch");
+
+    if (with_nucleus) {
+        float* partials = reinterpret_cast<float*>(
+            ws + kWsKeys + 2 * (size_t)m);
+        const int gsum = (int)std::max<long long>(
+            1LL, std::min<long long>((k + kSelBlock - 1) / kSelBlock,
+                                     kMaxGrid));
+        const int per = (k + gsum - 1) / gsum;
+        topp_partial_kernel<<<gsum, kSelBlock, 0, cs>>>(bufs[cur], partials,
+                                                        k, per);
+        topp_crossing_kernel<<<1, kSelBlock, 0, cs>>>(dargs, bufs[cur],
+                                                      partials, k, per,
+                                                      gsum);
+        check_launch("selection nucleus count launch");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// internal graph cache
+// ---------------------------------------------------------------------------
+
+// One cached executable graph per (n, k, mode, workspace). Capture runs
+// on a private side stream (capturing on the caller's stream is illegal
+// when it is the legacy default stream); replay always targets the
+// caller's stream, which orders it with surrounding work. The graph
+// nodes reference only fixed workspace addresses plus the device args
+// block, so replays pick up fresh pointers through the per-call H2D
+// copy. The stage-machine kernels read their state from the workspace at
+// runtime, so a fixed launch sequence stays correct for every input.
+struct SelGraph {
+    cudaGraphExec_t exec = nullptr;
+};
+using SelGraphKey = std::tuple<int, int, int, unsigned long long*>;
+
+cudaStream_t capture_stream() {
+    static cudaStream_t s = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (cudaStreamCreate(&s) != cudaSuccess)
+            throw std::runtime_error(std::string("capture stream create failed: ") +
+                                     cudaGetErrorString(cudaGetLastError()));
+    });
+    return s;
+}
+
+// Bounded cache: decode loops use a handful of shapes; clear everything
+// if pathological call patterns ever exceed the cap.
+cudaGraphExec_t cached_graph(const SelGraphKey& key,
+                             const std::function<void(cudaStream_t)>& record) {
+    static std::mutex mu;
+    static std::map<SelGraphKey, SelGraph> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second.exec;
+    if (cache.size() >= 64) {
+        for (auto& kv : cache)
+            if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
+        cache.clear();
+    }
+    cudaStream_t cs = capture_stream();
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+        throw std::runtime_error(std::string("graph capture begin failed: ") +
+                                 cudaGetErrorString(cudaGetLastError()));
+    record(cs);
+    cudaGraph_t graph = nullptr;
+    if (cudaStreamEndCapture(cs, &graph) != cudaSuccess || !graph)
+        throw std::runtime_error(std::string("graph capture end failed: ") +
+                                 cudaGetErrorString(cudaGetLastError()));
+    cudaGraphExec_t exec = nullptr;
+    if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess || !exec) {
+        cudaGraphDestroy(graph);
+        throw std::runtime_error(std::string("graph instantiate failed: ") +
+                                 cudaGetErrorString(cudaGetLastError()));
+    }
+    cudaGraphDestroy(graph);
+    cache.emplace(key, SelGraph{exec});
+    return exec;
+}
+
+// Rounds + finalize + the right emit/sort/decode tail for the given k.
+// p_stop > 0 requests the nucleus count (top-p mode; vals are already
+// probabilities, so the mass scan sums them directly). Sampling lives in
+// sample_topp_launch, which drives its own (windowed) sequence.
 void select_common(const float* x, float* vals, long long* idxs,
-                   int* count_out, int n, int k, float p_stop) {
-    if (coop_supported()) {
-        launch_radix_topk(x, vals, idxs, count_out, nullptr, n, k, p_stop,
-                          1.0f, 0ULL, /*sample=*/0);
-    } else {
-        const size_t bitmap_words = ((size_t)n + 63) / 64;
-        unsigned long long* ws = selection_workspace(0);
-        select_rounds_host(x, vals, idxs, count_out, n, k, p_stop,
-                           ws + 256, fallback_bitmap(bitmap_words),
-                           bitmap_words);
+                   int* count_out, int n, int k, float p_stop,
+                   std::uintptr_t stream) {
+    cudaStream_t cs = (cudaStream_t)stream;
+    int m = 1;
+    while (m < k) m <<= 1;                        // sort pad size
+    // candidates + two m-word key buffers + 1024 floats of scan scratch
+    // + the per-call args block
+    unsigned long long* ws =
+        selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m + 256 +
+                            sizeof(SelArgs) / sizeof(unsigned long long));
+    SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+    // outer capture in progress (torch.cuda.graph): contribute the raw
+    // kernels to the caller's graph, with a loader node that re-installs
+    // the capture-time pointers on every replay (torch's fixed-tensor
+    // contract). No host allocations or event queries happen here - both
+    // are illegal mid-capture.
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cs, &cap) != cudaSuccess)
+        cap = cudaStreamCaptureStatusNone;
+    if (cap == cudaStreamCaptureStatusActive) {
+        const SelArgs tmp{x, vals, idxs, count_out, p_stop};
+        select_raw_pipeline(dargs, ws, n, k, m, p_stop > 0.0f, cs, &tmp);
+        return;
     }
+    ship_args(cs, dargs, x, vals, idxs, count_out, p_stop);
+
+    const int mode = p_stop > 0.0f ? 1 : 0;
+    cudaGraphExec_t exec = cached_graph(
+        SelGraphKey(n, k, mode, ws),
+        [&](cudaStream_t rec) {
+            select_raw_pipeline(dargs, ws, n, k, m, mode == 1, rec);
+        });
+    if (cudaGraphLaunch(exec, cs) != cudaSuccess)
+        throw std::runtime_error(std::string("selection graph launch failed: ") +
+                                 cudaGetErrorString(cudaGetLastError()));
 }
 
 } // namespace
@@ -687,9 +1155,9 @@ topk_cpu(const std::vector<float>& x, int k) {
     return {std::move(vals), std::move(idxs)};
 }
 
-void topk_launch(const float* x, float* vals, long long* idxs, int n, int k) {
+void topk_launch(const float* x, float* vals, long long* idxs, int n, int k, std::uintptr_t stream) {
     if (k <= 0 || n <= 0) return;
-    select_common(x, vals, idxs, nullptr, n, k, 0.0f);
+    select_common(x, vals, idxs, nullptr, n, k, 0.0f, stream);
 }
 
 std::pair<std::vector<float>, std::vector<long long>>
@@ -710,7 +1178,7 @@ topp_cpu(const std::vector<float>& probs, float p) {
 }
 
 void topp_select_launch(const float* x, float* vals, long long* idxs,
-                        int n, float p, int* count_out) {
+                        int n, float p, int* count_out, std::uintptr_t stream) {
     if (n <= 0) {
         if (count_out) {
             int zero = 0;
@@ -718,52 +1186,86 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
         }
         return;
     }
-    select_common(x, vals, idxs, count_out, n, n, p);
+    select_common(x, vals, idxs, count_out, n, n, p, stream);
 }
 
 // ---------------------------------------------------------------------------
 // fused nucleus sampling: softmax(logits/T) -> nucleus(p) -> inverse-CDF
-// draw from a hash-derived uniform, all inside the cooperative kernel.
-// Returns the sampled token via a one-int host readback.
-// (CPU reference: sample_topp_cpu in sampling.cu, defined in activations.hpp)
+// draw from a hash-derived uniform. The token comes back through a
+// workspace slot with a host readback (this launcher is intentionally
+// NOT CUDA-graph capturable - the widening loop needs the result).
+// (CPU reference: sample_topp_cpu in sampling.cu, declared in
+// activations.hpp)
 // ---------------------------------------------------------------------------
 
 long long sample_topp_launch(const float* x, int n, float p, float t,
-                             unsigned long long seed) {
+                             unsigned long long seed, std::uintptr_t stream) {
     if (n <= 0)
         throw std::invalid_argument("sample of empty logits");
     if (!(p > 0.0f && p <= 1.0f))
         throw std::invalid_argument("p must be in (0, 1]");
     if (!(t > 0.0f))
         throw std::invalid_argument("temperature must be > 0");
-    if (!coop_supported()) {
-        // rare: device without cooperative launch - do the whole thing on
-        // the host (readback + CPU reference) so the API still works
-        std::vector<float> host(n);
-        if (cudaMemcpy(host.data(), x, n * sizeof(float),
-                       cudaMemcpyDeviceToHost) != cudaSuccess)
-            throw std::runtime_error("sample fallback readback failed");
-        return sample_topp_cpu(host, p, t, seed);
-    }
-    // Widening-window strategy: sort only the top-M candidates (shared-
-    // memory bitonic below 2048-class sizes, no global-sort grid.sync
-    // storm), sample within them; if the nucleus is not covered by the
-    // window, retry with 4x as many candidates. Typical distributions are
-    // covered by the first window.
-    int window = 4096;
-    if (window > n) window = n;
+    // Widening-window strategy: sort only the top-M candidates (M starts
+    // at the early-exit/in-block-sort size), sample within them; if the
+    // nucleus is not covered by the window, retry with 4x as many.
+    // Typical distributions are covered by the first window.
+    int window = std::min(kSelEarlyOut, n);
     for (;;) {
         int m = 1;
         while (m < window) m <<= 1;
-        // Grow the workspace to the FULL launch size (two m-word key
-        // buffers + block-sum scratch) BEFORE grabbing the token slot: the
-        // launch would grow it otherwise and free the old buffer below it.
-        unsigned long long* ws = selection_workspace(2 * (size_t)m + 256);
-        int* token_out = reinterpret_cast<int*>(ws + 256);
+        // Grow the workspace BEFORE presetting the token slot: the growth
+        // would otherwise free the buffer the slot lives in.
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m + 256 +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        cudaStream_t cs = (cudaStream_t)stream;
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemcpy(token_out, &token, sizeof(int), cudaMemcpyHostToDevice);
-        launch_radix_topk(x, nullptr, nullptr, nullptr, token_out, n, window,
-                          p, 1.0f / t, seed, /*sample=*/1);
+        // reset the control head FIRST, then preset the token sentinel
+        // (the memset would otherwise wipe it), then ship the args
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        cudaMemcpyAsync(token_out, &token, sizeof(int), cudaMemcpyHostToDevice, cs);
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, p);
+        const int grid = selection_grid(n);
+        for (int level = 7; level >= 0; --level)
+            select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, level, (unsigned long long)window, 1.0f / t,
+                kNoPen);
+        select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
+                                                           1.0f / t, kNoPen);
+        // global softmax mass (max, then total): the nucleus threshold
+        // must be global, not window-local (see exptotal_kernel)
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, 1.0f / t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, 1.0f / t, kNoPen);
+        check_launch("sample round launch");
+        if (window <= kSelEarlyOut) {
+            emit_finish_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, window, 1.0f / t, seed, /*sample=*/1, kNoPen);
+            check_launch("sample emit+finish launch");
+        } else {
+            emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                    1.0f / t, kNoPen);
+            chunk_sort_kernel<<<(m + kSelSortChunk - 1) / kSelSortChunk,
+                                kSelBlock, 0, cs>>>(ws + kWsKeys, window, m);
+            unsigned long long* bufs[2] = {ws + kWsKeys,
+                                           ws + kWsKeys + (size_t)m};
+            int cur = 0;
+            for (int run = kSelSortChunk; run < m; run <<= 1) {
+                const long long ntiles = m / kSelMergeTile;
+                const int gmerge = (int)std::max<long long>(
+                    1LL, std::min<long long>(ntiles, kMaxGrid));
+                merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
+                                                                bufs[cur ^ 1],
+                                                                m, run);
+                cur ^= 1;
+            }
+            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], ws, window,
+                                                   n, p, seed, token_out,
+                                                   nullptr);
+            check_launch("sample tail launch");
+        }
         cudaError_t err = cudaDeviceSynchronize();   // surface kernel faults
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("sample kernel failed: ") +
@@ -776,6 +1278,112 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
         if (window == n)
             throw std::runtime_error("sample nucleus not covered");
         window = std::min(n, window * 4);  // widen and retry
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fused decode step: repetition penalty -> temperature -> nucleus sample
+// ---------------------------------------------------------------------------
+
+// One call from raw logits to the next token. The penalty set becomes a
+// vocab bitmap (one kernel), then the SAME selection pipeline runs with
+// a penalty-aware key-packing: every site that reads a logit applies
+// penalty (to the raw value, matching the composed reference order)
+// then the temperature scale. No cached graphs here - the penalty rides
+// as a kernel parameter, and this launcher has an inherent host
+// readback anyway (same contract as sample_topp).
+long long decode_step_launch(const float* x, const long long* ids,
+                             int n, int m, float penalty, float p, float t,
+                             unsigned long long seed, std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("decode_step of empty logits");
+    if (m < 0)
+        throw std::invalid_argument("sampled_ids size must be >= 0");
+    if (!(penalty > 0.0f))
+        throw std::invalid_argument("penalty must be > 0");
+    if (!(p > 0.0f && p <= 1.0f))
+        throw std::invalid_argument("p must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    const size_t bitmap_words = ((size_t)n + 63) / 64;
+    const int use_pen = (m > 0 && penalty != 1.0f) ? 1 : 0;
+
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int mm = 1;
+        while (mm < window) mm <<= 1;
+        unsigned long long* ws = selection_workspace(
+            (size_t)kSelEarlyOut + 2 * (size_t)mm + 256 + bitmap_words +
+            sizeof(SelArgs) / sizeof(unsigned long long));
+        // bitmap lives right after the args block; it must be zeroed on
+        // every (re)try because the marking kernel ORs bits in - zero
+        // the whole span from the head through the bitmap (the buffers
+        // in between do not need it, but one contiguous clear is cheaper
+        // than two async memsets)
+        unsigned long long* bm = ws + sel_args_off(mm) +
+                                 sizeof(SelArgs) / sizeof(unsigned long long);
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(mm));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0,
+                        (size_t)(bm - ws + bitmap_words) *
+                            sizeof(unsigned long long),
+                        cs);
+        cudaMemcpyAsync(token_out, &token, sizeof(int),
+                        cudaMemcpyHostToDevice, cs);
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, p);
+        const PenCtx pen{bm, penalty, use_pen};
+        if (use_pen)
+            penalty_bitmap_kernel<<<(int)((m + kSelBlock - 1) / kSelBlock),
+                                    kSelBlock, 0, cs>>>(ids, m, bm);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        for (int level = 7; level >= 0; --level)
+            select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, level, (unsigned long long)window, inv_t, pen);
+        select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
+                                                           inv_t, pen);
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, pen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, pen);
+        check_launch("decode step round launch");
+        if (window <= kSelEarlyOut) {
+            emit_finish_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, window, inv_t, seed, /*sample=*/1, pen);
+            check_launch("decode step finish launch");
+        } else {
+            emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                    inv_t, pen);
+            chunk_sort_kernel<<<(mm + kSelSortChunk - 1) / kSelSortChunk,
+                                kSelBlock, 0, cs>>>(ws + kWsKeys, window, mm);
+            unsigned long long* bufs[2] = {ws + kWsKeys,
+                                           ws + kWsKeys + (size_t)mm};
+            int cur = 0;
+            for (int run = kSelSortChunk; run < mm; run <<= 1) {
+                const long long ntiles = mm / kSelMergeTile;
+                const int gmerge = (int)std::max<long long>(
+                    1LL, std::min<long long>(ntiles, kMaxGrid));
+                merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(
+                    bufs[cur], bufs[cur ^ 1], mm, run);
+                cur ^= 1;
+            }
+            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], ws, window,
+                                                   n, p, seed, token_out,
+                                                   nullptr);
+            check_launch("decode step tail launch");
+        }
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("decode step kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("decode step readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("decode step nucleus not covered");
+        window = std::min(n, window * 4);
     }
 }
 
@@ -835,15 +1443,16 @@ long long argmax_cpu(const std::vector<float>& x) {
     return best;
 }
 
-void argmax_launch(const float* x, int n, int* out) {
+void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream) {
     if (n <= 0) return;
     unsigned long long* ws = selection_workspace(0);
-    unsigned long long* best = ws + 256;           // counter slot doubles as reset
-    // Zero the best-key slot and the arrival counter in one 16-byte clear;
-    // the kernel resets the counter itself for subsequent launches.
-    cudaMemsetAsync(best, 0, 2 * sizeof(unsigned long long));
+    // Reuse two head words as the best-key slot + arrival counter (16
+    // bytes, self-resetting). Every selection call memsets the whole head
+    // before its own kernels, so cross-op clobbering is impossible.
+    unsigned long long* best = ws + kWsTicket;
+    cudaMemsetAsync(best, 0, 2 * sizeof(unsigned long long), (cudaStream_t)stream);
     const int grid = (int)((n + kSelBlock - 1) / kSelBlock);
-    argmax_kernel<<<grid, kSelBlock>>>(
+    argmax_kernel<<<grid, kSelBlock, 0, (cudaStream_t)stream>>>(
         x, best, reinterpret_cast<unsigned int*>(best + 1), n, out);
     check_launch("argmax kernel launch");
 }
