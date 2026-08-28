@@ -229,6 +229,8 @@ suite on every push.
   launch, early-exit compaction, cached CUDA graphs), stream-aware
   launchers everywhere (real CUDA-graph capture), INT8 compute path
   (IMMA qgemm + decode GEMV), fused decode_step sampling
+- v0.4.1 (done): runtime block-size autotuning for the row-wise kernels
+  (norms/softmax pick 128..1024 threads per shape at first call)
 - v0.4+: lightweight fused attention; prebuilt wheels on PyPI;
   pipelined tensor-core INT8 GEMM
 

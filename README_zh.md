@@ -215,6 +215,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
   单读 softmax、CUDA graph 验证
 - v0.3（已完成）：chunk-merge 选择排序 + 并行核计数、bf16x4/x8 向量化、
   INT8 量化/反量化工具
+- v0.4.1（已完成）：按行 kernel（归一化/softmax）运行时线程块自动调优
 - v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
 - v0.4+：轻量融合 attention；PyPI 预编译 wheel
 
