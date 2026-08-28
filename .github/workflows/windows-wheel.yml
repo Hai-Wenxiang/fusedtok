@@ -33,7 +33,6 @@ jobs:
         with:
           cuda: "12.4.1"
           method: "network"
-          sub-packages: '["nvcc", "cudart", "development"]'
 
       - name: Show toolkit
         shell: pwsh
