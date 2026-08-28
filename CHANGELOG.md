@@ -26,6 +26,21 @@ adheres to [Semantic Versioning](https://semver.org/).
   boundaries, K tails, k=1), int8 extremes, end-to-end quantized error
   bound, decode-shaped GEMV, and graph capture-replay with mutation.
 
+- decode_step(logits, sampled_ids, penalty, p=0.9, temperature=1.0,
+  seed=0): the fused decode loop - repetition penalty (vocab bitmap,
+  applied to the raw logit before the temperature scale, matching the
+  composed reference order), temperature, and nucleus sampling, all
+  inside the selection pipeline with a single host readback. Same seed
+  gives the same token as the composed repetition_penalty ->
+  temperature -> sample_topp calls on CPU and every GPU path. 131k-vocab
+  decode: 309us/token vs 354us for the composed three calls (1.15x, and
+  one API call instead of three); the launch is raw (no internal graph -
+  the penalty rides as a kernel parameter, which cached graphs would
+  bake stale).
+- tests/test_decode_step.py: composed-reference parity across penalties
+  and seeds, distribution shift under heavy penalty, empty/disabled
+  penalty paths, a 40-token generation loop, torch zero-copy parity.
+
 ### Changed
 - selection kernels (top-k / top-p / sampling) rewritten as a multi-launch
   pipeline of plain kernels: per-round arrival-ticket radix refinement (the

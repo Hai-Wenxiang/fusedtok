@@ -68,7 +68,14 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
 // kernel softmaxes (via sorted exp accumulation), truncates to the p-nucleus
 // and inverse-CDF samples with a hash-uniform of `seed`. Returns the token.
 long long sample_topp_launch(const float* x, int n, float p, float t,
-                             unsigned long long seed, std::uintptr_t stream = 0);
+                              unsigned long long seed, std::uintptr_t stream = 0);
+// Fused decode step: repetition penalty over the sampled ids (vocab
+// bitmap), temperature, then nucleus sampling - one call, one readback.
+// Returns the sampled token id.
+long long decode_step_launch(const float* x, const long long* ids,
+                             int n, int m, float penalty, float p, float t,
+                             unsigned long long seed,
+                             std::uintptr_t stream = 0);
 // INT8 quantization: q = clamp(round(x * (1/scale))), scale = absmax/127
 // (written to scale_out device float). n elements.
 void quantize_int8_launch(const float* x, signed char* q,

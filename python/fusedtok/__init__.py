@@ -58,6 +58,7 @@ __all__ = [
     "dequantize_int8",
     "qadd_int8",
     "qgemm",
+    "decode_step",
 ]
 
 
@@ -713,3 +714,56 @@ def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
         raise ValueError("logits must be 1-D")
     call = _fusedtok.sample_topp if path == "staged" else _fusedtok.sample_topp_cpu
     return int(call(arr, p, temperature, seed))
+
+
+def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,
+                seed=0, cuda=False):
+    """Fused decode step: one call from raw logits to the next token.
+
+    Applies the CTRL-style repetition penalty over ``sampled_ids``
+    (previously generated tokens), then the temperature scale, then
+    nucleus-samples - the whole chain runs inside the selection pipeline
+    (a vocab bitmap marks penalized ids; every logit read applies
+    penalty then temperature, matching the composed reference order).
+
+    Returns the sampled token id (int). Deterministic per seed.
+    ``penalty`` > 0 (1.0 disables), ``p`` in (0, 1], temperature > 0.
+    """
+    if not penalty > 0.0:
+        raise ValueError("penalty must be > 0")
+    if not 0.0 < p <= 1.0:
+        raise ValueError("p must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        n = logits.numel()
+        if _is_torch(sampled_ids):
+            ids = sampled_ids
+        else:
+            ids = torch.as_tensor(sampled_ids, dtype=torch.int64)
+        if ids.ndim != 1:
+            raise ValueError("sampled_ids must be 1-D")
+        if ids.numel() and (ids.min() < 0 or ids.max() >= n):
+            raise ValueError("token id out of range")
+        if not ids.is_cuda:
+            ids = ids.to(logits.device)
+        ids = ids.to(torch.int64).contiguous()
+        return int(_fusedtok.decode_step_launch(
+            logits.data_ptr(), ids.data_ptr(), n, ids.numel(),
+            penalty, p, temperature, seed, _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    ids = np.asarray(sampled_ids, dtype=np.int64).ravel()
+    if ids.size and (ids.min() < 0 or ids.max() >= arr.size):
+        raise ValueError("token id out of range")
+    if path == "staged":
+        return int(_fusedtok.decode_step(arr, ids, penalty, p, temperature,
+                                         seed))
+    # CPU reference: the composed three calls, same operation order
+    penalized = _fusedtok.repetition_penalty_cpu(arr, ids, penalty)
+    return int(_fusedtok.sample_topp_cpu(penalized, p, temperature, seed))

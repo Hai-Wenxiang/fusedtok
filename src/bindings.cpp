@@ -821,6 +821,44 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("a"), py::arg("b"), py::arg("y"), py::arg("m"), py::arg("n"),
        py::arg("k"), py::arg("sa"), py::arg("sb"), py::arg("stream") = 0);
 
+    // staged decode step: numpy logits + python ids in, token out
+    m.def("decode_step", [](FArray logits, py::array_t<long long, py::array::c_style> ids,
+                            double penalty, double p, double t,
+                            unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        const int n = (int)logits.size();
+        const int m = (int)ids.size();
+        if (n == 0)
+            throw std::invalid_argument("decode_step of empty logits");
+        auto ii = ids.request();
+        const long long* ip = static_cast<const long long*>(ii.ptr);
+        for (int j = 0; j < m; ++j)
+            if (ip[j] < 0 || ip[j] >= n)
+                throw std::invalid_argument("token id out of range");
+        DevBuf dx(n * 4), di((size_t)m * 8);
+        h2d(dx.get(), logits.data(), n * 4);
+        if (m > 0)
+            h2d(di.get(), ip, (size_t)m * 8);
+        const long long token = ft::decode_step_launch(
+            dx.fget(), reinterpret_cast<const long long*>(di.fget()),
+            n, m, (float)penalty, (float)p, (float)t, seed, 0);
+        sync_device("decode step kernel");
+        return token;
+    }, py::arg("logits"), py::arg("sampled_ids"), py::arg("penalty") = 1.0,
+       py::arg("p") = 0.9, py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("decode_step_launch", [](py::int_ x, py::int_ ids, int n, int m,
+                                   double penalty, double p, double t,
+                                   unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
+        return ft::decode_step_launch(
+            df(x), reinterpret_cast<const long long*>((uintptr_t)ids),
+            n, m, (float)penalty, (float)p, (float)t, seed, stream);
+    }, py::arg("x"), py::arg("ids"), py::arg("n"), py::arg("m"),
+       py::arg("penalty") = 1.0, py::arg("p") = 0.9, py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
     m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
                                    unsigned long long seed,
                                    std::uintptr_t stream) -> long long {
