@@ -1,4 +1,4 @@
-﻿// Row-wise softmax, max-subtracted for numerical stability.
+// Row-wise softmax, max-subtracted for numerical stability.
 //
 // Two kernel variants behind one launcher:
 //
@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -37,8 +38,9 @@ void softmax_check(const std::vector<float>& x, int rows, int cols) {
         throw std::invalid_argument("x.size() must equal rows * cols");
 }
 
-constexpr int kSmBlock = 256;
-constexpr int kSmWarps = kSmBlock / 32;
+constexpr int kSmBlock = 256;   // default block + variant-boundary basis
+// (shared staging sizes derive from the runtime block: WARPS = BLOCK/32
+// inside the templated kernels)
 // --- variant 1: register-resident path (cols <= kSmRegMax * kSmBlock) ------
 // Each thread's slice of the row lives in registers, so x is read ONCE,
 // exp is computed ONCE, and y is written from the register copy - minimal
@@ -46,18 +48,19 @@ constexpr int kSmWarps = kSmBlock / 32;
 
 constexpr int kSmPerThread = 32;                   // register budget per thread
 
-template <typename T>
+template <typename T, int BLOCK>
 __global__ void softmax_reg_kernel(const T* __restrict__ x,
                                    T* __restrict__ y,
                                    int cols) {
+    constexpr int WARPS = BLOCK / 32;
     const T* xr = x + (size_t)blockIdx.x * cols;
     T* yr = y + (size_t)blockIdx.x * cols;
-    __shared__ float sh_m[kSmWarps], sh_s[kSmWarps];
+    __shared__ float sh_m[WARPS], sh_s[WARPS];
 
     // load this thread's slice (strided; coalesced across the warp)
     float v[kSmPerThread];
     int cnt = 0;
-    for (int i = threadIdx.x; i < cols && cnt < kSmPerThread; i += kSmBlock)
+    for (int i = threadIdx.x; i < cols && cnt < kSmPerThread; i += BLOCK)
         v[cnt++] = ld_f(xr, i);
 
     // row max over the register slice + block reduce
@@ -72,7 +75,7 @@ __global__ void softmax_reg_kernel(const T* __restrict__ x,
         if (lane == 0) sh_m[warp] = m;
         __syncthreads();
         if (warp == 0) {
-            m = (threadIdx.x < kSmWarps) ? sh_m[lane] : -INFINITY;
+            m = (threadIdx.x < WARPS) ? sh_m[lane] : -INFINITY;
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
@@ -98,7 +101,7 @@ __global__ void softmax_reg_kernel(const T* __restrict__ x,
         if (lane == 0) sh_s[warp] = s;
         __syncthreads();
         if (warp == 0) {
-            s = (threadIdx.x < kSmWarps) ? sh_s[lane] : 0.0f;
+            s = (threadIdx.x < WARPS) ? sh_s[lane] : 0.0f;
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 s += __shfl_down_sync(0xffffffffu, s, off);
@@ -110,7 +113,7 @@ __global__ void softmax_reg_kernel(const T* __restrict__ x,
 
     // write straight from registers - x is never re-read
     int j = 0;
-    for (int i = threadIdx.x; i < cols && j < cnt; i += kSmBlock, ++j)
+    for (int i = threadIdx.x; i < cols && j < cnt; i += BLOCK, ++j)
         st_f(yr, i, e[j] * inv);
 }
 
@@ -126,15 +129,16 @@ __device__ __forceinline__ void merge_state(float& m, float& s,
     m = m_new;
 }
 
-template <typename T>
+template <typename T, int BLOCK>
 __global__ void softmax_online_kernel(const T* __restrict__ x,
                                       T* __restrict__ y,
                                       int cols) {
+    constexpr int WARPS = BLOCK / 32;
     const T* xr = x + (size_t)blockIdx.x * cols;
     T* yr = y + (size_t)blockIdx.x * cols;
 
     float m = -INFINITY, s = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += kSmBlock) {
+    for (int i = threadIdx.x; i < cols; i += BLOCK) {
         const float v = ld_f(xr, i);
         if (v > m) {
             s = (m == -INFINITY) ? 1.0f : s * __expf(m - v) + 1.0f;
@@ -150,14 +154,14 @@ __global__ void softmax_online_kernel(const T* __restrict__ x,
         const float so = __shfl_down_sync(0xffffffffu, s, off);
         merge_state(m, s, mo, so);
     }
-    __shared__ float sh_m[kSmWarps], sh_s[kSmWarps];
+    __shared__ float sh_m[WARPS], sh_s[WARPS];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     if (lane == 0) { sh_m[warp] = m; sh_s[warp] = s; }
     __syncthreads();
     if (warp == 0) {
-        m = (threadIdx.x < kSmWarps) ? sh_m[lane] : -INFINITY;
-        s = (threadIdx.x < kSmWarps) ? sh_s[lane] : 0.0f;
+        m = (threadIdx.x < WARPS) ? sh_m[lane] : -INFINITY;
+        s = (threadIdx.x < WARPS) ? sh_s[lane] : 0.0f;
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             const float mo = __shfl_down_sync(0xffffffffu, m, off);
@@ -169,8 +173,61 @@ __global__ void softmax_online_kernel(const T* __restrict__ x,
     __syncthreads();
     const float inv = 1.0f / sh_s[0];
 
-    for (int i = threadIdx.x; i < cols; i += kSmBlock)
+    for (int i = threadIdx.x; i < cols; i += BLOCK)
         st_f(yr, i, __expf(ld_f(xr, i) - sh_m[0]) * inv);
+}
+
+// Block dispatch + one-time tuning. The reg/online variant boundary
+// stays based on the default block (kSmBlock) so a wider tuned block
+// cannot flip kernels underneath the numerics tests; only the chosen
+// variant's thread count varies.
+template <typename T>
+void softmax_dispatch(const T* x, T* y, int rows, int cols, int block,
+                      cudaStream_t cs) {
+    if (cols <= kSmPerThread * kSmBlock) {
+        switch (block) {
+        case 128:
+            softmax_reg_kernel<T, 128><<<rows, 128, 0, cs>>>(x, y, cols);
+            break;
+        case 512:
+            softmax_reg_kernel<T, 512><<<rows, 512, 0, cs>>>(x, y, cols);
+            break;
+        case 1024:
+            softmax_reg_kernel<T, 1024><<<rows, 1024, 0, cs>>>(x, y, cols);
+            break;
+        default:
+            softmax_reg_kernel<T, 256><<<rows, 256, 0, cs>>>(x, y, cols);
+            break;
+        }
+    } else {
+        switch (block) {
+        case 128:
+            softmax_online_kernel<T, 128><<<rows, 128, 0, cs>>>(x, y, cols);
+            break;
+        case 512:
+            softmax_online_kernel<T, 512><<<rows, 512, 0, cs>>>(x, y, cols);
+            break;
+        case 1024:
+            softmax_online_kernel<T, 1024><<<rows, 1024, 0, cs>>>(x, y, cols);
+            break;
+        default:
+            softmax_online_kernel<T, 256><<<rows, 256, 0, cs>>>(x, y, cols);
+            break;
+        }
+    }
+    check_launch("softmax kernel launch");
+}
+
+// Tuning on the caller's own buffers at full size (see the layernorm
+// note for why a truncated scratch problem misleads the choice).
+template <typename T>
+int softmax_pick_block(const char* tag, const T* x, T* y, int rows,
+                       int cols, cudaStream_t cs) {
+    return autotune_block(tag, ((long long)rows << 32) | (unsigned)cols,
+                          [&](int b) {
+                              softmax_dispatch<T>(x, y, rows, cols, b, cs);
+                          },
+                          cs);
 }
 
 } // namespace
@@ -197,25 +254,23 @@ std::vector<float> softmax_cpu(const std::vector<float>& x, int rows, int cols) 
 
 void softmax_launch(const float* x, float* y, int rows, int cols, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
-    if (cols <= kSmPerThread * kSmBlock) {
-        softmax_reg_kernel<float><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
-        check_launch("softmax kernel launch");
-    } else {
-        softmax_online_kernel<float><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
-        check_launch("softmax kernel launch");
-    }
+    cudaStream_t cs = (cudaStream_t)stream;
+    int block = kSmBlock;
+    if (!stream_is_capturing(cs))
+        block = softmax_pick_block<float>("softmax:f32", x, y, rows, cols,
+                                          cs);
+    softmax_dispatch<float>(x, y, rows, cols, block, cs);
 }
 
 void softmax_launch_bf16(const __nv_bfloat16* x, __nv_bfloat16* y,
                          int rows, int cols, std::uintptr_t stream) {
     if (rows <= 0 || cols <= 0) return;
-    if (cols <= kSmPerThread * kSmBlock) {
-        softmax_reg_kernel<__nv_bfloat16><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
-        check_launch("softmax bf16 kernel launch");
-    } else {
-        softmax_online_kernel<__nv_bfloat16><<<rows, kSmBlock, 0, (cudaStream_t)stream>>>(x, y, cols);
-        check_launch("softmax bf16 kernel launch");
-    }
+    cudaStream_t cs = (cudaStream_t)stream;
+    int block = kSmBlock;
+    if (!stream_is_capturing(cs))
+        block = softmax_pick_block<__nv_bfloat16>("softmax:bf16", x, y,
+                                                  rows, cols, cs);
+    softmax_dispatch<__nv_bfloat16>(x, y, rows, cols, block, cs);
 }
 
 } // namespace fusedtok

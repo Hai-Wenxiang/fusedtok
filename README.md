@@ -157,16 +157,19 @@ reproduce with `python benchmarks/bench.py`):
 
 | Op | Shape | fusedtok | PyTorch eager | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 410 µs | 2564 µs | **6.2x** |
-| RMSNorm (+residual) | [1024×4096] | 256 µs | 526 µs | **2.1x** |
-| SwiGLU | [1024×4096] | 158 µs | 257 µs | **1.6x** |
-| top-k (k=50) | [131072] | 78 µs | 124 µs | **1.6x** |
+| RoPE NeoX (q+k) | [2048×4096] | 418 µs | 2571 µs | **6.2x** |
+| RMSNorm (+residual) | [1024×4096] | 156 µs | 538 µs | **3.4x** |
+| LayerNorm | [1024×4096] | 115 µs | 161 µs | **1.4x** |
+| SwiGLU | [1024×4096] | 158 µs | 263 µs | **1.7x** |
+| top-k (k=50) | [131072] | 74 µs | 131 µs | **1.8x** |
 | decode_step (penalty+sample) | [131072] | 309 µs | 354 µs (3 calls) | **1.15x** |
-| Softmax | [1024×4096] | 105 µs | 115 µs | 1.1x |
-| LayerNorm | [1024×4096] | 167 µs | 159 µs | ~1.0x |
-| SiLU | [1024×4096] | 103 µs | 104 µs | ~1.0x |
-| argmax | [131072] | 39 µs | 43 µs | ~1.1x |
+| Softmax | [1024×4096] | 103 µs | 118 µs | 1.1x |
+| SiLU | [1024×4096] | 104 µs | 108 µs | ~1.0x |
+| argmax | [131072] | 67 µs | 40 µs | 0.6x (incl. host readback) |
 | INT8 decode GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs (fp16) | **2.0x** |
+
+Row-wise kernels (norms, softmax) autotune their thread-block size per
+shape at first call (v0.4.1); the table reflects the tuned choices.
 
 ![fusedtok vs PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 

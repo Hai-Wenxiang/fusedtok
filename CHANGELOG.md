@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- runtime block-size autotuning for the row-wise kernels (rmsnorm,
+  layernorm, softmax, both dtypes): the first call for a (op, dtype,
+  rows, cols) shape micro-benchmarks the candidate thread blocks (128 /
+  256 / 512 / 1024) with the REAL kernel on the caller's own buffers at
+  full size and caches the winner for the process. Tuning a truncated
+  scratch problem misleads the choice (small grids favor big blocks,
+  full grids do not) - measured before shipping. Stream captures skip
+  tuning and use the default block; structurally unlaunchable
+  candidates (register-resident softmax at 1024 threads) score as slow
+  instead of failing. Measured on RTX 3060 vs the fixed 256-thread
+  baseline: layernorm +17..53% across shapes (e.g. [4096x4096] 671 ->
+  460 us, [512x8192] 204 -> 108 us), rmsnorm+residual [4096x4096] +39%
+  (1010 -> 616 us), softmax ~+1% (kept for the wide-row online variant
+  where big blocks win). tests/test_autotune.py pins correctness across
+  tuned blocks, bit-identical cached repeats, dtype-specific choices,
+  and capture paths.
+- benchmarks/bench.py: the chart now uses two LINEAR panels (split at
+  the largest gap of the sorted per-op maxima) with direct microsecond
+  labels and color-coded speedup badges, replacing the log-scale axis.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added
