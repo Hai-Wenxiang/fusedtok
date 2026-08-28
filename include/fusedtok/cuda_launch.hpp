@@ -82,6 +82,13 @@ void qadd_int8_launch(const signed char* qa, const signed char* qb,
                       float sa, float sb, signed char* qy,
                       float* out_scale, long long n, std::uintptr_t stream = 0);
 
+// INT8 matmul: y[M,N] = (A_q[M,K] . B_q[N,K]^T) int32-exact * (sa*sb).
+// Both operands row-major along K (LLM layout: activations @ weight.T).
+// M == 1 dispatches to a warp-per-row GEMV kernel.
+void qgemm_launch(const signed char* aq, const signed char* bq,
+                  float* y, int m, int n, int k, float sa, float sb,
+                  std::uintptr_t stream = 0);
+
 // Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream = 0);
 // y[i] = x[i] / t.

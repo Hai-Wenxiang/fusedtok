@@ -765,6 +765,62 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("qa"), py::arg("qb"), py::arg("sa"), py::arg("sb"),
        py::arg("qy"), py::arg("out_scale"), py::arg("n"), py::arg("stream") = 0);
 
+    // ==================================================================
+    // INT8 matmul
+    // ==================================================================
+    m.def("qgemm_cpu", [](py::array_t<signed char, py::array::c_style> a,
+                          py::array_t<signed char, py::array::c_style> b,
+                          int m, int n, int k, float sa, float sb) {
+        if (a.size() != (py::ssize_t)m * k || b.size() != (py::ssize_t)n * k)
+            throw std::invalid_argument("qgemm operand size mismatch");
+        auto ia = a.request(), ib = b.request();
+        const signed char* pa = static_cast<const signed char*>(ia.ptr);
+        const signed char* pb = static_cast<const signed char*>(ib.ptr);
+        std::vector<float> y = ft::qgemm_cpu(
+            std::vector<signed char>(pa, pa + a.size()),
+            std::vector<signed char>(pb, pb + b.size()),
+            m, n, k, sa, sb);
+        py::array_t<float> out(std::vector<py::ssize_t>{m, n});
+        if (!y.empty())
+            std::memcpy(out.mutable_data(), y.data(), y.size() * 4);
+        return out;
+    }, py::arg("a"), py::arg("b"), py::arg("m"), py::arg("n"), py::arg("k"),
+       py::arg("sa"), py::arg("sb"));
+
+    m.def("qgemm", [](py::array_t<signed char, py::array::c_style> a,
+                      py::array_t<signed char, py::array::c_style> b,
+                      int m, int n, int k, float sa, float sb) {
+        // staged: copy both operands up, run, copy the result back
+        if (a.size() != (py::ssize_t)m * k || b.size() != (py::ssize_t)n * k)
+            throw std::invalid_argument("qgemm operand size mismatch");
+        if ((long long)m * n * k > (1LL << 38))
+            throw std::invalid_argument("qgemm operands too large");
+        DevBuf da(a.size()), db(b.size());
+        h2d(da.get(), a.data(), a.size());
+        h2d(db.get(), b.data(), b.size());
+        DevBuf dy((size_t)m * n * 4);
+        if (m > 0 && n > 0 && k > 0)
+            ft::qgemm_launch(reinterpret_cast<const signed char*>(da.fget()),
+                             reinterpret_cast<const signed char*>(db.fget()),
+                             dy.fget(), m, n, k, sa, sb, 0);
+        py::array_t<float> out(std::vector<py::ssize_t>{m, n});
+        if ((long long)m * n > 0)
+            d2h(out.mutable_data(), dy.get(), (size_t)m * n * 4);
+        sync_device("qgemm kernel");
+        return out;
+    }, py::arg("a"), py::arg("b"), py::arg("m"), py::arg("n"), py::arg("k"),
+       py::arg("sa"), py::arg("sb"));
+
+    m.def("qgemm_launch", [](py::int_ a, py::int_ b, py::int_ y,
+                             int m, int n, int k, float sa, float sb,
+                             std::uintptr_t stream) {
+        ft::qgemm_launch(
+            reinterpret_cast<const signed char*>((uintptr_t)a),
+            reinterpret_cast<const signed char*>((uintptr_t)b),
+            dfm(y), m, n, k, sa, sb, stream);
+    }, py::arg("a"), py::arg("b"), py::arg("y"), py::arg("m"), py::arg("n"),
+       py::arg("k"), py::arg("sa"), py::arg("sb"), py::arg("stream") = 0);
+
     m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
                                    unsigned long long seed,
                                    std::uintptr_t stream) -> long long {

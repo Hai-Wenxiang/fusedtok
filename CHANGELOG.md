@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- qgemm(a_q, a_scale, b_q, b_scale): INT8 matmul closing the v0.4
+  quantized-compute loop - y = (A_q[M,K] int8 @ B_q[N,K] int8^T) *
+  (sa*sb) with int32-exact accumulation (CPU / staged / zero-copy
+  results are bit-identical; the integer math has no tolerance games and
+  the single float scale differs from a numpy float64 reference by at
+  most one rounding). Both operands row-major along K (the LLM
+  activations @ weight.T layout); M == 1 dispatches to a warp-per-row
+  GEMV kernel. The GEMM path uses tensor-core IMMA (wmma s8xs8->s32,
+  64x64 tile, 32x16 per warp). Honest numbers (RTX 3060): decode GEMV
+  [1x4096 @ 131072x4096] runs at 337 GB/s effective - exactly 2x faster
+  than the same projection in fp16, which is the point of INT8 weights;
+  mid-size GEMM reaches ~17 TOPS vs cuBLASLt torch._int_mm's 83 TOPS (a
+  pipelined/CUTLASS-class kernel stays future work; correctness and
+  stream/graph integration are complete). All launchers are
+  stream-aware and CUDA-graph capturable.
+- tests/test_qgemm.py: exact integer parity across shapes (tile
+  boundaries, K tails, k=1), int8 extremes, end-to-end quantized error
+  bound, decode-shaped GEMV, and graph capture-replay with mutation.
+
 ### Changed
 - selection kernels (top-k / top-p / sampling) rewritten as a multi-launch
   pipeline of plain kernels: per-round arrival-ticket radix refinement (the

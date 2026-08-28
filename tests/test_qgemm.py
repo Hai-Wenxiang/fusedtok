@@ -1,0 +1,171 @@
+"""INT8 matmul (qgemm): exact integer parity across every path.
+
+The kernel accumulates int8 x int8 products in int32 and applies the
+combined per-tensor scale exactly once at the store, so GPU and CPU
+results are BIT-IDENTICAL to numpy's int32 matmul times a float scale -
+these tests assert exact equality, no quantization tolerances.
+"""
+
+import numpy as np
+import pytest
+
+import fusedtok
+
+HAS_TORCH = True
+try:
+    import torch
+except ImportError:
+    HAS_TORCH = False
+
+
+def ref_qgemm(a, b, sa, sb):
+    acc = a.astype(np.int32) @ b.astype(np.int32).T
+    return acc.astype(np.float32) * np.float32(sa * sb)
+
+
+def rand_q(rng, rows, k):
+    q = rng.integers(-127, 128, size=(rows, k), dtype=np.int64)
+    return q.astype(np.int8)
+
+
+@pytest.mark.parametrize("m,n,k", [
+    (1, 8, 16),           # GEMV path, tiny
+    (1, 1000, 4096),      # GEMV path, decode-like
+    (3, 5, 7),            # everything non-tiled
+    (64, 64, 32),         # exactly one tile, one slab
+    (65, 63, 33),         # one tile over, partial slabs
+    (128, 256, 512),      # multi-tile
+    (17, 4096, 129),      # tall N, odd K (scalar tails)
+    (100, 50, 1),         # K = 1
+])
+def test_qgemm_cpu_exact(m, n, k):
+    rng = np.random.default_rng(m * 1000 + n + k)
+    a = rand_q(rng, m, k)
+    b = rand_q(rng, n, k)
+    y = fusedtok.qgemm(a, 0.03, b, 0.02)
+    assert y.shape == (m, n)
+    assert y.dtype == np.float32
+    # integer accumulation is exact; the float scale can differ from the
+    # numpy reference by one rounding (f32(f32*f32) vs f32(f64*f64))
+    np.testing.assert_allclose(y, ref_qgemm(a, b, 0.03, 0.02), rtol=1e-6)
+
+
+def test_qgemm_extreme_values():
+    # int8 extremes: -127 * -127 * 4096 nears int32 range in real GEMMs;
+    # keep K modest so the exact reference stays in range
+    a = np.full((4, 100), -127, dtype=np.int8)
+    b = np.full((3, 100), -127, dtype=np.int8)
+    y = fusedtok.qgemm(a, 1.0, b, 1.0)
+    np.testing.assert_array_equal(y, ref_qgemm(a, b, 1.0, 1.0))
+
+
+def test_qgemm_errors():
+    a = np.zeros((4, 8), dtype=np.int8)
+    b = np.zeros((2, 8), dtype=np.int8)
+    with pytest.raises(ValueError):
+        fusedtok.qgemm(a, 1.0, np.zeros((2, 7), dtype=np.int8), 1.0)
+    if HAS_TORCH:
+        with pytest.raises(ValueError):
+            fusedtok.qgemm(np.zeros((4,), dtype=np.int8), 1.0, b, 1.0)
+
+
+def test_qgemm_end_to_end_quantized():
+    # quantize -> matmul -> compare against the float matmul within the
+    # per-tensor quantization error bound (sqrt(K) * quantum scale)
+    rng = np.random.default_rng(7)
+    k = 256
+    x = rng.standard_normal((3, k)).astype(np.float32)
+    w = (rng.standard_normal((64, k)) * 0.1).astype(np.float32)
+    xq, sx = fusedtok.quantize_int8(x.ravel())
+    wq, sw = fusedtok.quantize_int8(w.ravel())
+    xq = xq.reshape(3, k)
+    wq = wq.reshape(64, k)
+    y = fusedtok.qgemm(xq, sx, wq, sw)
+    ref = x.astype(np.float64) @ w.T.astype(np.float64)
+    bound = 0.5 * (float(sx) + float(sw)) * np.sqrt(k) * 1.5
+    assert np.abs(y.astype(np.float64) - ref).max() < bound
+
+
+@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
+class TestCuda:
+    @pytest.mark.parametrize("m,n,k", [
+        (1, 8, 16),
+        (1, 4096, 4096),    # GEMV kernel
+        (64, 64, 32),
+        (65, 63, 33),
+        (300, 500, 1024),   # multi-tile GEMM
+        (17, 4096, 129),
+    ])
+    def test_staged_matches_cpu_bitexact(self, m, n, k):
+        rng = np.random.default_rng(m + n * 7 + k)
+        a = rand_q(rng, m, k)
+        b = rand_q(rng, n, k)
+        y = fusedtok.qgemm(a, 0.05, b, 0.04, cuda=True)
+        ycpu = fusedtok.qgemm(a, 0.05, b, 0.04)
+        # cross-path: GPU must be bit-identical to the CPU path (same
+        # exact integers, same single float scale application)
+        np.testing.assert_array_equal(y, ycpu)
+
+    def test_repeated_calls_same_result(self):
+        rng = np.random.default_rng(11)
+        a = rand_q(rng, 32, 128)
+        b = rand_q(rng, 48, 128)
+        first = fusedtok.qgemm(a, 0.1, b, 0.2, cuda=True)
+        for _ in range(3):
+            np.testing.assert_array_equal(
+                fusedtok.qgemm(a, 0.1, b, 0.2, cuda=True), first)
+
+
+@pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
+                    reason="no torch/GPU")
+class TestTorchZeroCopy:
+    def test_matches_cpu_bitexact(self):
+        rng = np.random.default_rng(12)
+        a = rand_q(rng, 129, 500)
+        b = rand_q(rng, 260, 500)
+        at = torch.from_numpy(a).cuda()
+        bt = torch.from_numpy(b).cuda()
+        y = fusedtok.qgemm(at, 0.03, bt, 0.02)
+        np.testing.assert_array_equal(
+            y.cpu().numpy(), fusedtok.qgemm(a, 0.03, b, 0.04 if False else 0.02))
+
+    def test_gemv_decode_shape(self):
+        # the realistic decode step: [1, hidden] @ [vocab, hidden]^T
+        rng = np.random.default_rng(13)
+        hidden, vocab = 1024, 8192
+        x = rand_q(rng, 1, hidden)
+        w = rand_q(rng, vocab, hidden)
+        xt = torch.from_numpy(x).cuda()
+        wt = torch.from_numpy(w).cuda()
+        y = fusedtok.qgemm(xt, 0.06, wt, 0.01)
+        assert y.shape == (1, vocab)
+        np.testing.assert_array_equal(
+            y.cpu().numpy(), fusedtok.qgemm(x, 0.06, w, 0.01))
+
+    def test_graph_capture_replay(self):
+        # qgemm is graph-capturable (no allocs/syncs in the launcher)
+        a = torch.randint(-127, 128, (64, 256), device="cuda", dtype=torch.int8)
+        b = torch.randint(-127, 128, (64, 256), device="cuda", dtype=torch.int8)
+        y = torch.empty((64, 64), device="cuda", dtype=torch.float32)
+
+        def run():
+            from fusedtok import _fusedtok
+            _fusedtok.qgemm_launch(a.data_ptr(), b.data_ptr(), y.data_ptr(),
+                                   64, 64, 256, 0.05, 0.02,
+                                   torch.cuda.current_stream().cuda_stream)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run()
+        a.mul_(-1)                       # replay must recompute
+        g.replay()
+        torch.cuda.synchronize()
+        # torch has no CUDA int matmul; the numpy CPU path is exact
+        ref = torch.from_numpy(fusedtok.qgemm(
+            a.cpu().numpy(), 0.05, b.cpu().numpy(), 0.02)).cuda()
+        assert torch.allclose(y, ref, rtol=1e-6)

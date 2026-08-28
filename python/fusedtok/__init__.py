@@ -57,6 +57,7 @@ __all__ = [
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
+    "qgemm",
 ]
 
 
@@ -640,6 +641,48 @@ def qadd_int8(qa, sa, qb, sb):
                           qy.data_ptr(), out_scale.data_ptr(), qa.numel(),
                           _cuda_stream())
     return qy, out_scale
+
+
+def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
+    """INT8 matmul with int32-exact accumulation:
+
+    ``y[M, N] = (A_q[M, K] int8  @  B_q[N, K] int8 ^T) * (a_scale*b_scale)``
+
+    Both operands are row-major along K - the LLM-friendly layout
+    (``activations @ linear_weight.T``). ``M == 1`` dispatches to a
+    warp-per-row GEMV kernel (the decode step). Results are bit-identical
+    across the CPU / staged / zero-copy paths: integer accumulation is
+    exact and the combined scale applies once at the store.
+    """
+    if _device_path(a_q, cuda=False) == "torch-cuda":
+        if not (_is_torch(b_q) and b_q.is_cuda):
+            raise TypeError("both operands must be CUDA int8 tensors")
+        if a_q.dtype is not torch.int8 or b_q.dtype is not torch.int8:
+            raise TypeError("operands must be int8")
+        if a_q.ndim != 2 or b_q.ndim != 2:
+            raise ValueError("operands must be 2-D [rows, K]")
+        m, k = a_q.shape
+        n, k2 = b_q.shape
+        if k != k2:
+            raise ValueError("inner dimensions must match")
+        y = torch.empty((m, n), dtype=torch.float32, device=a_q.device)
+        if m > 0 and n > 0 and k > 0:
+            _fusedtok.qgemm_launch(a_q.data_ptr(), b_q.data_ptr(),
+                                   y.data_ptr(), m, n, k,
+                                   float(a_scale), float(b_scale),
+                                   _cuda_stream())
+        return y
+    a = np.ascontiguousarray(a_q, dtype=np.int8)
+    b = np.ascontiguousarray(b_q, dtype=np.int8)
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("operands must be 2-D [rows, K]")
+    m, k = a.shape
+    n, k2 = b.shape
+    if k != k2:
+        raise ValueError("inner dimensions must match")
+    call = (_fusedtok.qgemm if cuda else _fusedtok.qgemm_cpu)
+    res = call(a, b, m, n, k, float(a_scale), float(b_scale))
+    return _numpy_to_torch_like(res, a_q) if _is_torch(a_q) else res
 
 
 def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
