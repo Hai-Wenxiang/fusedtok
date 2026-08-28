@@ -30,7 +30,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "cuda_available",
@@ -689,10 +689,11 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
 def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
     """Fused nucleus sampling: one GPU round trip from raw logits to a token.
 
-    Pipeline (single cooperative kernel): softmax(logits / temperature) ->
-    truncate to the smallest top-p nucleus -> inverse-CDF draw using a
-    hash-uniform of ``seed``. Deterministic per seed; the RNG is a
-    splitmix-style hash (reproducible, NOT cryptographically secure).
+    Pipeline (selection pipeline with a global-mass threshold): softmax of
+    ``logits / temperature`` -> truncate to the smallest top-p nucleus ->
+    inverse-CDF draw using a hash-uniform of ``seed``. Deterministic per
+    seed; the RNG is a splitmix-style hash (reproducible, NOT
+    cryptographically secure).
 
     Returns the sampled token id (int). ``p`` in (0, 1], temperature > 0.
     """

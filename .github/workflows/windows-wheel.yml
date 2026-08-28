@@ -1,0 +1,58 @@
+# Windows wheel builder (v0.4.1 experiment; user-approved attempt).
+#
+# Windows runners have no CUDA toolkit - this job installs one via the
+# community cuda-toolkit action (network-extracted, cached by the action
+# across runs) and builds a cp312 win_amd64 wheel. The workflow starts
+# MANUAL (workflow_dispatch) so the ~20-40 min job only runs on request;
+# once proven stable it can also attach the wheel to GitHub Releases or
+# join the PyPI publish job (trusted-publisher environment change).
+# Fallback that always works: the maintainer-built cp312 wheel attached
+# to each GitHub Release + the verified pip source-build path.
+
+name: windows-wheel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA Toolkit (cached)
+        uses: Jimver/cuda-toolkit@v0.2.27
+        with:
+          cuda: "12.4.1"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "development"]'
+
+      - name: Show toolkit
+        shell: pwsh
+        run: |
+          nvcc --version
+          $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          echo "CUDA_PATH=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build the wheel
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          # mirror the reference machine's toolchain
+          python -m pip install cmake ninja pybind11 scikit-build-core
+          python -m build --wheel --outdir dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-wheel
+          path: dist/*.whl
+          if-no-files-found: error

@@ -7,8 +7,12 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
+#include <functional>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace fusedtok {
 
@@ -118,6 +122,80 @@ __device__ __forceinline__ void st_f(float* p, long long i, float v) {
 }
 __device__ __forceinline__ void st_f(__nv_bfloat16* p, long long i, float v) {
     p[i] = __float2bfloat16_rn(v);   // round-to-nearest-even
+}
+
+// ---------------------------------------------------------------------------
+// Runtime block-size autotuning (v0.4.1)
+// ---------------------------------------------------------------------------
+
+// One-time per (tag, shape key) micro-benchmark: every candidate block
+// runs the REAL kernel on the caller's own buffers (full size - a
+// truncated problem misleads the choice, see the op files) for a few
+// warmup + timed iterations on the caller's stream, CUDA events pick
+// the winner, and the choice is cached for the process. The per-TU
+// static cache means each op file keeps its own table - no cross-op
+// contention. Callers must skip tuning while a stream capture is active
+// (events and syncs are illegal mid-capture) and fall back to the
+// default block. Structurally unlaunchable candidates (register
+// pressure at 1024 threads on register-heavy kernels) score as slow
+// instead of failing the call.
+inline int autotune_block(const char* tag, long long shape_key,
+                          const std::function<void(int block)>& launch,
+                          cudaStream_t cs, int min_block = 1) {
+    static std::mutex mu;
+    static std::map<std::pair<const char*, long long>, int> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    const auto key = std::make_pair(tag, shape_key);
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+    static const int cands[4] = {128, 256, 512, 1024};
+    cudaEvent_t s = nullptr, e = nullptr;
+    cudaEventCreate(&s);
+    cudaEventCreate(&e);
+    float best_ms = 1e30f;
+    int best_block = 256;
+    for (int b : cands) {
+        if (b < min_block)
+            continue;               // e.g. coverage floors from the caller
+        // A candidate can be structurally unlaunchable (e.g. register
+        // pressure at 1024 threads); score those as infinitely slow
+        // instead of failing the call, and clear the sticky error.
+        bool ok = true;
+        try {
+            for (int i = 0; i < 3; ++i)
+                launch(b);                  // warmup (occupancy settle)
+        } catch (const std::runtime_error&) {
+            cudaGetLastError();
+            ok = false;
+        }
+        if (!ok)
+            continue;
+        cudaEventRecord(s, cs);
+        for (int i = 0; i < 8; ++i)
+            launch(b);
+        cudaEventRecord(e, cs);
+        cudaEventSynchronize(e);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, s, e);
+        if (ms < best_ms) {
+            best_ms = ms;
+            best_block = b;
+        }
+    }
+    cudaEventDestroy(s);
+    cudaEventDestroy(e);
+    cudaGetLastError();                   // clear benign residue
+    cache.emplace(key, best_block);
+    return best_block;
+}
+
+// True when the stream is being captured (tuning must be skipped).
+inline bool stream_is_capturing(cudaStream_t cs) {
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cs, &cap) != cudaSuccess)
+        cudaGetLastError();               // do not poison the caller
+    return cap == cudaStreamCaptureStatusActive;
 }
 
 } // namespace fusedtok

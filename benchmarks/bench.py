@@ -3,7 +3,12 @@
 Timing uses CUDA events (wall-clock-free, WDDM-safe). Each configuration is
 warmed up, then measured over enough iterations to average out jitter.
 Results are printed as a table, dumped to JSON, and rendered into a grouped
-bar chart (log-scale time) next to this script under ../docs/.
+bar chart next to this script under ../docs/.
+
+The chart uses LINEAR time axes on two panels (fast ops / slow ops, split
+at the largest gap in the sorted times): every bar is annotated with its
+direct microsecond value and the per-op speedup, so no log-scale powers
+of ten have to be decoded by eye.
 
 Usage:
     python benchmarks/bench.py [--iters N] [--out docs]
@@ -178,7 +183,11 @@ def main():
     with open(json_path, "w") as f:
         json.dump(payload, f, indent=2)
 
-    # Grouped bar chart, log time axis, one group per op (largest shape).
+    # Grouped bar chart with LINEAR axes, one group per op (largest
+    # shape). Times span two orders of magnitude, so the ops split into
+    # two panels at the largest gap of the sorted per-op maxima - each
+    # panel stays directly comparable in plain microseconds and every
+    # bar carries its value plus the speedup.
     ops, ft_times, tr_times = [], [], []
     for row in RESULTS:
         if row["shape"] in ("[4096x4096]", "[8192x4096]", "[131072]"):
@@ -188,30 +197,67 @@ def main():
                 ft_times.append(row["fusedtok_us"])
                 tr_times.append(row["torch_us"])
 
-    x = np.arange(len(ops))
-    width = 0.38
+    # natural-break split: sort ops by their slower bar, cut where the
+    # ratio between consecutive maxima is largest (both sides non-empty)
+    order = sorted(range(len(ops)), key=lambda i: max(ft_times[i],
+                                                      tr_times[i]))
+    split_at = order[0]
+    best_ratio = 1.0
+    for a, b in zip(order, order[1:]):
+        hi = max(ft_times[b], tr_times[b])
+        lo = max(ft_times[a], tr_times[a])
+        if hi / lo > best_ratio:
+            best_ratio = hi / lo
+            split_at = b
+    slow_idx = set(i for i in order[order.index(split_at):])
+    groups = [("slow ops (linear us)", [i for i in range(len(ops))
+                                         if i in slow_idx]),
+              ("fast ops (linear us)", [i for i in range(len(ops))
+                                        if i not in slow_idx])]
+
     # output filename derives from the actual device so charts from
     # different GPUs never overwrite each other
     dev_slug = dev_name.lower().replace(" ", "").replace("geforce", "")
-    fig, ax = plt.subplots(figsize=(11.5, 6.0), dpi=150)
-    b1 = ax.bar(x - width / 2, ft_times, width, label="fusedtok", color="#3b82f6")
-    b2 = ax.bar(x + width / 2, tr_times, width, label="PyTorch eager", color="#9ca3af")
-    ax.set_yscale("log")
-    ax.set_ylabel("time per call (us, log scale)")
-    ax.set_title(f"fusedtok vs PyTorch eager - {dev_name} "
-                 f"(float32; largest shape per op)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(ops, rotation=18, ha="right")
-    for bars in (b1, b2):
-        for rect in bars:
-            h = rect.get_height()
-            ax.annotate(f"{h:.0f}",
-                        xy=(rect.get_x() + rect.get_width() / 2, h),
-                        xytext=(0, 2), textcoords="offset points",
-                        ha="center", fontsize=7)
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3, which="both")
-    fig.tight_layout()
+    fig, axes = plt.subplots(2, 1, figsize=(11.5, 9.5), dpi=150)
+    width = 0.38
+    for ax, (title, idxs) in zip(axes, groups):
+        if not idxs:
+            ax.set_visible(False)
+            continue
+        x = np.arange(len(idxs))
+        fts = [ft_times[i] for i in idxs]
+        trs = [tr_times[i] for i in idxs]
+        b1 = ax.bar(x - width / 2, fts, width, label="fusedtok",
+                    color="#3b82f6")
+        b2 = ax.bar(x + width / 2, trs, width, label="PyTorch eager",
+                    color="#9ca3af")
+        ax.set_ylabel("time per call (us)")
+        ax.set_title(title)
+        ax.set_xticks(x)
+        ax.set_xticklabels([ops[i] for i in idxs], rotation=18, ha="right")
+        # annotate every bar with its direct microsecond value; the
+        # speedup badge above each pair carries the ratio
+        for bars, vals in ((b1, fts), (b2, trs)):
+            for rect, v in zip(bars, vals):
+                ax.annotate(f"{v:.0f}",
+                            xy=(rect.get_x() + rect.get_width() / 2, v),
+                            xytext=(0, 2), textcoords="offset points",
+                            ha="center", fontsize=7)
+        # speedup badge centered above each op pair
+        for j, i in enumerate(idxs):
+            sp = tr_times[i] / ft_times[i]
+            ax.annotate(f"{sp:.2f}x",
+                        xy=(j, max(ft_times[i], tr_times[i])),
+                        xytext=(0, 16), textcoords="offset points",
+                        ha="center", fontsize=8, fontweight="bold",
+                        color="#166534" if sp >= 1.05 else
+                        ("#92400e" if sp >= 0.9 else "#991b1b"))
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+        ax.margins(y=0.22)
+    fig.suptitle(f"fusedtok vs PyTorch eager - {dev_name} "
+                 f"(float32; largest shape per op)", y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
     png_path = os.path.join(args.out, f"benchmark_{dev_slug}.png")
     fig.savefig(png_path)
 

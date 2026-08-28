@@ -149,16 +149,19 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 
 | 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
-| RMSNorm（含残差） | [1024×4096] | 260 µs | 538 µs | **2.1x** |
-| SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
-| top-k (k=50) | [131072] | 86 µs | 130 µs | **1.6x** |
+| RoPE NeoX (q+k) | [2048×4096] | 418 µs | 2571 µs | **6.2x** |
+| RMSNorm（含残差） | [1024×4096] | 156 µs | 538 µs | **3.4x** |
+| LayerNorm | [1024×4096] | 115 µs | 161 µs | **1.4x** |
+| SwiGLU | [1024×4096] | 158 µs | 263 µs | **1.7x** |
+| top-k (k=50) | [131072] | 74 µs | 131 µs | **1.8x** |
 | decode_step（惩罚+采样） | [131072] | 309 µs | 354 µs（3 次调用） | **1.15x** |
-| LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
-| SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
-| Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
-| argmax | [131072] | 36 µs | 46 µs | **1.3x** |
+| Softmax | [1024×4096] | 103 µs | 118 µs | 1.1x |
+| SiLU | [1024×4096] | 104 µs | 108 µs | ~1.0x |
+| argmax | [131072] | 67 µs | 40 µs | 0.6x（含主机回读） |
 | INT8 解码 GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs（fp16） | **2.0x** |
+
+按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
+线程块大小；上表为调优后的数字。
 
 ![fusedtok 对比 PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
@@ -166,12 +169,12 @@ PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
 
 | 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
+| RoPE NeoX (q+k) | [512×4096] | 29 µs | 239 µs | **8.3x** |
 | RMSNorm（含残差） | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
 | Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
-| top-k (k=50) | [131072] | 27 µs | 40 µs（CUB） | **1.5x** |
-| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
-| argmax | [32000] | 11 µs | 22 µs | **1.9x** |
+| top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.5x** |
+| SwiGLU | [4096×4096] | 504 µs | 859 µs | **1.7x** |
+| argmax | [32000] | 15 µs | 22 µs | **1.5x** |
 | LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
 
 ![fusedtok 对比 PyTorch eager（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
@@ -212,6 +215,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
   单读 softmax、CUDA graph 验证
 - v0.3（已完成）：chunk-merge 选择排序 + 并行核计数、bf16x4/x8 向量化、
   INT8 量化/反量化工具
+- v0.4.1（已完成）：按行 kernel（归一化/softmax）运行时线程块自动调优
 - v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
 - v0.4+：轻量融合 attention；PyPI 预编译 wheel
 

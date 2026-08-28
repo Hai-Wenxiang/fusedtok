@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-08-29
+
+### Added
+- runtime block-size autotuning for the row-wise kernels (rmsnorm,
+  layernorm, softmax, both dtypes): the first call for a (op, dtype,
+  rows, cols) shape micro-benchmarks the candidate thread blocks (128 /
+  256 / 512 / 1024) with the REAL kernel on the caller's own buffers at
+  full size and caches the winner for the process. Tuning a truncated
+  scratch problem misleads the choice (small grids favor big blocks,
+  full grids do not) - measured before shipping. Stream captures skip
+  tuning and use the default block; structurally unlaunchable
+  candidates (register-resident softmax at 1024 threads) score as slow
+  instead of failing. Measured on RTX 3060 vs the fixed 256-thread
+  baseline: layernorm +17..53% across shapes (e.g. [4096x4096] 671 ->
+  460 us, [512x8192] 204 -> 108 us), rmsnorm+residual [4096x4096] +39%
+  (1010 -> 616 us), softmax ~+1% (kept for the wide-row online variant
+  where big blocks win). tests/test_autotune.py pins correctness across
+  tuned blocks, bit-identical cached repeats, dtype-specific choices,
+  and capture paths.
+- benchmarks/bench.py: the chart now uses two LINEAR panels (split at
+  the largest gap of the sorted per-op maxima) with direct microsecond
+  labels and color-coded speedup badges, replacing the log-scale axis.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added
@@ -170,7 +193,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   CPU reference implements the identical algorithm; boundary draws may pick
   a neighbor token due to exact-exp vs fast-exp rounding (both valid).
   Same seed gives the same token across the CPU / staged / zero-copy paths.
-### Added
 - bfloat16 support on the zero-copy torch path for the inference core:
   SiLU / GeLU (both forms) / ReLU / Tanh / Sigmoid, add / mul / SwiGLU,
   RMSNorm / LayerNorm (norm weights upcast to float32 automatically),
@@ -185,7 +207,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   written from registers; __expf (2-ulp fast approximation) replaces expf.
   Wide rows fall back to an online (max, sum) streaming kernel with the
   same tolerance. Benchmarks: 0.70-0.86x -> 0.98-1.13x vs PyTorch.
-### Changed
 - top-k / top-p GPU path rewritten: single cooperative kernel doing 8-round
   256-bin radix refinement over order-preserving packed keys, one emit scan,
   and a bitonic sort (shared-memory fast path for k <= 2048, global-memory
@@ -196,18 +217,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   small vocab sizes - honest numbers, merge-sort upgrade planned).
   Host-driven per-round fallback retained for non-cooperative devices.
 
-## [0.2.0] - Unreleased
-
-### Changed
-- top-k / top-p GPU path rewritten: single cooperative kernel doing 8-round
-  256-bin radix refinement over order-preserving packed keys, one emit scan,
-  and a bitonic sort (shared-memory fast path for k <= 2048, global-memory
-  grid-participating path above). Deterministic ties (earliest index) are
-  preserved exactly; process-cached workspace avoids per-call device syncs
-  and keeps the hot path CUDA-graph-capturable. top-k @131072: 0.77x ->
-  1.42x vs PyTorch; top-p: 26x faster than v0.1 (still behind torch.sort at
-  small vocab sizes - honest numbers, merge-sort upgrade planned).
-  Host-driven per-round fallback retained for non-cooperative devices.
 
 ### Verified
 - Linux/Blackwell validation: full suite (134 tests) green on RTX 5060 Ti
@@ -217,12 +226,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   argmax 1.9x vs PyTorch eager (chart in docs/).
 - The released PyPI build (sm_86 cubins + compute_86 PTX) JIT-runs
   correctly on sm_120 drivers.
-- CUDA graph capture+replay verified for elementwise, norms, softmax,
-  top-k and RoPE launchers (sample_topp documented as not capturable).
-- Windows wheel on CI: skipped - windows runners lack a CUDA toolkit
-  (3GB/30min install per run); local wheel builds are proven, GitHub
-  Releases ship a cp312 Windows wheel, and pip source-build fallback is
-  verified on Windows.
 
 ## [0.1.2] - 2026-08-23
 

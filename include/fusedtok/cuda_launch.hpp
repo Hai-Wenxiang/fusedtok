@@ -64,9 +64,10 @@ void topk_launch(const float* x, float* vals, long long* idxs, int n, int k, std
 // selected prefix into vals/idxs and the count into count_out.
 void topp_select_launch(const float* x, float* vals, long long* idxs,
                         int n, float p, int* count_out, std::uintptr_t stream = 0);
-// Fused nucleus sampling over raw logits with temperature: one cooperative
-// kernel softmaxes (via sorted exp accumulation), truncates to the p-nucleus
-// and inverse-CDF samples with a hash-uniform of `seed`. Returns the token.
+// Fused nucleus sampling over raw logits with temperature: the selection
+// pipeline softmaxes (global-mass threshold over the sorted keys),
+// truncates to the p-nucleus and inverse-CDF samples with a
+// hash-uniform of `seed`. Returns the token.
 long long sample_topp_launch(const float* x, int n, float p, float t,
                               unsigned long long seed, std::uintptr_t stream = 0);
 // Fused decode step: repetition penalty over the sampled ids (vocab

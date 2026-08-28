@@ -157,16 +157,19 @@ reproduce with `python benchmarks/bench.py`):
 
 | Op | Shape | fusedtok | PyTorch eager | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 416 µs | 2570 µs | **6.2x** |
-| RMSNorm (+residual) | [1024×4096] | 260 µs | 538 µs | **2.1x** |
-| SwiGLU | [1024×4096] | 153 µs | 257 µs | **1.7x** |
-| top-k (k=50) | [131072] | 86 µs | 130 µs | **1.6x** |
+| RoPE NeoX (q+k) | [2048×4096] | 418 µs | 2571 µs | **6.2x** |
+| RMSNorm (+residual) | [1024×4096] | 156 µs | 538 µs | **3.4x** |
+| LayerNorm | [1024×4096] | 115 µs | 161 µs | **1.4x** |
+| SwiGLU | [1024×4096] | 158 µs | 263 µs | **1.7x** |
+| top-k (k=50) | [131072] | 74 µs | 131 µs | **1.8x** |
 | decode_step (penalty+sample) | [131072] | 309 µs | 354 µs (3 calls) | **1.15x** |
-| LayerNorm | [1024×4096] | 168 µs | 162 µs | ~1.0x |
-| SiLU | [1024×4096] | 105 µs | 112 µs | ~1.0x |
-| Softmax | [1024×4096] | 159 µs | 115 µs | 0.7x |
-| argmax | [131072] | 36 µs | 46 µs | **1.3x** |
+| Softmax | [1024×4096] | 103 µs | 118 µs | 1.1x |
+| SiLU | [1024×4096] | 104 µs | 108 µs | ~1.0x |
+| argmax | [131072] | 67 µs | 40 µs | 0.6x (incl. host readback) |
 | INT8 decode GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs (fp16) | **2.0x** |
+
+Row-wise kernels (norms, softmax) autotune their thread-block size per
+shape at first call (v0.4.1); the table reflects the tuned choices.
 
 ![fusedtok vs PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
 
@@ -174,12 +177,12 @@ reproduce with `python benchmarks/bench.py`):
 
 | Op | Shape | fusedtok | PyTorch eager | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [512×4096] | 29 µs | 240 µs | **8.3x** |
+| RoPE NeoX (q+k) | [512×4096] | 29 µs | 239 µs | **8.3x** |
 | RMSNorm (+residual) | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
 | Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
-| top-k (k=50) | [131072] | 27 µs | 40 µs (CUB) | **1.5x** |
-| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.7x** |
-| argmax | [32000] | 11 µs | 22 µs | **1.9x** |
+| top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.5x** |
+| SwiGLU | [4096×4096] | 504 µs | 859 µs | **1.7x** |
+| argmax | [32000] | 15 µs | 22 µs | **1.5x** |
 | LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
 
 ![fusedtok vs PyTorch eager (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
@@ -226,6 +229,8 @@ suite on every push.
   launch, early-exit compaction, cached CUDA graphs), stream-aware
   launchers everywhere (real CUDA-graph capture), INT8 compute path
   (IMMA qgemm + decode GEMV), fused decode_step sampling
+- v0.4.1 (done): runtime block-size autotuning for the row-wise kernels
+  (norms/softmax pick 128..1024 threads per shape at first call)
 - v0.4+: lightweight fused attention; prebuilt wheels on PyPI;
   pipelined tensor-core INT8 GEMM
 
