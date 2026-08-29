@@ -247,8 +247,13 @@ suite on every push.
   (IMMA qgemm + decode GEMV), fused decode_step sampling
 - v0.4.1 (done): runtime block-size autotuning for the row-wise kernels
   (norms/softmax pick 128..1024 threads per shape at first call)
-- v0.4+: lightweight fused attention; prebuilt wheels on PyPI;
-  pipelined tensor-core INT8 GEMM
+- v0.5 (done): attention - GQA decode attention over a contiguous
+  kv-cache (flash-decoding split over long caches, per-sequence lengths)
+  and a tiled prefill path (honest ~0.45x of SDPA flash - the
+  convenience path); single-chart-per-GPU benchmarks; Windows wheels in
+  the PyPI publish pipeline
+- future: pipelined tensor-core INT8 GEMM; top-k mid-range parity;
+  API freeze for 1.0
 
 ## Community
 

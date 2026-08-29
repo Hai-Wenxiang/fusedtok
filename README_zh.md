@@ -230,7 +230,8 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
   INT8 量化/反量化工具
 - v0.4.1（已完成）：按行 kernel（归一化/softmax）运行时线程块自动调优
 - v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
-- v0.4+：轻量融合 attention；PyPI 预编译 wheel
+- v0.5（已完成）：attention —— GQA 解码注意力（连续 kv-cache、长 cache 自动 flash-decoding 切分、每序列长度）+ 分块 prefill 路径（诚实约 0.45x vs SDPA flash，定位便捷路径）；每 GPU 单图 benchmark；Windows wheel 进入 PyPI 发布管线
+- 后续：流水线化 tensor-core INT8 GEMM；top-k 中段 k 补平；1.0 的 API 冻结
 
 ## 社区
 
