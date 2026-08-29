@@ -247,6 +247,57 @@ def main():
             ALL_OK &= ok
 
     print(SEP)
+    print("attention: decode step, GQA + kv-cache + per-sequence lens")
+    q = rng.standard_normal((2, 8, 16)).astype(np.float32)     # B=2 Hq=8 D=16
+    k = rng.standard_normal((2, 2, 6, 16)).astype(np.float32)  # Hkv=2 T=6
+    v = rng.standard_normal((2, 2, 6, 16)).astype(np.float32)
+    lens = np.array([6, 3], dtype=np.int32)
+    ref = np.zeros((2, 8, 16), dtype=np.float64)
+    for bi, length in enumerate(lens):
+        for h in range(8):
+            kv = h // 4                                        # GQA group 4
+            s = k[bi, kv, :length].astype(np.float64) @ q[bi, h] / 4.0
+            p = np.exp(s - s.max())
+            ref[bi, h] = (p / p.sum()) @ v[bi, kv, :length].astype(np.float64)
+    out = fusedtok.attention_decode(q, k, v, lens, cuda=True) if have_cuda \
+        else fusedtok.attention_decode(q, k, v, lens)
+    check("gqa + lens vs eager", out, ref, tol=1e-4)
+    if have_cuda and HAS_TORCH:
+        qt, kt, vt = (torch.from_numpy(x).cuda() for x in (q, k, v))
+        lt = torch.from_numpy(lens).cuda()
+        yt = fusedtok.attention_decode(qt, kt, vt, lt)
+        torch.cuda.synchronize()
+        check("torch cuda zero-copy", yt.cpu().numpy(), ref, tol=1e-4)
+
+    print(SEP)
+    print("attention prefill: fresh-sequence causal attention (S query rows)")
+    q = rng.standard_normal((1, 8, 12, 16)).astype(np.float32)
+    k = rng.standard_normal((1, 2, 12, 16)).astype(np.float32)
+    v = rng.standard_normal((1, 2, 12, 16)).astype(np.float32)
+    ref = np.zeros((1, 8, 12, 16), dtype=np.float64)
+    for h in range(8):
+        kvh = h // 4
+        scores = q[0, h].astype(np.float64) @ k[0, kvh].astype(np.float64).T / 4.0
+        for i in range(12):
+            p = np.exp(scores[i, :i + 1] - scores[i, :i + 1].max())
+            ref[0, h, i] = (p / p.sum()) @ v[0, kvh, :i + 1].astype(np.float64)
+    out = fusedtok.attention_prefill(q, k, v, cuda=True) if have_cuda \
+        else fusedtok.attention_prefill(q, k, v)
+    check("causal diagonal vs eager", out, ref, tol=1e-4)
+    if have_cuda and HAS_TORCH:
+        qt, kt, vt = (torch.from_numpy(x).cuda() for x in (q, k, v))
+        yt = fusedtok.attention_prefill(qt, kt, vt, causal=False)
+        torch.cuda.synchronize()
+        ref_bi = np.zeros_like(ref)
+        for h in range(8):
+            kvh = h // 4
+            scores = q[0, h].astype(np.float64) @ k[0, kvh].astype(np.float64).T / 4.0
+            p = np.exp(scores - scores.max(axis=-1, keepdims=True))
+            p /= p.sum(axis=-1, keepdims=True)
+            ref_bi[0, h] = p @ v[0, kvh].astype(np.float64)
+        check("bidirectional zero-copy", yt.cpu().numpy(), ref_bi, tol=1e-4)
+
+    print(SEP)
     print("ALL PASS" if ALL_OK else "SOME CHECKS FAILED")
     return 0 if ALL_OK else 1
 

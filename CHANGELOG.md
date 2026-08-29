@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-08-30
+
+### Added
+- attention_decode(q, k_cache, v_cache, lens=None): single-token
+  (decode step) causal attention with GQA over a contiguous
+  [B, Hkv, T, D] kv-cache - `out = softmax(q . K^T / sqrt(D)) . V` with
+  q head h attending via kv head h // (Hq/Hkv) (contiguous groups; Hq ==
+  Hkv is plain MHA). Two strategies behind one launcher: short caches /
+  saturated grids take a single kernel (one block per (batch, q head),
+  8 warps striding the rows with a running ONLINE softmax each, merged
+  in shared memory); long caches (>= ~512 rows) take a flash-decoding
+  split path - the sequence is sliced, stage-1 blocks (one per
+  (batch, kv head, slice)) compute the partials of ALL q heads of the
+  GQA group over their slice in one pass (k/v rows read once, reused
+  across the group) into a process-cached workspace, and stage-2 blocks
+  max-rescale-merge the partials. Scores never materialize; q/K/V are
+  read exactly once. Stream-ordered and CUDA-graph capturable on both
+  paths (workspace allocation happens outside captures; a first call
+  racing an active capture falls back to the single-kernel path).
+  Optional per-sequence `lens` mark valid cache rows so
+  variable-length batches share one cache tensor (padding rows are
+  ignored; a zero-length sequence produces a zero output row). float32;
+  dim multiple of 4, at most 512. RTX 3060 vs pre-expanded
+  torch SDPA (Lq=1): 4.2x @ T=512, 6.5x @ 4k, 9.3x @ 32k (163 GB/s
+  effective); 13.3x against the expand+SDPA composite most code
+  actually writes.
+- attention_prefill(q, k, v, causal=True): fresh-sequence attention
+  over S query rows - q [B,Hq,S,D] x k/v [B,Hkv,S,D], causal row i
+  attending to keys [0, i] (or all rows when causal=False). Tiled
+  single kernel: a 64/32/16-row query tile (by head size) lives in
+  shared memory while K/V stream through staged chunks, and lanes split
+  into per-row groups (4/8/16 lanes) so a dot product needs only
+  log2(lanes) xor-shuffles instead of a 10-step warp reduction - the
+  register arrays stay register-resident via compile-time trip counts
+  (a runtime bound silently demotes them to local memory, measured 7x).
+  Same GQA grouping, zero-row and dtype conventions as the decode op;
+  CUDA-graph capturable. HONEST numbers (RTX 3060, D=128): ~0.45x of
+  torch SDPA's flash backend at S=256..4096 - this is the convenience
+  path (GQA + causal + fusedtok pipeline integration without
+  materializing scores); heavyweight prefill belongs to SDPA /
+  FlashAttention (tensor cores); the library's competitive attention
+  surface is the decode step.
+- tests/test_attention.py: GQA mapping (constant-V probe), float64
+  reference parity across shapes (single key, odd T, empty cache, long
+  4096-row cache, D=4..256), padding-poisoning, error contract, staged
+  and zero-copy paths, an independent torch repeat_interleave
+  crosscheck, graph capture-replay with mutation on both kernel paths,
+  and split-path pins for every templated group width (1/2/4/8/16),
+  lens crossing slice boundaries, batched long caches and 16k rows.
+
 ## [0.4.1] - 2026-08-29
 
 ### Added

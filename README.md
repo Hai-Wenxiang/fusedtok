@@ -35,6 +35,8 @@ traffic and launch overhead.
 | ✅ | decode_step | the whole decode step fused: penalty -> temperature -> nucleus sample, one call, one readback |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
 | ✅ | qgemm | INT8 matmul, int32-exact: tensor-core IMMA GEMM + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
+| ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths |
+| ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional); convenience path - heavyweight prefill stays SDPA/flash territory (honest ~0.45x) |
 
 ## Install
 
@@ -151,41 +153,50 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 
 ## Benchmarks
 
-RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing, vs the
-equivalent PyTorch eager expressions (full data: `docs/benchmark_rt3060.json`,
-reproduce with `python benchmarks/bench.py`):
+RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing, vs
+the equivalent PyTorch reference (composite eager expressions; attention
+references use **pre-expanded** heads - `repeat_interleave` outside the
+timed region). Largest shape per op; full data:
+`docs/benchmark_rtx3060.json`, reproduce with `python benchmarks/bench.py`:
 
-| Op | Shape | fusedtok | PyTorch eager | Speedup |
+| Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 418 µs | 2571 µs | **6.2x** |
-| RMSNorm (+residual) | [1024×4096] | 156 µs | 538 µs | **3.4x** |
-| LayerNorm | [1024×4096] | 115 µs | 161 µs | **1.4x** |
-| SwiGLU | [1024×4096] | 158 µs | 263 µs | **1.7x** |
-| top-k (k=50) | [131072] | 74 µs | 131 µs | **1.8x** |
-| decode_step (penalty+sample) | [131072] | 309 µs | 354 µs (3 calls) | **1.15x** |
-| Softmax | [1024×4096] | 103 µs | 118 µs | 1.1x |
-| SiLU | [1024×4096] | 104 µs | 108 µs | ~1.0x |
-| argmax | [131072] | 67 µs | 40 µs | 0.6x (incl. host readback) |
-| INT8 decode GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs (fp16) | **2.0x** |
+| attention_decode (GQA) | T=16384, D=128 | 857 µs | 7667 µs (SDPA) | **8.9x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1654 µs | 10092 µs | **6.1x** |
+| RMSNorm (+residual) | [4096×4096] | 613 µs | 2058 µs | **3.4x** |
+| SwiGLU | [4096×4096] | 610 µs | 1031 µs | **1.7x** |
+| top-k (k=50) | [131072] | 78 µs | 125 µs | **1.6x** |
+| LayerNorm | [4096×4096] | 441 µs | 615 µs | **1.4x** |
+| Softmax | [4096×4096] | 415 µs | 427 µs | 1.0x |
+| SiLU / GeLU / add | [4096×4096] | ~414 µs | ~411 µs | ~1.0x |
+| argmax | [131072] | 39 µs | 35 µs | 0.9x (incl. host readback) |
+| attention_prefill (causal) | S=1024, D=128 | 5764 µs | 2607 µs (SDPA flash) | 0.45x (honest) |
 
 Row-wise kernels (norms, softmax) autotune their thread-block size per
 shape at first call (v0.4.1); the table reflects the tuned choices.
 
-![fusedtok vs PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
+![fusedtok vs PyTorch reference](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx3060.png)
 
-**RTX 5060 Ti (Blackwell, sm_120)** — same suite, torch 2.11/cu128, highlights:
+**RTX 5060 Ti (Blackwell, sm_120)** — same suite, largest shape per op
+(full data: `docs/benchmark_rtx5060ti.json`):
 
-| Op | Shape | fusedtok | PyTorch eager | Speedup |
+| Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [512×4096] | 29 µs | 239 µs | **8.3x** |
-| RMSNorm (+residual) | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
-| Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1385 µs | 8372 µs | **6.0x** |
+| RMSNorm (+residual) | [4096×4096] | 505 µs | 1658 µs | **3.3x** |
+| attention_decode (GQA) | T=16384, D=128 | 572 µs | 2669 µs (SDPA) | **4.7x** |
+| SwiGLU | [4096×4096] | 505 µs | 858 µs | **1.7x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.5x** |
-| SwiGLU | [4096×4096] | 504 µs | 859 µs | **1.7x** |
-| argmax | [32000] | 15 µs | 22 µs | **1.5x** |
-| LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
+| LayerNorm / Softmax | [4096×4096] | ~344 µs | ~347 µs | 1.0x |
+| argmax | [131072] | 17 µs | 14 µs | 0.8x (incl. host readback) |
+| attention_prefill (causal) | S=1024, D=128 | 3299 µs | 1420 µs (SDPA flash) | 0.43x (honest) |
 
-![fusedtok vs PyTorch eager (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
+On smaller shapes the Blackwell card shows bigger wins (softmax 2.5x,
+RMSNorm 3.2x at 256 rows, attention decode 3.8x at T=4096 running
+235 GB/s) - the launch-overhead share shrinks as shapes grow; full
+sweep in the JSON.
+
+![fusedtok vs PyTorch reference (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx5060ti.png)
 
 The PyPI wheel ships sm_80/sm_86 cubins plus a compute_86 PTX fallback —
 verified to JIT and run correctly on Blackwell (sm_120) drivers.
@@ -195,10 +206,15 @@ intermediate tensors through global memory. The v0.4 selection pipeline
 (arrival-ticket radix rounds + early-exit compaction, replayed from a
 cached CUDA graph) beats torch's CUB radix select at small k on both
 GPUs; mid-range k (2048..n) stays at or below parity — honest numbers,
-a pipelined tensor-core sort stays future work. The INT8 decode GEMV
-moves half the bytes of an fp16 projection and runs at full memory
-bandwidth (2x); the IMMA GEMM path (~17 TOPS) is correctness-first —
-cuBLASLt (`torch._int_mm`) remains faster for large prefill matmuls.
+a pipelined tensor-core sort stays future work. attention_decode wins
+big at decode (one launch streams the GQA cache once at up to ~157 GB/s
+effective while SDPA pays head expansion or small-query inefficiency);
+attention_prefill is the honest convenience path at ~0.45x of SDPA's
+flash backend — no tensor cores by design, so heavyweight prefill stays
+with SDPA/FlashAttention. The INT8 decode GEMV moves half the bytes of
+an fp16 projection and runs at full memory bandwidth (2x); the IMMA
+GEMM path (~17 TOPS) is correctness-first — cuBLASLt (`torch._int_mm`)
+remains faster for large prefill matmuls.
 
 ## Development
 
@@ -231,8 +247,13 @@ suite on every push.
   (IMMA qgemm + decode GEMV), fused decode_step sampling
 - v0.4.1 (done): runtime block-size autotuning for the row-wise kernels
   (norms/softmax pick 128..1024 threads per shape at first call)
-- v0.4+: lightweight fused attention; prebuilt wheels on PyPI;
-  pipelined tensor-core INT8 GEMM
+- v0.5 (done): attention - GQA decode attention over a contiguous
+  kv-cache (flash-decoding split over long caches, per-sequence lengths)
+  and a tiled prefill path (honest ~0.45x of SDPA flash - the
+  convenience path); single-chart-per-GPU benchmarks; Windows wheels in
+  the PyPI publish pipeline
+- future: pipelined tensor-core INT8 GEMM; top-k mid-range parity;
+  API freeze for 1.0
 
 ## Community
 

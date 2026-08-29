@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(fusedtok VERSION 0.4.1 LANGUAGES CXX CUDA)
+project(fusedtok VERSION 0.5.0 LANGUAGES CXX CUDA)
 
 # C++17 for host code; CUDA follows via nvcc default
 set(CMAKE_CXX_STANDARD 17)
@@ -38,6 +38,7 @@ pybind11_add_module(_fusedtok
     src/sampling.cu
     src/quantize.cu
     src/qgemm.cu
+    src/attention.cu
     src/bindings.cpp)
 target_include_directories(_fusedtok PRIVATE include src)
 # Static CUDA runtime: the wheel then carries no libcudart.so dependency,

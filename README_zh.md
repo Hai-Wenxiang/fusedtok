@@ -35,6 +35,8 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | decode_step | 整个解码步融合：惩罚 -> 温度 -> 核采样，一次调用一次回读 |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称 per-tensor INT8，融合反量化-加-重量化 |
 | ✅ | qgemm | INT8 矩阵乘，int32 精确：tensor-core IMMA GEMM + 每 warp 一行的 GEMV（M=1 解码；比 fp16 投影快 2 倍） |
+| ✅ | attention_decode | 解码步因果注意力：GQA + 连续 kv-cache，在线 softmax、长 cache 自动 flash-decoding 切分、支持每序列长度 |
+| ✅ | attention_prefill | 新序列 S 行注意力（因果 / 双向）；便捷路径——重度 prefill 仍属 SDPA/flash 领地（诚实约 0.45x） |
 
 ## 安装
 
@@ -144,40 +146,47 @@ for step in range(256):
 ## 性能基准
 
 RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时，对比等价的
-PyTorch eager 表达式（完整数据：`docs/benchmark_rt3060.json`，可用
-`python benchmarks/bench.py` 复现）：
+PyTorch 参考实现（组合 eager 表达式；attention 参考使用**预展开**头 ——
+`repeat_interleave` 在计时区之外）。每算子取最大形状；完整数据：
+`docs/benchmark_rtx3060.json`，可用 `python benchmarks/bench.py` 复现：
 
-| 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
+| 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [2048×4096] | 418 µs | 2571 µs | **6.2x** |
-| RMSNorm（含残差） | [1024×4096] | 156 µs | 538 µs | **3.4x** |
-| LayerNorm | [1024×4096] | 115 µs | 161 µs | **1.4x** |
-| SwiGLU | [1024×4096] | 158 µs | 263 µs | **1.7x** |
-| top-k (k=50) | [131072] | 74 µs | 131 µs | **1.8x** |
-| decode_step（惩罚+采样） | [131072] | 309 µs | 354 µs（3 次调用） | **1.15x** |
-| Softmax | [1024×4096] | 103 µs | 118 µs | 1.1x |
-| SiLU | [1024×4096] | 104 µs | 108 µs | ~1.0x |
-| argmax | [131072] | 67 µs | 40 µs | 0.6x（含主机回读） |
-| INT8 解码 GEMV | [1×4096] @ [131072×4096] | 1595 µs | 3186 µs（fp16） | **2.0x** |
+| attention_decode（GQA） | T=16384, D=128 | 857 µs | 7667 µs（SDPA） | **8.9x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1654 µs | 10092 µs | **6.1x** |
+| RMSNorm（含残差） | [4096×4096] | 613 µs | 2058 µs | **3.4x** |
+| SwiGLU | [4096×4096] | 610 µs | 1031 µs | **1.7x** |
+| top-k (k=50) | [131072] | 78 µs | 125 µs | **1.6x** |
+| LayerNorm | [4096×4096] | 441 µs | 615 µs | **1.4x** |
+| Softmax | [4096×4096] | 415 µs | 427 µs | 1.0x |
+| SiLU / GeLU / add | [4096×4096] | ~414 µs | ~411 µs | ~1.0x |
+| argmax | [131072] | 39 µs | 35 µs | 0.9x（含主机回读） |
+| attention_prefill（因果） | S=1024, D=128 | 5764 µs | 2607 µs（SDPA flash） | 0.45x（诚实） |
 
 按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
 线程块大小；上表为调优后的数字。
 
-![fusedtok 对比 PyTorch eager](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt3060.png)
+![fusedtok 对比 PyTorch 参考](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx3060.png)
 
-**RTX 5060 Ti（Blackwell，sm_120）** —— 同套测试，torch 2.11/cu128，亮点：
+**RTX 5060 Ti（Blackwell，sm_120）** —— 同套测试，每算子最大形状
+（完整数据：`docs/benchmark_rtx5060ti.json`）：
 
-| 算子 | 形状 | fusedtok | PyTorch eager | 加速比 |
+| 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [512×4096] | 29 µs | 239 µs | **8.3x** |
-| RMSNorm（含残差） | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
-| Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1385 µs | 8372 µs | **6.0x** |
+| RMSNorm（含残差） | [4096×4096] | 505 µs | 1658 µs | **3.3x** |
+| attention_decode（GQA） | T=16384, D=128 | 572 µs | 2669 µs（SDPA） | **4.7x** |
+| SwiGLU | [4096×4096] | 505 µs | 858 µs | **1.7x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.5x** |
-| SwiGLU | [4096×4096] | 504 µs | 859 µs | **1.7x** |
-| argmax | [32000] | 15 µs | 22 µs | **1.5x** |
-| LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
+| LayerNorm / Softmax | [4096×4096] | ~344 µs | ~347 µs | 1.0x |
+| argmax | [131072] | 17 µs | 14 µs | 0.8x（含主机回读） |
+| attention_prefill（因果） | S=1024, D=128 | 3299 µs | 1420 µs（SDPA flash） | 0.43x（诚实） |
 
-![fusedtok 对比 PyTorch eager（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rt5060ti.png)
+小形状下 Blackwell 的优势更大（softmax 2.5x、RMSNorm 3.2x @256 行、
+attention decode 3.8x @T=4096 跑出 235 GB/s）——形状越大启动开销占比
+越低；完整扫描见 JSON。
+
+![fusedtok 对比 PyTorch 参考（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx5060ti.png)
 
 PyPI wheel 附带 sm_80/sm_86 原生 cubin 与 compute_86 PTX 回退 —— 已在
 Blackwell（sm_120）驱动上验证 JIT 运行正确。
@@ -186,7 +195,11 @@ Blackwell（sm_120）驱动上验证 JIT 运行正确。
 来回搬运。v0.4 选择管线（到达票据 radix 轮 + 早退压缩，缓存 CUDA 图整管线
 回放）在两张卡上小 k 场景均超过 torch 的 CUB radix select；中等 k
 （2048..n）仍持平或落后 —— 数字诚实，流水线化 tensor-core 排序留作后续
-工作。INT8 解码 GEMV 只搬运 fp16 投影一半的字节并跑满内存带宽（2 倍）；
+工作。attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
+有效带宽最高约 157 GB/s，而 SDPA 要付头展开或小查询低效的代价）；
+attention_prefill 是诚实的便捷路径，约为 SDPA flash 后端的 0.45x ——
+设计上不用 tensor core，重度 prefill 请继续用 SDPA/FlashAttention。
+INT8 解码 GEMV 只搬运 fp16 投影一半的字节并跑满内存带宽（2 倍）；
 IMMA GEMM 路径（约 17 TOPS）以正确性优先 —— 大规模 prefill 矩阵乘仍以
 cuBLASLt（torch._int_mm）更快。
 
@@ -217,7 +230,8 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
   INT8 量化/反量化工具
 - v0.4.1（已完成）：按行 kernel（归一化/softmax）运行时线程块自动调优
 - v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
-- v0.4+：轻量融合 attention；PyPI 预编译 wheel
+- v0.5（已完成）：attention —— GQA 解码注意力（连续 kv-cache、长 cache 自动 flash-decoding 切分、每序列长度）+ 分块 prefill 路径（诚实约 0.45x vs SDPA flash，定位便捷路径）；每 GPU 单图 benchmark；Windows wheel 进入 PyPI 发布管线
+- 后续：流水线化 tensor-core INT8 GEMM；top-k 中段 k 补平；1.0 的 API 冻结
 
 ## 社区
 
