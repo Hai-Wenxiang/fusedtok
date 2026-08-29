@@ -149,6 +149,95 @@ def test_decode_errors():
         fusedtok.attention_decode(q, k, v, np.array([1, 2], np.int32))
 
 
+# ---------------------------------------------------------------------------
+# prefill
+# ---------------------------------------------------------------------------
+
+
+def ref_prefill(q, k, v, causal=True):
+    """float64 eager reference with the causal prefill diagonal."""
+    b, hq, s, d = q.shape
+    _, hkv, _, _ = k.shape
+    group = hq // hkv
+    out = np.zeros((b, hq, s, d), dtype=np.float64)
+    for bi in range(b):
+        for h in range(hq):
+            kv = h // group
+            qd = q[bi, h].astype(np.float64)               # [s, d]
+            kd = k[bi, kv].astype(np.float64)
+            vd = v[bi, kv].astype(np.float64)
+            scores = qd @ kd.T / np.sqrt(d)                # [s, s]
+            for i in range(s):
+                lim = i + 1 if causal else s
+                p = np.exp(scores[i, :lim] - scores[i, :lim].max())
+                p /= p.sum()
+                out[bi, h, i] = p @ vd[:lim]
+    return out
+
+
+PREFILL_SHAPES = [
+    (1, 4, 2, 1, 32),          # S=1 degenerates to a decode step
+    (1, 8, 8, 5, 64),          # MHA, tiny
+    (2, 6, 3, 17, 16),         # odd S, group 2, batch
+    (1, 32, 8, 40, 128),       # LLaMA-ish GQA
+    (1, 4, 1, 33, 8),          # ragged S over the 16-row tiles
+    (1, 8, 2, 64, 256),        # max dim
+]
+
+
+@pytest.mark.parametrize("b,hq,hkv,s,d", PREFILL_SHAPES)
+@pytest.mark.parametrize("causal", [True, False])
+def test_prefill_cpu_matches_reference(b, hq, hkv, s, d, causal):
+    rng = np.random.default_rng(b * 100 + hq * 17 + s * 3 + d + causal)
+    q = rng.standard_normal((b, hq, s, d)).astype(np.float32)
+    k = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+    v = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+    y = fusedtok.attention_prefill(q, k, v, causal=causal)
+    assert y.shape == (b, hq, s, d)
+    np.testing.assert_allclose(y, ref_prefill(q, k, v, causal),
+                               rtol=1e-4, atol=1e-5)
+
+
+def test_prefill_first_row_attends_only_to_itself():
+    # causal row 0: softmax over a single score -> output equals v[0]
+    rng = np.random.default_rng(50)
+    q = rng.standard_normal((1, 4, 9, 32)).astype(np.float32)
+    k = rng.standard_normal((1, 2, 9, 32)).astype(np.float32)
+    v = rng.standard_normal((1, 2, 9, 32)).astype(np.float32)
+    y = fusedtok.attention_prefill(q, k, v, causal=True)
+    for h in range(4):                      # GQA: q head h -> kv head h//2
+        np.testing.assert_allclose(y[0, h, 0], v[0, h // 2, 0],
+                                   rtol=1e-5, atol=1e-6)
+
+
+def test_prefill_s1_equals_decode():
+    # S=1 causal prefill IS the decode step with len=1
+    rng = np.random.default_rng(51)
+    q = rng.standard_normal((2, 8, 4, 64)).astype(np.float32)[:, :, :1, :]
+    k = rng.standard_normal((2, 2, 4, 64)).astype(np.float32)[:, :, :1, :]
+    v = rng.standard_normal((2, 2, 4, 64)).astype(np.float32)[:, :, :1, :]
+    pre = fusedtok.attention_prefill(q, k, v, causal=True)
+    dec = fusedtok.attention_decode(q.reshape(2, 8, 64),
+                                    k.reshape(2, 2, 1, 64),
+                                    v.reshape(2, 2, 1, 64))
+    np.testing.assert_allclose(pre.reshape(2, 8, 64), dec,
+                               rtol=1e-5, atol=1e-6)
+
+
+def test_prefill_errors():
+    q = np.zeros((1, 4, 8, 32), np.float32)
+    k = np.zeros((1, 2, 8, 32), np.float32)
+    v = np.zeros_like(k)
+    with pytest.raises(ValueError):
+        fusedtok.attention_prefill(np.zeros((1, 5, 8, 32), np.float32), k, v)
+    with pytest.raises(ValueError):
+        fusedtok.attention_prefill(q, k, np.zeros((1, 2, 7, 32), np.float32))
+    with pytest.raises(ValueError):
+        fusedtok.attention_prefill(q, np.zeros((1, 2, 8, 30), np.float32), v)
+    with pytest.raises(ValueError):
+        fusedtok.attention_prefill(q, k, v[:, :, :, :31])
+
+
 @pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
 class TestCuda:
     @pytest.mark.parametrize("b,hq,hkv,t,d,with_lens", SHAPES)
@@ -224,6 +313,99 @@ class TestSplitPath:
         y = fusedtok.attention_decode(q, k, v, cuda=True)
         np.testing.assert_allclose(y, ref_decode(q, k, v, None),
                                    rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
+class TestPrefillCuda:
+    @pytest.mark.parametrize("b,hq,hkv,s,d", PREFILL_SHAPES)
+    @pytest.mark.parametrize("causal", [True, False])
+    def test_staged_matches_reference(self, b, hq, hkv, s, d, causal):
+        rng = np.random.default_rng(b * 100 + hq * 17 + s * 3 + d + causal)
+        q = rng.standard_normal((b, hq, s, d)).astype(np.float32)
+        k = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+        v = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+        y = fusedtok.attention_prefill(q, k, v, causal=causal, cuda=True)
+        np.testing.assert_allclose(y, ref_prefill(q, k, v, causal),
+                                   rtol=1e-4, atol=1e-5)
+
+    def test_long_sequence_matches_reference(self):
+        # multi-tile S with the causal diagonal crossing every tile
+        rng = np.random.default_rng(99)
+        b, hq, hkv, s, d = 1, 8, 2, 300, 64
+        q = rng.standard_normal((b, hq, s, d)).astype(np.float32)
+        k = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+        v = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+        y = fusedtok.attention_prefill(q, k, v, cuda=True)
+        np.testing.assert_allclose(y, ref_prefill(q, k, v, True),
+                                   rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
+                    reason="no torch/GPU")
+class TestPrefillTorch:
+    def test_zero_copy_matches_reference(self):
+        rng = np.random.default_rng(61)
+        q = rng.standard_normal((2, 12, 100, 64)).astype(np.float32)
+        k = rng.standard_normal((2, 4, 100, 64)).astype(np.float32)
+        v = rng.standard_normal((2, 4, 100, 64)).astype(np.float32)
+        y = fusedtok.attention_prefill(
+            torch.from_numpy(q).cuda(), torch.from_numpy(k).cuda(),
+            torch.from_numpy(v).cuda(), causal=False)
+        torch.cuda.synchronize()
+        np.testing.assert_allclose(y.cpu().numpy(), ref_prefill(q, k, v, False),
+                                   rtol=1e-4, atol=1e-5)
+
+    def test_sdpa_crosscheck(self):
+        # independent implementation: torch SDPA with is_causal=True
+        # (heads expanded with repeat_interleave)
+        rng = np.random.default_rng(62)
+        b, hq, hkv, s, d = 1, 32, 8, 256, 128
+        q = rng.standard_normal((b, hq, s, d)).astype(np.float32)
+        k = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+        v = rng.standard_normal((b, hkv, s, d)).astype(np.float32)
+        y = fusedtok.attention_prefill(
+            torch.from_numpy(q).cuda(), torch.from_numpy(k).cuda(),
+            torch.from_numpy(v).cuda(), causal=True)
+        torch.cuda.synchronize()
+        group = hq // hkv
+        kk = torch.from_numpy(k).cuda().repeat_interleave(group, dim=1)
+        vv = torch.from_numpy(v).cuda().repeat_interleave(group, dim=1)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            torch.from_numpy(q).cuda(), kk, vv, is_causal=True)
+        np.testing.assert_allclose(y.cpu().numpy(), ref.cpu().numpy(),
+                                   rtol=1e-3, atol=1e-4)
+
+    def test_graph_capture_replay(self):
+        from fusedtok import _fusedtok
+
+        b, hq, hkv, s, d = 1, 8, 2, 64, 64
+        q = torch.randn(b, hq, s, d, device="cuda")
+        k = torch.randn(b, hkv, s, d, device="cuda")
+        v = torch.randn(b, hkv, s, d, device="cuda")
+        y = torch.empty(b, hq, s, d, device="cuda")
+
+        def run():
+            _fusedtok.attention_prefill_launch(
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), y.data_ptr(),
+                b, hq, hkv, s, d, True,
+                torch.cuda.current_stream().cuda_stream)
+
+        s_side = torch.cuda.Stream()
+        s_side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s_side):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(s_side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run()
+        q.mul_(1.5)                       # replay must recompute
+        y.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        ref = fusedtok.attention_prefill(q, k, v).cpu().numpy()
+        np.testing.assert_allclose(y.cpu().numpy(), ref, rtol=1e-5,
+                                   atol=1e-6)
 
 
 @pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),

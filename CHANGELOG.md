@@ -30,6 +30,22 @@ adheres to [Semantic Versioning](https://semver.org/).
   torch SDPA (Lq=1): 4.2x @ T=512, 6.5x @ 4k, 9.3x @ 32k (163 GB/s
   effective); 13.3x against the expand+SDPA composite most code
   actually writes.
+- attention_prefill(q, k, v, causal=True): fresh-sequence attention
+  over S query rows - q [B,Hq,S,D] x k/v [B,Hkv,S,D], causal row i
+  attending to keys [0, i] (or all rows when causal=False). Tiled
+  single kernel: a 64/32/16-row query tile (by head size) lives in
+  shared memory while K/V stream through staged chunks, and lanes split
+  into per-row groups (4/8/16 lanes) so a dot product needs only
+  log2(lanes) xor-shuffles instead of a 10-step warp reduction - the
+  register arrays stay register-resident via compile-time trip counts
+  (a runtime bound silently demotes them to local memory, measured 7x).
+  Same GQA grouping, zero-row and dtype conventions as the decode op;
+  CUDA-graph capturable. HONEST numbers (RTX 3060, D=128): ~0.45x of
+  torch SDPA's flash backend at S=256..4096 - this is the convenience
+  path (GQA + causal + fusedtok pipeline integration without
+  materializing scores); heavyweight prefill belongs to SDPA /
+  FlashAttention (tensor cores); the library's competitive attention
+  surface is the decode step.
 - tests/test_attention.py: GQA mapping (constant-V probe), float64
   reference parity across shapes (single key, odd T, empty cache, long
   4096-row cache, D=4..256), padding-poisoning, error contract, staged

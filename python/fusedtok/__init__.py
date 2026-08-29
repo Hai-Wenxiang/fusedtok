@@ -60,6 +60,7 @@ __all__ = [
     "qgemm",
     "decode_step",
     "attention_decode",
+    "attention_prefill",
 ]
 
 
@@ -531,6 +532,51 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
     call = (_fusedtok.attention_decode if _device_path(q, cuda) == "staged"
             else _fusedtok.attention_decode_cpu)
     res = call(arr_q, arr_k, arr_v, arr_lens, b, hq, hkv, t_rows, d)
+    return _numpy_to_torch_like(res, q) if _is_torch(q) else res
+
+
+def attention_prefill(q, k, v, causal=True, *, cuda=False):
+    """Prefill (fresh-sequence) attention over S query rows:
+
+    ``out[b, h, i] = softmax(q . K^T / sqrt(D)) . V`` where query row i
+    attends to key rows ``[0, i]`` (``causal=True``, the prefill
+    diagonal) or all S rows (``causal=False``, bidirectional / encoder
+    style).
+
+    q: [B, Hq, S, D]; k / v: [B, Hkv, S, D]; out: [B, Hq, S, D]. Same
+    contiguous-group GQA mapping as :func:`attention_decode` (Hq must be
+    a multiple of Hkv). float32; dim multiple of 4, at most 512.
+    """
+    if _device_path(q, cuda) == "torch-cuda":
+        for name, t in (("q", q), ("k", k), ("v", v)):
+            _check_torch_f32(t, name)
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError("q/k/v must be [B, heads, S, D]")
+        b, hq, s, d = q.shape
+        b2, hkv, s2, d2 = k.shape
+        if (b2, s2, d2) != (b, s, d) or v.shape != k.shape:
+            raise ValueError("k/v must match q's batch, seq and dim")
+        if hq % hkv:
+            raise ValueError("q heads must be a multiple of kv heads")
+        out = torch.empty((b, hq, s, d), dtype=torch.float32,
+                          device=q.device)
+        if b * hq * s > 0:
+            _fusedtok.attention_prefill_launch(
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+                b, hq, hkv, s, d, bool(causal), _cuda_stream())
+        return out
+    arr_q = _as_numpy(q, "q")
+    arr_k = _as_numpy(k, "k")
+    arr_v = _as_numpy(v, "v")
+    if arr_q.ndim != 4 or arr_k.ndim != 4 or arr_v.ndim != 4:
+        raise ValueError("q/k/v must be [B, heads, S, D]")
+    b, hq, s, d = arr_q.shape
+    b2, hkv, s2, d2 = arr_k.shape
+    if (b2, s2, d2) != (b, s, d) or arr_v.shape != arr_k.shape:
+        raise ValueError("k/v must match q's batch, seq and dim")
+    call = (_fusedtok.attention_prefill if _device_path(q, cuda) == "staged"
+            else _fusedtok.attention_prefill_cpu)
+    res = call(arr_q, arr_k, arr_v, b, hq, hkv, s, d, bool(causal))
     return _numpy_to_torch_like(res, q) if _is_torch(q) else res
 
 

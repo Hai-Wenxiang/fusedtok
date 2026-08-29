@@ -32,4 +32,24 @@ std::vector<float> attention_decode_cpu(const std::vector<float>& q,
                                         int batch, int q_heads, int kv_heads,
                                         int cache_rows, int dim);
 
+// ---------------------------------------------------------------------------
+// attention (prefill): fresh-sequence self-attention over S query rows.
+//
+//   q: [B, Hq, S, D], k: [B, Hkv, S, D], v: [B, Hkv, S, D]
+//   out: [B, Hq, S, D]
+//
+// causal = true (default): query row i attends to key rows [0, i] (the
+// prefill diagonal of a fresh sequence). causal = false attends to all
+// S rows (bidirectional / encoder style). Same GQA grouping convention
+// as the decode op (q head h -> kv head h * Hkv / Hq). D must be a
+// multiple of 4 and at most 512; S and B are arbitrary.
+// ---------------------------------------------------------------------------
+
+std::vector<float> attention_prefill_cpu(const std::vector<float>& q,
+                                         const std::vector<float>& k,
+                                         const std::vector<float>& v,
+                                         int batch, int q_heads,
+                                         int kv_heads, int seq, int dim,
+                                         bool causal);
+
 } // namespace fusedtok

@@ -57,6 +57,9 @@ constexpr int kAttMaxDim = 512;      // shared accumulator budget per warp
 constexpr int kAttLaneChunks = kAttMaxDim / 4 / 32;
 constexpr int kAttMinSlice = 256;    // do not slice shorter spans
 constexpr int kAttMaxSlices = 32;    // workspace cap on the split grid
+// prefill lane-group slices: chunks/LPR per lane is at most 8 for
+// every (dim band, LPR) combination the launcher picks
+constexpr int kAttPrefChunks = 8;
 
 void attention_check(int batch, int hq, int hkv, int t_seq, int dim) {
     if (batch < 0 || hq < 1 || hkv < 1 || t_seq < 0 || dim < 1)
@@ -415,6 +418,289 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
 }
 
 // ---------------------------------------------------------------------------
+// prefill kernel: fresh-sequence attention over S query rows (the
+// lightweight v0.5 prefill - no tensor cores, bandwidth-first).
+//
+// One block per (batch, q head, tile of QTILE query rows); K/V stream
+// through KVTILE-row shared chunks so every global load is reused by
+// the whole tile. The latency-critical inner dot avoids the classic
+// 10-shuffle warp reduction: lanes split into RPW row groups of
+// LANES_PER_ROW = 32 / RPW lanes, each lane owning an equal slice of
+// the head dimension (8 float4 chunks for every supported shape), so a
+// row's dot needs only log2(LANES_PER_ROW) xor-shuffles with no
+// broadcast and no cross-row serialization. q slices and accumulators
+// live in registers; different rows in a warp share the same k/v
+// shared reads for free (broadcast).
+//
+//   dim <= 128: 64-row tile, 8 rows/warp,  4 lanes/row
+//   dim <= 256: 32-row tile, 4 rows/warp,  8 lanes/row
+//   dim <= 512: 16-row tile, 2 rows/warp, 16 lanes/row
+//   dim  <  32: generic fallback (warp-per-row reduction), since the
+//               head dimension cannot feed 4 lanes
+// Causality falls out of each row's own limit (row i stops at key i+1).
+// ---------------------------------------------------------------------------
+
+template <int QTILE, int KVTILE, int LPR>
+__global__ void attn_prefill_kernel(const float* __restrict__ q,
+                                    const float* __restrict__ k,
+                                    const float* __restrict__ v,
+                                    float* __restrict__ out,
+                                    int hq, int hkv, int seq, int dim,
+                                    int tiles, int causal) {
+    constexpr int RPW = 32 / LPR;      // query rows per warp
+    const int tile = blockIdx.x % tiles;
+    const int h = (blockIdx.x / tiles) % hq;
+    const int bi = blockIdx.x / (tiles * hq);
+    const int group = hq / hkv;
+    const int kv = h / group;
+    const int row0 = tile * QTILE;
+    const int chunks = dim / 4;        // per row
+    // ceil: the last lane of a row may own a partial slice (chunk
+    // counts not divisible by LPR, e.g. dim=36 -> 9 chunks over 4
+    // lanes); out-of-range chunks read as zero and never store
+    const int lane_chunks = (chunks + LPR - 1) / LPR;
+    const float scale = 1.0f / sqrtf((float)dim);
+
+    const float4* k4 = reinterpret_cast<const float4*>(
+        k + (((size_t)bi * hkv + kv) * seq) * dim);
+    const float4* v4 = reinterpret_cast<const float4*>(
+        v + (((size_t)bi * hkv + kv) * seq) * dim);
+    const float4* q4 = reinterpret_cast<const float4*>(
+        q + (((size_t)bi * hq + h) * seq) * dim);
+    float4* o4 = reinterpret_cast<float4*>(
+        out + (((size_t)bi * hq + h) * seq) * dim);
+
+    // dynamic shared layout: [QTILE x dim q tile][KVTILE x dim k][v]
+    extern __shared__ float sm[];
+    float* q_s = sm;
+    float* k_s = sm + QTILE * dim;
+    float* v_s = k_s + KVTILE * dim;
+
+    // stage the query tile (padding rows past seq with zeros)
+    for (int idx = threadIdx.x; idx < QTILE * chunks; idx += kAttBlock) {
+        const int r = idx / chunks, c = idx % chunks;
+        const int row = row0 + r;
+        *reinterpret_cast<float4*>(&q_s[r * dim + c * 4]) =
+            (row < seq) ? q4[(size_t)row * chunks + c]
+                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r_in_warp = lane / LPR;              // row within the warp
+    const int i_in_row = lane % LPR;               // lane's slice of dim
+    const int row_w = row0 + warp * RPW;           // warp's first row
+
+    // register-resident q slice + online accumulator for OUR row (each
+    // lane holds lane_chunks float4 of one row; lanes of a row all
+    // track identical (m, l) - redundant but broadcast-free)
+    float4 qs[kAttPrefChunks];
+    float4 acc[kAttPrefChunks];
+    float m = -INFINITY, l = 0.0f;
+    const int row_abs = row_w + r_in_warp;
+    const bool live = row_abs < seq;
+    if (live) {
+        const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4* qrow = reinterpret_cast<const float4*>(
+            &q_s[(warp * RPW + r_in_warp) * dim]);
+        // compile-time trip count keeps qs/acc in registers (a runtime
+        // bound demotes the arrays to local memory)
+        #pragma unroll
+        for (int j = 0; j < kAttPrefChunks; ++j) {
+            if (j >= lane_chunks) break;
+            const int c = i_in_row + j * LPR;
+            qs[j] = (c < chunks) ? qrow[c] : zero4;
+            acc[j] = zero4;
+        }
+    }
+    const int lim = causal ? row_abs + 1 : seq;
+
+    // this block's last needed key row (rows past it are never visible)
+    const int row_end = min(seq, causal ? row0 + QTILE : seq);
+    for (int t0 = 0; t0 < row_end; t0 += KVTILE) {
+        // stage one k/v chunk (zero-padded past seq)
+        for (int idx = threadIdx.x; idx < KVTILE * chunks;
+             idx += kAttBlock) {
+            const int r = idx / chunks, c = idx % chunks;
+            const int row = t0 + r;
+            const bool klive = row < seq;
+            *reinterpret_cast<float4*>(&k_s[r * dim + c * 4]) =
+                klive ? k4[(size_t)row * chunks + c]
+                      : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            *reinterpret_cast<float4*>(&v_s[r * dim + c * 4]) =
+                klive ? v4[(size_t)row * chunks + c]
+                      : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+
+        if (live) {
+            const int t_stop = min(t0 + KVTILE, lim);
+            for (int tt = t0; tt < t_stop; ++tt) {
+                const float4* krow = reinterpret_cast<const float4*>(
+                    &k_s[(tt - t0) * dim]);
+                const float4* vrow = reinterpret_cast<const float4*>(
+                    &v_s[(tt - t0) * dim]);
+                float dot = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < kAttPrefChunks; ++j) {
+                    if (j >= lane_chunks) break;
+                    const int c = i_in_row + j * LPR;
+                    if (c < chunks) {
+                        const float4 kk = krow[c];
+                        dot += qs[j].x * kk.x + qs[j].y * kk.y
+                             + qs[j].z * kk.z + qs[j].w * kk.w;
+                    }
+                }
+                // reduce within the row's lane group only: log2(LPR)
+                // xor-shuffles, every lane keeps the total. The mask
+                // must cover JUST the row's contiguous lane group -
+                // rows of the same warp can have different `live`, and
+                // a full-warp mask with only some lanes arriving
+                // deadlocks the shuffle.
+                const unsigned row_mask =
+                    ((1u << LPR) - 1u) << (r_in_warp * LPR);
+                if (LPR > 1) {
+                    #pragma unroll
+                    for (int off = LPR / 2; off > 0; off >>= 1)
+                        dot += __shfl_xor_sync(row_mask, dot, off);
+                }
+                const float s = dot * scale;
+                const float m_new = fmaxf(m, s);
+                // __expf (SFU approximation, ~2 ulp): this is the hot
+                // two-instruction path of the prefill kernel; the
+                // parity tests' 1e-4 tolerances absorb the difference
+                const float rescale = __expf(m - m_new);
+                const float p = __expf(s - m_new);
+                l = l * rescale + p;
+                #pragma unroll
+                for (int j = 0; j < kAttPrefChunks; ++j) {
+                    if (j >= lane_chunks) break;
+                    const int c = i_in_row + j * LPR;
+                    if (c < chunks) {
+                        const float4 vv = vrow[c];
+                        acc[j].x = acc[j].x * rescale + p * vv.x;
+                        acc[j].y = acc[j].y * rescale + p * vv.y;
+                        acc[j].z = acc[j].z * rescale + p * vv.z;
+                        acc[j].w = acc[j].w * rescale + p * vv.w;
+                    }
+                }
+                m = m_new;
+            }
+        }
+        __syncthreads();               // before restaging k/v
+    }
+
+    if (live) {
+        // lim >= 1 always holds, so l > 0 (the row saw key 0)
+        float4* orow = o4 + (size_t)row_abs * chunks;
+        #pragma unroll
+        for (int j = 0; j < kAttPrefChunks; ++j) {
+            if (j >= lane_chunks) break;
+            const int c = i_in_row + j * LPR;
+            if (c < chunks)
+                orow[c] = make_float4(acc[j].x / l, acc[j].y / l,
+                                      acc[j].z / l, acc[j].w / l);
+        }
+    }
+}
+
+// generic fallback for dim < 32 (at most 8 float4 chunks: one chunk
+// per lane, classic warp reduction; each warp services two rows) ----
+
+__global__ void attn_prefill_small_kernel(const float* __restrict__ q,
+                                          const float* __restrict__ k,
+                                          const float* __restrict__ v,
+                                          float* __restrict__ out,
+                                          int hq, int hkv, int seq,
+                                          int dim, int tiles, int causal) {
+    constexpr int QTILE = 16;
+    const int tile = blockIdx.x % tiles;
+    const int h = (blockIdx.x / tiles) % hq;
+    const int bi = blockIdx.x / (tiles * hq);
+    const int group = hq / hkv;
+    const int kv = h / group;
+    const int row0 = tile * QTILE;
+    const int chunks = dim / 4;
+    const float scale = 1.0f / sqrtf((float)dim);
+
+    const float4* k4 = reinterpret_cast<const float4*>(
+        k + (((size_t)bi * hkv + kv) * seq) * dim);
+    const float4* v4 = reinterpret_cast<const float4*>(
+        v + (((size_t)bi * hkv + kv) * seq) * dim);
+    const float4* q4 = reinterpret_cast<const float4*>(
+        q + (((size_t)bi * hq + h) * seq) * dim);
+    float4* o4 = reinterpret_cast<float4*>(
+        out + (((size_t)bi * hq + h) * seq) * dim);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row_a = row0 + warp * 2, row_b = row0 + warp * 2 + 1;
+    const bool has_a = row_a < seq, has_b = row_b < seq;
+    const int lim_a = causal ? row_a + 1 : seq;
+    const int lim_b = causal ? row_b + 1 : seq;
+    const int tmax = max(has_a ? lim_a : 0, has_b ? lim_b : 0);
+
+    // one float4 chunk per lane (chunks <= 8 on this path)
+    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 qc_a = (has_a && lane < chunks)
+        ? q4[(size_t)row_a * chunks + lane] : zero;
+    const float4 qc_b = (has_b && lane < chunks)
+        ? q4[(size_t)row_b * chunks + lane] : zero;
+
+    float m_a = -INFINITY, l_a = 0.0f, m_b = -INFINITY, l_b = 0.0f;
+    float4 acc_a = zero, acc_b = zero;
+    for (int t = 0; t < tmax; ++t) {
+        const float4 kc = (lane < chunks)
+            ? k4[(size_t)t * chunks + lane] : zero;
+        const float4 vc = (lane < chunks)
+            ? v4[(size_t)t * chunks + lane] : zero;
+        if (has_a && t < lim_a) {
+            float dot = qc_a.x * kc.x + qc_a.y * kc.y
+                      + qc_a.z * kc.z + qc_a.w * kc.w;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_down_sync(0xffffffffu, dot, off);
+            const float s = __shfl_sync(0xffffffffu, dot, 0) * scale;
+            const float m_new = fmaxf(m_a, s);
+            const float rescale = expf(m_a - m_new);
+            const float p = expf(s - m_new);
+            l_a = l_a * rescale + p;
+            m_a = m_new;
+            acc_a.x = acc_a.x * rescale + p * vc.x;
+            acc_a.y = acc_a.y * rescale + p * vc.y;
+            acc_a.z = acc_a.z * rescale + p * vc.z;
+            acc_a.w = acc_a.w * rescale + p * vc.w;
+        }
+        if (has_b && t < lim_b) {
+            float dot = qc_b.x * kc.x + qc_b.y * kc.y
+                      + qc_b.z * kc.z + qc_b.w * kc.w;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_down_sync(0xffffffffu, dot, off);
+            const float s = __shfl_sync(0xffffffffu, dot, 0) * scale;
+            const float m_new = fmaxf(m_b, s);
+            const float rescale = expf(m_b - m_new);
+            const float p = expf(s - m_new);
+            l_b = l_b * rescale + p;
+            m_b = m_new;
+            acc_b.x = acc_b.x * rescale + p * vc.x;
+            acc_b.y = acc_b.y * rescale + p * vc.y;
+            acc_b.z = acc_b.z * rescale + p * vc.z;
+            acc_b.w = acc_b.w * rescale + p * vc.w;
+        }
+    }
+    if (has_a && lane < chunks)
+        o4[(size_t)row_a * chunks + lane] =
+            make_float4(acc_a.x / l_a, acc_a.y / l_a,
+                        acc_a.z / l_a, acc_a.w / l_a);
+    if (has_b && lane < chunks)
+        o4[(size_t)row_b * chunks + lane] =
+            make_float4(acc_b.x / l_b, acc_b.y / l_b,
+                        acc_b.z / l_b, acc_b.w / l_b);
+}
+
+// ---------------------------------------------------------------------------
 // per-shape workspace cache for the split path (process lifetime, like
 // the selection pipeline's scratch). Allocations happen OUTSIDE stream
 // captures; a first call that races an active capture falls back to the
@@ -621,6 +907,102 @@ void attention_decode_launch(const float* q, const float* k, const float* v,
     attn_reduce_kernel<<<batch * hq, kAttBlock, 0, cs>>>(
         ws.ml, ws.acc, out, hq, hkv, dim, group, slices);
     check_launch("attention reduce kernel launch");
+}
+
+// ---------------------------------------------------------------------------
+// prefill CPU reference: masked two-pass softmax attention
+// ---------------------------------------------------------------------------
+
+std::vector<float> attention_prefill_cpu(const std::vector<float>& q,
+                                         const std::vector<float>& k,
+                                         const std::vector<float>& v,
+                                         int batch, int hq, int hkv,
+                                         int seq, int dim, bool causal) {
+    attention_check(batch, hq, hkv, seq, dim);
+    const size_t qn = (size_t)batch * hq * seq * dim;
+    const size_t kvn = (size_t)batch * hkv * seq * dim;
+    if (q.size() < qn || k.size() < kvn || v.size() < kvn)
+        throw std::invalid_argument("attention operand size mismatch");
+    const int group = hq / hkv;
+    const float scale = 1.0f / sqrtf((float)dim);
+    std::vector<float> out(qn, 0.0f);
+    std::vector<float> scores(seq > 0 ? seq : 1);
+    for (int bi = 0; bi < batch; ++bi)
+        for (int h = 0; h < hq; ++h) {
+            const int kv = h / group;
+            const float* qp = q.data() +
+                (((size_t)bi * hq + h) * seq) * dim;
+            const float* kp = k.data() +
+                (((size_t)bi * hkv + kv) * seq) * dim;
+            const float* vp = v.data() +
+                (((size_t)bi * hkv + kv) * seq) * dim;
+            for (int i = 0; i < seq; ++i) {
+                const int lim = causal ? i + 1 : seq;
+                const float* qr = qp + (size_t)i * dim;
+                float m = -INFINITY;
+                for (int t = 0; t < lim; ++t) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < dim; ++d)
+                        dot += qr[d] * kp[(size_t)t * dim + d];
+                    scores[t] = dot * scale;
+                    m = fmaxf(m, scores[t]);
+                }
+                float l = 0.0f;
+                for (int t = 0; t < lim; ++t)
+                    l += expf(scores[t] - m);
+                float* op = out.data() +
+                    (((size_t)bi * hq + h) * seq + i) * dim;
+                for (int t = 0; t < lim; ++t) {
+                    const float p = expf(scores[t] - m) / l;
+                    for (int d = 0; d < dim; ++d)
+                        op[d] += p * vp[(size_t)t * dim + d];
+                }
+            }
+        }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// prefill launcher: one block per (batch, q head, 16-row tile);
+// stream-ordered, no workspace, CUDA-graph capturable as-is
+// ---------------------------------------------------------------------------
+
+void attention_prefill_launch(const float* q, const float* k,
+                              const float* v, float* out,
+                              int batch, int hq, int hkv, int seq, int dim,
+                              bool causal, std::uintptr_t stream) {
+    attention_check(batch, hq, hkv, seq, dim);
+    if (batch == 0 || seq == 0)
+        return;                        // nothing to compute
+    cudaStream_t cs = (cudaStream_t)stream;
+    // tile shape by head size: bigger tiles for smaller heads, inside
+    // heads below 32 floats cannot feed 4 lanes and take the generic
+    // warp-reduction fallback
+    if (dim < 32) {
+        const int tiles = (seq + 15) / 16;
+        dim3 grid((unsigned)(batch * hq * tiles));
+        attn_prefill_small_kernel<<<grid, kAttBlock, 0, cs>>>(
+            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
+        check_launch("attention prefill kernel launch");
+        return;
+    }
+    int qtile, kvtile, lpr;
+    if (dim <= 128) { qtile = 64; kvtile = 16; lpr = 4; }
+    else if (dim <= 256) { qtile = 32; kvtile = 8; lpr = 8; }
+    else { qtile = 16; kvtile = 4; lpr = 16; }
+    const int smem = (qtile + 2 * kvtile) * dim * (int)sizeof(float);
+    const int tiles = (seq + qtile - 1) / qtile;
+    dim3 grid((unsigned)(batch * hq * tiles));
+    if (lpr == 4)
+        attn_prefill_kernel<64, 16, 4><<<grid, kAttBlock, smem, cs>>>(
+            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
+    else if (lpr == 8)
+        attn_prefill_kernel<32, 8, 8><<<grid, kAttBlock, smem, cs>>>(
+            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
+    else
+        attn_prefill_kernel<16, 4, 16><<<grid, kAttBlock, smem, cs>>>(
+            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
+    check_launch("attention prefill kernel launch");
 }
 
 } // namespace fusedtok

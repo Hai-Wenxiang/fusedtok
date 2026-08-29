@@ -939,6 +939,59 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("out"), py::arg("batch"), py::arg("hq"), py::arg("hkv"),
        py::arg("t_seq"), py::arg("dim"), py::arg("stream") = 0);
 
+    m.def("attention_prefill_cpu", [](FArray q, FArray k, FArray v,
+                                      int batch, int hq, int hkv, int seq,
+                                      int dim, bool causal) {
+        if (q.size() != (py::ssize_t)batch * hq * seq * dim ||
+            k.size() != (py::ssize_t)batch * hkv * seq * dim ||
+            v.size() != (py::ssize_t)batch * hkv * seq * dim)
+            throw std::invalid_argument("attention operand size mismatch");
+        auto out = ft::attention_prefill_cpu(to_vec(q), to_vec(k),
+                                             to_vec(v), batch, hq, hkv,
+                                             seq, dim, causal);
+        return wrap_vec(out, {(py::ssize_t)batch, (py::ssize_t)hq,
+                              (py::ssize_t)seq, (py::ssize_t)dim});
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("batch"),
+       py::arg("hq"), py::arg("hkv"), py::arg("seq"), py::arg("dim"),
+       py::arg("causal"));
+
+    m.def("attention_prefill", [](FArray q, FArray k, FArray v,
+                                  int batch, int hq, int hkv, int seq,
+                                  int dim, bool causal) {
+        if (q.size() != (py::ssize_t)batch * hq * seq * dim ||
+            k.size() != (py::ssize_t)batch * hkv * seq * dim ||
+            v.size() != (py::ssize_t)batch * hkv * seq * dim)
+            throw std::invalid_argument("attention operand size mismatch");
+        const size_t n = (size_t)batch * hq * seq * dim;
+        const size_t kvn = (size_t)batch * hkv * seq * dim;
+        py::array_t<float> out(std::vector<py::ssize_t>{batch, hq, seq, dim});
+        if (n == 0) return out;
+        DevBuf dq(n * 4), dk(kvn * 4), dv(kvn * 4), dy(n * 4);
+        h2d(dq.get(), q.data(), n * 4);
+        h2d(dk.get(), k.data(), kvn * 4);
+        h2d(dv.get(), v.data(), kvn * 4);
+        ft::attention_prefill_launch(dq.fget(), dk.fget(), dv.fget(),
+                                     dy.fget(), batch, hq, hkv, seq, dim,
+                                     causal);
+        d2h(out.mutable_data(), dy.get(), n * 4);
+        sync_device("attention prefill kernel");
+        return out;
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("batch"),
+       py::arg("hq"), py::arg("hkv"), py::arg("seq"), py::arg("dim"),
+       py::arg("causal"));
+
+    m.def("attention_prefill_launch", [](py::int_ q, py::int_ k,
+                                         py::int_ v, py::int_ out,
+                                         int batch, int hq, int hkv,
+                                         int seq, int dim, bool causal,
+                                         std::uintptr_t stream) {
+        ft::attention_prefill_launch(df(q), df(k), df(v), dfm(out),
+                                     batch, hq, hkv, seq, dim, causal,
+                                     stream);
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+       py::arg("batch"), py::arg("hq"), py::arg("hkv"), py::arg("seq"),
+       py::arg("dim"), py::arg("causal"), py::arg("stream") = 0);
+
     m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
                                    unsigned long long seed,
                                    std::uintptr_t stream) -> long long {
