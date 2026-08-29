@@ -1,228 +1,251 @@
 {
   "device": "NVIDIA GeForce RTX 5060 Ti",
   "torch": "2.11.0+cu128",
-  "fusedtok": "0.4.0",
-  "timestamp": "2026-08-28 19:13:18",
+  "fusedtok": "0.4.1",
+  "timestamp": "2026-08-29 18:04:30",
   "results": [
     {
       "op": "rmsnorm+res",
       "shape": "[256x4096]",
-      "fusedtok_us": 9.57,
-      "torch_us": 30.24,
+      "fusedtok_us": 9.59,
+      "torch_us": 30.33,
       "speedup": 3.16,
-      "bandwidth_gbs": 1314.8
+      "bandwidth_gbs": 1312.3
     },
     {
       "op": "layernorm",
       "shape": "[256x4096]",
-      "fusedtok_us": 9.11,
-      "torch_us": 9.03,
-      "speedup": 0.99,
-      "bandwidth_gbs": 1380.5
+      "fusedtok_us": 9.2,
+      "torch_us": 9.05,
+      "speedup": 0.98,
+      "bandwidth_gbs": 1367.0
     },
     {
       "op": "softmax",
       "shape": "[256x4096]",
-      "fusedtok_us": 8.33,
-      "torch_us": 14.43,
-      "speedup": 1.73,
-      "bandwidth_gbs": 1510.0
+      "fusedtok_us": 8.3,
+      "torch_us": 14.41,
+      "speedup": 1.74,
+      "bandwidth_gbs": 1516.2
     },
     {
       "op": "silu",
       "shape": "[256x4096]",
-      "fusedtok_us": 7.91,
-      "torch_us": 4.73,
-      "speedup": 0.6,
-      "bandwidth_gbs": 1590.6
+      "fusedtok_us": 8.18,
+      "torch_us": 4.87,
+      "speedup": 0.59,
+      "bandwidth_gbs": 1538.8
     },
     {
       "op": "gelu(erf)",
       "shape": "[256x4096]",
-      "fusedtok_us": 7.88,
-      "torch_us": 4.91,
+      "fusedtok_us": 8.01,
+      "torch_us": 4.97,
       "speedup": 0.62,
-      "bandwidth_gbs": 1596.8
+      "bandwidth_gbs": 1571.2
     },
     {
       "op": "swiglu",
       "shape": "[256x4096]",
-      "fusedtok_us": 8.69,
-      "torch_us": 10.15,
-      "speedup": 1.17,
-      "bandwidth_gbs": 1447.2
+      "fusedtok_us": 8.61,
+      "torch_us": 10.2,
+      "speedup": 1.18,
+      "bandwidth_gbs": 1460.8
     },
     {
       "op": "add",
       "shape": "[256x4096]",
-      "fusedtok_us": 8.58,
-      "torch_us": 5.42,
-      "speedup": 0.63,
-      "bandwidth_gbs": 1466.4
+      "fusedtok_us": 8.61,
+      "torch_us": 5.48,
+      "speedup": 0.64,
+      "bandwidth_gbs": 1461.3
     },
     {
       "op": "rmsnorm+res",
       "shape": "[1024x4096]",
-      "fusedtok_us": 102.55,
-      "torch_us": 228.86,
-      "speedup": 2.23,
-      "bandwidth_gbs": 490.8
+      "fusedtok_us": 101.45,
+      "torch_us": 229.25,
+      "speedup": 2.26,
+      "bandwidth_gbs": 496.1
     },
     {
       "op": "layernorm",
       "shape": "[1024x4096]",
-      "fusedtok_us": 26.87,
-      "torch_us": 27.98,
-      "speedup": 1.04,
-      "bandwidth_gbs": 1872.8
+      "fusedtok_us": 26.64,
+      "torch_us": 28.01,
+      "speedup": 1.05,
+      "bandwidth_gbs": 1889.4
     },
     {
       "op": "softmax",
       "shape": "[1024x4096]",
-      "fusedtok_us": 20.13,
-      "torch_us": 51.26,
-      "speedup": 2.55,
-      "bandwidth_gbs": 2500.2
+      "fusedtok_us": 20.41,
+      "torch_us": 51.35,
+      "speedup": 2.52,
+      "bandwidth_gbs": 2466.1
     },
     {
       "op": "silu",
       "shape": "[1024x4096]",
       "fusedtok_us": 19.84,
-      "torch_us": 19.49,
+      "torch_us": 19.5,
       "speedup": 0.98,
-      "bandwidth_gbs": 2536.5
+      "bandwidth_gbs": 2536.3
     },
     {
       "op": "gelu(erf)",
       "shape": "[1024x4096]",
-      "fusedtok_us": 20.04,
-      "torch_us": 19.54,
+      "fusedtok_us": 19.99,
+      "torch_us": 19.42,
       "speedup": 0.97,
-      "bandwidth_gbs": 2511.6
+      "bandwidth_gbs": 2518.4
     },
     {
       "op": "swiglu",
       "shape": "[1024x4096]",
-      "fusedtok_us": 103.92,
-      "torch_us": 173.58,
-      "speedup": 1.67,
-      "bandwidth_gbs": 484.3
+      "fusedtok_us": 104.3,
+      "torch_us": 173.41,
+      "speedup": 1.66,
+      "bandwidth_gbs": 482.6
     },
     {
       "op": "add",
       "shape": "[1024x4096]",
-      "fusedtok_us": 101.97,
-      "torch_us": 102.26,
+      "fusedtok_us": 102.36,
+      "torch_us": 102.62,
       "speedup": 1.0,
-      "bandwidth_gbs": 493.6
+      "bandwidth_gbs": 491.7
     },
     {
       "op": "rmsnorm+res",
       "shape": "[4096x4096]",
-      "fusedtok_us": 504.61,
-      "torch_us": 1657.83,
-      "speedup": 3.29,
-      "bandwidth_gbs": 399.0
+      "fusedtok_us": 504.85,
+      "torch_us": 1658.28,
+      "speedup": 3.28,
+      "bandwidth_gbs": 398.8
     },
     {
       "op": "layernorm",
       "shape": "[4096x4096]",
-      "fusedtok_us": 345.65,
-      "torch_us": 350.68,
+      "fusedtok_us": 345.85,
+      "torch_us": 350.61,
       "speedup": 1.01,
-      "bandwidth_gbs": 582.5
+      "bandwidth_gbs": 582.1
     },
     {
       "op": "softmax",
       "shape": "[4096x4096]",
-      "fusedtok_us": 342.32,
-      "torch_us": 343.71,
+      "fusedtok_us": 342.38,
+      "torch_us": 343.62,
       "speedup": 1.0,
-      "bandwidth_gbs": 588.1
+      "bandwidth_gbs": 588.0
     },
     {
       "op": "silu",
       "shape": "[4096x4096]",
-      "fusedtok_us": 346.13,
-      "torch_us": 349.88,
+      "fusedtok_us": 346.39,
+      "torch_us": 349.71,
       "speedup": 1.01,
-      "bandwidth_gbs": 581.7
+      "bandwidth_gbs": 581.2
     },
     {
       "op": "gelu(erf)",
       "shape": "[4096x4096]",
-      "fusedtok_us": 346.24,
-      "torch_us": 349.36,
+      "fusedtok_us": 346.25,
+      "torch_us": 349.56,
       "speedup": 1.01,
       "bandwidth_gbs": 581.5
     },
     {
       "op": "swiglu",
       "shape": "[4096x4096]",
-      "fusedtok_us": 503.91,
-      "torch_us": 857.74,
+      "fusedtok_us": 504.48,
+      "torch_us": 857.58,
       "speedup": 1.7,
-      "bandwidth_gbs": 399.5
+      "bandwidth_gbs": 399.1
     },
     {
       "op": "add",
       "shape": "[4096x4096]",
-      "fusedtok_us": 503.91,
-      "torch_us": 506.26,
+      "fusedtok_us": 503.83,
+      "torch_us": 506.22,
       "speedup": 1.0,
-      "bandwidth_gbs": 399.5
+      "bandwidth_gbs": 399.6
     },
     {
       "op": "rope neox q+k",
       "shape": "[512x4096]",
-      "fusedtok_us": 28.73,
-      "torch_us": 239.35,
-      "speedup": 8.33,
-      "bandwidth_gbs": 1168.1
+      "fusedtok_us": 28.96,
+      "torch_us": 239.67,
+      "speedup": 8.27,
+      "bandwidth_gbs": 1158.5
     },
     {
       "op": "rope neox q+k",
       "shape": "[2048x4096]",
-      "fusedtok_us": 345.8,
-      "torch_us": 1889.46,
+      "fusedtok_us": 345.99,
+      "torch_us": 1890.34,
       "speedup": 5.46,
-      "bandwidth_gbs": 388.1
+      "bandwidth_gbs": 387.9
     },
     {
       "op": "rope neox q+k",
       "shape": "[8192x4096]",
-      "fusedtok_us": 1384.44,
-      "torch_us": 8370.72,
-      "speedup": 6.05,
-      "bandwidth_gbs": 387.8
+      "fusedtok_us": 1384.95,
+      "torch_us": 8371.78,
+      "speedup": 6.04,
+      "bandwidth_gbs": 387.6
     },
     {
       "op": "topk k=50",
       "shape": "[32000]",
-      "fusedtok_us": 37.31,
-      "torch_us": 39.41,
-      "speedup": 1.06
+      "fusedtok_us": 37.41,
+      "torch_us": 39.15,
+      "speedup": 1.05
     },
     {
       "op": "argmax",
       "shape": "[32000]",
-      "fusedtok_us": 14.85,
-      "torch_us": 21.58,
-      "speedup": 1.45
+      "fusedtok_us": 14.76,
+      "torch_us": 20.83,
+      "speedup": 1.41
     },
     {
       "op": "topk k=50",
       "shape": "[131072]",
-      "fusedtok_us": 27.15,
-      "torch_us": 40.78,
-      "speedup": 1.5
+      "fusedtok_us": 27.2,
+      "torch_us": 40.99,
+      "speedup": 1.51
     },
     {
       "op": "argmax",
       "shape": "[131072]",
-      "fusedtok_us": 16.46,
-      "torch_us": 14.0,
-      "speedup": 0.85
+      "fusedtok_us": 16.73,
+      "torch_us": 13.79,
+      "speedup": 0.82
+    },
+    {
+      "op": "attn decode",
+      "shape": "T=4096",
+      "fusedtok_us": 176.9,
+      "torch_us": 673.63,
+      "speedup": 3.81,
+      "bandwidth_gbs": 189.9
+    },
+    {
+      "op": "attn decode",
+      "shape": "T=16384",
+      "fusedtok_us": 571.87,
+      "torch_us": 2669.27,
+      "speedup": 4.67,
+      "bandwidth_gbs": 234.8
+    },
+    {
+      "op": "attn prefill",
+      "shape": "S=1024",
+      "fusedtok_us": 3299.44,
+      "torch_us": 1420.34,
+      "speedup": 0.43
     }
   ]
 }

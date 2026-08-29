@@ -177,18 +177,24 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 
 ![fusedtok vs PyTorch reference](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx3060.png)
 
-**RTX 5060 Ti (Blackwell, sm_120)** — same suite, highlights (full data:
-`docs/benchmark_rtx5060ti.json`):
+**RTX 5060 Ti (Blackwell, sm_120)** — same suite, largest shape per op
+(full data: `docs/benchmark_rtx5060ti.json`):
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [512×4096] | 29 µs | 239 µs | **8.3x** |
-| RMSNorm (+residual) | [4096×4096] | 512 µs | 1662 µs | **3.3x** |
-| Softmax | [1024×4096] | 20 µs | 51 µs | **2.6x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1385 µs | 8372 µs | **6.0x** |
+| RMSNorm (+residual) | [4096×4096] | 505 µs | 1658 µs | **3.3x** |
+| attention_decode (GQA) | T=16384, D=128 | 572 µs | 2669 µs (SDPA) | **4.7x** |
+| SwiGLU | [4096×4096] | 505 µs | 858 µs | **1.7x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.5x** |
-| SwiGLU | [4096×4096] | 504 µs | 859 µs | **1.7x** |
-| argmax | [32000] | 15 µs | 22 µs | **1.5x** |
-| LayerNorm | [1024×4096] | 27 µs | 28 µs | ~1.0x |
+| LayerNorm / Softmax | [4096×4096] | ~344 µs | ~347 µs | 1.0x |
+| argmax | [131072] | 17 µs | 14 µs | 0.8x (incl. host readback) |
+| attention_prefill (causal) | S=1024, D=128 | 3299 µs | 1420 µs (SDPA flash) | 0.43x (honest) |
+
+On smaller shapes the Blackwell card shows bigger wins (softmax 2.5x,
+RMSNorm 3.2x at 256 rows, attention decode 3.8x at T=4096 running
+235 GB/s) - the launch-overhead share shrinks as shapes grow; full
+sweep in the JSON.
 
 ![fusedtok vs PyTorch reference (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx5060ti.png)
 
