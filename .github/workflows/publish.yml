@@ -108,8 +108,13 @@ jobs:
 
       - name: Build the wheel
         shell: pwsh
+        env:
+          # Ninja matches the reference build; the VS generator's CUDA
+          # targets need CudaToolkitDir (registry), which silent
+          # installs do not write
+          CMAKE_GENERATOR: Ninja
         run: |
-          python -m pip install --upgrade pip build
+          python -m pip install --upgrade pip build ninja
           python -m build --wheel --outdir dist .
           Get-ChildItem dist
 

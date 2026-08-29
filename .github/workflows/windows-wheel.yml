@@ -56,8 +56,10 @@ jobs:
 
       - name: Build the wheel
         shell: pwsh
+        env:
+          CMAKE_GENERATOR: Ninja
         run: |
-          python -m pip install --upgrade pip build
+          python -m pip install --upgrade pip build ninja
           python -m build --wheel --outdir dist .
           Get-ChildItem dist
 
