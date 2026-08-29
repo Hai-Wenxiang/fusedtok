@@ -80,11 +80,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $url = "https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda_12.4.1_12.4.1_551.78_windows_network.exe"
-          curl.exe -L --retry 3 -o cuda_net.exe $url
+          $installer = Join-Path $PWD "cuda_net.exe"
+          # -f: fail on HTTP errors instead of saving an error page as exe
+          curl.exe -L -f --retry 3 -o $installer $url
           if ($LASTEXITCODE -ne 0) { throw "cuda installer download failed" }
-          # documented enterprise silent mode: toolkit components only
-          Start-Process -Wait -FilePath ".\cuda_net.exe" -ArgumentList "-s","cudatoolkit"
-          Remove-Item cuda_net.exe -Force
+          $size = (Get-Item $installer).Length
+          if ($size -lt 50MB) { throw "cuda installer too small: $size bytes" }
+          # documented enterprise silent mode: toolkit components only;
+          # ABSOLUTE path - Start-Process refuses relative .\ paths here
+          Start-Process -Wait -FilePath $installer -ArgumentList "-s","cudatoolkit"
+          Remove-Item $installer -Force
           $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
           if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
             throw "nvcc not found after silent install"
