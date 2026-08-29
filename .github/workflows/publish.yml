@@ -85,13 +85,21 @@ jobs:
           curl.exe -L -f --retry 3 -o $installer $url
           if ($LASTEXITCODE -ne 0) { throw "cuda installer download failed" }
           $size = (Get-Item $installer).Length
-          if ($size -lt 20MB) { throw "installer too small: $size bytes" }
-          # documented enterprise silent mode: toolkit components only;
-          # ABSOLUTE path - Start-Process refuses relative .\ paths here
-          Start-Process -Wait -FilePath $installer -ArgumentList "-s","cudatoolkit_12.4"
+          if ($size -lt 20MB) { throw "cuda installer too small: $size bytes" }
+          # bare -s (all components): component-scoped names like
+          # cudatoolkit_12.4 make the network bootstrapper exit within
+          # seconds installing nothing; the driver component may fail on
+          # GPU-less runners but the toolkit still lands - success is
+          # judged by nvcc.exe below, not the exit code
+          $p = Start-Process -PassThru -Wait -FilePath $installer -ArgumentList "-s"
+          "installer exit code: $($p.ExitCode)"
           Remove-Item $installer -Force
           $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
           if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
+            Get-ChildItem "$env:TEMP" -Recurse -Filter "cuda*" -ErrorAction SilentlyContinue |
+              Select-Object -First 10 | ForEach-Object { $_.FullName }
+            $cudalog = Join-Path $env:USERPROFILE "AppData\Local\Temp\CUDA\cuda.log"
+            if (Test-Path $cudalog) { Get-Content $cudalog -Tail 40 }
             throw "nvcc not found after silent install"
           }
           "CUDA_PATH=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
