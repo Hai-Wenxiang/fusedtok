@@ -43,7 +43,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cuda installer download failed" }
           $size = (Get-Item $installer).Length
           if ($size -lt 20MB) { throw "installer too small: $size bytes" }
-          Start-Process -Wait -FilePath $installer -ArgumentList "-s","cudatoolkit_12.4"
+          $p = Start-Process -PassThru -Wait -FilePath $installer -ArgumentList "-s"
+          "installer exit code: $($p.ExitCode)"
           Remove-Item $installer -Force
           $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
           if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
