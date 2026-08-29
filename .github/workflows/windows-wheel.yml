@@ -37,12 +37,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $url = "https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda_12.4.1_12.4.1_551.78_windows_network.exe"
+          $url = "https://developer.download.nvidia.com/compute/cuda/12.4.1/network_installers/cuda_12.4.1_windows_network.exe"
           $installer = Join-Path $PWD "cuda_net.exe"
           curl.exe -L -f --retry 3 -o $installer $url
           if ($LASTEXITCODE -ne 0) { throw "cuda installer download failed" }
           $size = (Get-Item $installer).Length
-          if ($size -lt 50MB) { throw "cuda installer too small: $size bytes" }
+          if ($size -lt 20MB) { throw "installer too small: $size bytes" }
           Start-Process -Wait -FilePath $installer -ArgumentList "-s","cudatoolkit"
           Remove-Item $installer -Force
           $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
