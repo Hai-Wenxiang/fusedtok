@@ -2,13 +2,13 @@
 
 Timing uses CUDA events (wall-clock-free, WDDM-safe). Each configuration is
 warmed up, then measured over enough iterations to average out jitter.
-Results are printed as a table, dumped to JSON, and rendered into a grouped
-bar chart next to this script under ../docs/.
+Results are printed as a table, dumped to JSON, and rendered into ONE
+single-panel chart per GPU next to this script under ../docs/.
 
-The chart uses LINEAR time axes on two panels (fast ops / slow ops, split
-at the largest gap in the sorted times): every bar is annotated with its
-direct microsecond value and the per-op speedup, so no log-scale powers
-of ten have to be decoded by eye.
+The chart is a horizontal speedup chart sorted from best to worst: every
+bar carries the fusedtok and reference microsecond values at the bar end,
+a parity line marks 1.0x, and bar colors separate wins (green), ties
+(amber) and losses (red). One figure per GPU, no panels, no log axes.
 
 Usage:
     python benchmarks/bench.py [--iters N] [--out docs]
@@ -16,7 +16,9 @@ Usage:
 The torch "eager" references are the composite expressions an inference
 loop would write by hand (or the closest native op); RoPE's reference
 computes frequencies inside the timed region, matching fusedtok (no
-precomputed cos/sin cache on either side).
+precomputed cos/sin cache on either side). The attention references use
+PRE-EXPANDED heads (no repeat_interleave inside the timed region), the
+fair comparison for what fusedtok computes.
 """
 
 import argparse
@@ -170,9 +172,43 @@ def main():
                lambda: int(logits.argmax()),
                max(20, iters // 2))
 
+    # --- attention (decode step over a kv-cache; fresh-sequence prefill) ------
+    # references use PRE-EXPANDED heads (repeat_interleave outside the
+    # timed region) - the fair fight; fusedtok reads the GQA cache as-is
+    for cache_rows in [4096, 16384]:
+        b, hq, hkv, d = 1, 32, 8, 128
+        q = torch.randn(b, hq, d, device="cuda")
+        k = torch.randn(b, hkv, cache_rows, d, device="cuda")
+        v = torch.randn(b, hkv, cache_rows, d, device="cuda")
+        kk = k.repeat_interleave(hq // hkv, dim=1)
+        vv = v.repeat_interleave(hq // hkv, dim=1)
+        kv_bytes = (2 * k.numel() + q.numel() * 2) * 4
+        record("attn decode", f"T={cache_rows}",
+               lambda: fusedtok.attention_decode(q, k, v),
+               lambda: torch.nn.functional.scaled_dot_product_attention(
+                   q.unsqueeze(2), kk, vv).squeeze(2),
+               max(20, iters // 2), bytes_moved=kv_bytes)
+
+    b, hq, hkv, d, s = 1, 32, 8, 128, 1024
+    qp = torch.randn(b, hq, s, d, device="cuda")
+    kp = torch.randn(b, hkv, s, d, device="cuda")
+    vp = torch.randn(b, hkv, s, d, device="cuda")
+    kkp = kp.repeat_interleave(hq // hkv, dim=1)
+    vvp = vp.repeat_interleave(hq // hkv, dim=1)
+    record("attn prefill", f"S={s}",
+           lambda: fusedtok.attention_prefill(qp, kp, vp, causal=True),
+           lambda: torch.nn.functional.scaled_dot_product_attention(
+               qp, kkp, vvp, is_causal=True),
+           max(10, iters // 8))
+
     # --- outputs ------------------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
-    json_path = os.path.join(args.out, "benchmark_results.json")
+    # device-derived file slug: charts/JSONs from different GPUs never
+    # overwrite each other
+    dev_slug = (dev_name.lower()
+                .replace("geforce", "").replace("nvidia", "")
+                .replace(" ", ""))
+    json_path = os.path.join(args.out, f"benchmark_{dev_slug}.json")
     payload = {
         "device": dev_name,
         "torch": torch.__version__,
@@ -183,81 +219,59 @@ def main():
     with open(json_path, "w") as f:
         json.dump(payload, f, indent=2)
 
-    # Grouped bar chart with LINEAR axes, one group per op (largest
-    # shape). Times span two orders of magnitude, so the ops split into
-    # two panels at the largest gap of the sorted per-op maxima - each
-    # panel stays directly comparable in plain microseconds and every
-    # bar carries its value plus the speedup.
-    ops, ft_times, tr_times = [], [], []
+    # ONE single-panel chart per GPU (device name in the file name so
+    # different GPUs never overwrite each other): horizontal speedup
+    # bars sorted best-first, absolute microsecond values at the bar
+    # end, a 1.0x parity line, color-coded win/tie/loss. Each op is
+    # represented by its LAST measured shape (the suites above measure
+    # progressively larger shapes, so last = largest = the headline
+    # configuration).
+    rows_by_op = {}
     for row in RESULTS:
-        if row["shape"] in ("[4096x4096]", "[8192x4096]", "[131072]"):
-            label = row["op"]
-            if label not in ops:
-                ops.append(label)
-                ft_times.append(row["fusedtok_us"])
-                tr_times.append(row["torch_us"])
+        rows_by_op[row["op"]] = row          # last shape per op wins
+    ops = sorted(rows_by_op.values(),
+                 key=lambda r: r["speedup"], reverse=True)
 
-    # natural-break split: sort ops by their slower bar, cut where the
-    # ratio between consecutive maxima is largest (both sides non-empty)
-    order = sorted(range(len(ops)), key=lambda i: max(ft_times[i],
-                                                      tr_times[i]))
-    split_at = order[0]
-    best_ratio = 1.0
-    for a, b in zip(order, order[1:]):
-        hi = max(ft_times[b], tr_times[b])
-        lo = max(ft_times[a], tr_times[a])
-        if hi / lo > best_ratio:
-            best_ratio = hi / lo
-            split_at = b
-    slow_idx = set(i for i in order[order.index(split_at):])
-    groups = [("slow ops (linear us)", [i for i in range(len(ops))
-                                         if i in slow_idx]),
-              ("fast ops (linear us)", [i for i in range(len(ops))
-                                        if i not in slow_idx])]
+    n = len(ops)
+    fig, ax = plt.subplots(figsize=(11.5, 0.42 * n + 1.6), dpi=150)
+    y = np.arange(n)[::-1]
+    speedups = [r["speedup"] for r in ops]
+    colors = ["#16a34a" if sp >= 1.05 else
+              ("#d97706" if sp >= 0.9 else "#dc2626") for sp in speedups]
+    bars = ax.barh(y, speedups, height=0.62, color=colors, zorder=3)
 
-    # output filename derives from the actual device so charts from
-    # different GPUs never overwrite each other
-    dev_slug = dev_name.lower().replace(" ", "").replace("geforce", "")
-    fig, axes = plt.subplots(2, 1, figsize=(11.5, 9.5), dpi=150)
-    width = 0.38
-    for ax, (title, idxs) in zip(axes, groups):
-        if not idxs:
-            ax.set_visible(False)
-            continue
-        x = np.arange(len(idxs))
-        fts = [ft_times[i] for i in idxs]
-        trs = [tr_times[i] for i in idxs]
-        b1 = ax.bar(x - width / 2, fts, width, label="fusedtok",
-                    color="#3b82f6")
-        b2 = ax.bar(x + width / 2, trs, width, label="PyTorch eager",
-                    color="#9ca3af")
-        ax.set_ylabel("time per call (us)")
-        ax.set_title(title)
-        ax.set_xticks(x)
-        ax.set_xticklabels([ops[i] for i in idxs], rotation=18, ha="right")
-        # annotate every bar with its direct microsecond value; the
-        # speedup badge above each pair carries the ratio
-        for bars, vals in ((b1, fts), (b2, trs)):
-            for rect, v in zip(bars, vals):
-                ax.annotate(f"{v:.0f}",
-                            xy=(rect.get_x() + rect.get_width() / 2, v),
-                            xytext=(0, 2), textcoords="offset points",
-                            ha="center", fontsize=7)
-        # speedup badge centered above each op pair
-        for j, i in enumerate(idxs):
-            sp = tr_times[i] / ft_times[i]
-            ax.annotate(f"{sp:.2f}x",
-                        xy=(j, max(ft_times[i], tr_times[i])),
-                        xytext=(0, 16), textcoords="offset points",
-                        ha="center", fontsize=8, fontweight="bold",
-                        color="#166534" if sp >= 1.05 else
-                        ("#92400e" if sp >= 0.9 else "#991b1b"))
-        ax.legend(loc="upper right", fontsize=8)
-        ax.grid(axis="y", alpha=0.3)
-        ax.margins(y=0.22)
-    fig.suptitle(f"fusedtok vs PyTorch eager - {dev_name} "
-                 f"(float32; largest shape per op)", y=0.995)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    # absolute values at each bar end (or inside when the bar is long)
+    x_max = max(max(speedups) * 1.06, 1.35)
+    for yi, r, sp in zip(y, ops, speedups):
+        label = (f"{r['fusedtok_us']:.0f} vs {r['torch_us']:.0f} us"
+                 f"  ({r['shape']})")
+        inside = sp > x_max * 0.55
+        ax.annotate(label,
+                    xy=(sp, yi),
+                    xytext=(6 if not inside else -6, 0),
+                    textcoords="offset points",
+                    va="center",
+                    ha="left" if not inside else "right",
+                    fontsize=8.5,
+                    color="#111827",
+                    zorder=4)
+
+    ax.axvline(1.0, color="#6b7280", linewidth=1.1,
+               linestyle="--", zorder=2)
+    ax.annotate("parity (1.0x)", xy=(1.0, y[-1] - 0.55),
+                fontsize=8, color="#6b7280", ha="center")
+    ax.set_yticks(y)
+    ax.set_yticklabels([r["op"] for r in ops], fontsize=9.5)
+    ax.set_xlabel("speedup vs PyTorch reference (linear, higher is better)")
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(-0.9, n - 0.1 + 0.55)
+    ax.set_title(f"fusedtok vs PyTorch reference - {dev_name} "
+                 f"(float32; largest shape per op; value = fusedtok vs ref)",
+                 fontsize=11)
+    ax.grid(axis="x", alpha=0.3, zorder=1)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
     png_path = os.path.join(args.out, f"benchmark_{dev_slug}.png")
     fig.savefig(png_path)
 
