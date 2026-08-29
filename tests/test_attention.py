@@ -177,6 +177,55 @@ class TestCuda:
                 fusedtok.attention_decode(q, k, v, lens, cuda=True), first)
 
 
+@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
+class TestSplitPath:
+    """Long caches take the flash-decoding split path (per-slice partials
+    in a cached workspace + reduce). The heuristic slices at >= 512 rows
+    for every templated GQA group width; these pin it against the float64
+    reference with lens crossing slice boundaries."""
+
+    @pytest.mark.parametrize("group", [1, 2, 4, 8, 16])
+    @pytest.mark.parametrize("t", [2048, 5000])       # 2^k and ragged
+    def test_long_cache_matches_reference(self, group, t):
+        rng = np.random.default_rng(group * 977 + t)
+        hkv, d = 4, 128
+        hq = hkv * group
+        q, k, v, _ = make_case(rng, 1, hq, hkv, t, d, False)
+        y = fusedtok.attention_decode(q, k, v, cuda=True)
+        np.testing.assert_allclose(y, ref_decode(q, k, v, None),
+                                   rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize("len_after_first_slice", [0, 1, 293])
+    def test_lens_across_slice_boundaries(self, len_after_first_slice):
+        # slice boundaries fall at ~len/14 on this shape; a length just
+        # past the first boundary leaves one dense slice, one stub and
+        # empty remainder slices - all must merge to the reference
+        rng = np.random.default_rng(4000 + len_after_first_slice)
+        t, hq, hkv, d = 4096, 32, 8, 64
+        q, k, v, _ = make_case(rng, 2, hq, hkv, t, d, False)
+        lens = np.array([t, 400 + len_after_first_slice], dtype=np.int32)
+        y = fusedtok.attention_decode(q, k, v, lens, cuda=True)
+        np.testing.assert_allclose(y, ref_decode(q, k, v, lens),
+                                   rtol=1e-4, atol=1e-5)
+
+    def test_batched_long_cache(self):
+        # a bigger batch shrinks the slice count toward 1; both regimes
+        # must produce the same math as the reference
+        rng = np.random.default_rng(77)
+        b, hq, hkv, t, d = 6, 32, 8, 4096, 128
+        q, k, v, lens = make_case(rng, b, hq, hkv, t, d, True)
+        y = fusedtok.attention_decode(q, k, v, lens, cuda=True)
+        np.testing.assert_allclose(y, ref_decode(q, k, v, lens),
+                                   rtol=1e-4, atol=1e-5)
+
+    def test_16k_cache(self):
+        rng = np.random.default_rng(88)
+        q, k, v, _ = make_case(rng, 1, 32, 8, 16384, 128, False)
+        y = fusedtok.attention_decode(q, k, v, cuda=True)
+        np.testing.assert_allclose(y, ref_decode(q, k, v, None),
+                                   rtol=1e-4, atol=1e-5)
+
+
 @pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
                     reason="no torch/GPU")
 class TestTorchZeroCopy:
@@ -266,5 +315,41 @@ class TestTorchZeroCopy:
         g.replay()
         torch.cuda.synchronize()
         ref = fusedtok.attention_decode(q, k, v, lens).cpu().numpy()
+        np.testing.assert_allclose(y.cpu().numpy(), ref, rtol=1e-5,
+                                   atol=1e-6)
+
+    def test_graph_capture_replay_split_path(self):
+        # long caches capture the TWO-KERNEL split path with its cached
+        # workspace (pointers baked into the graph stay valid because
+        # the workspace is process-cached per shape)
+        from fusedtok import _fusedtok
+
+        b, hq, hkv, t, d = 1, 32, 8, 4096, 128
+        q = torch.randn(b, hq, d, device="cuda")
+        k = torch.randn(b, hkv, t, d, device="cuda")
+        v = torch.randn(b, hkv, t, d, device="cuda")
+        y = torch.empty(b, hq, d, device="cuda")
+
+        def run():
+            _fusedtok.attention_decode_launch(
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), 0,
+                y.data_ptr(), b, hq, hkv, t, d,
+                torch.cuda.current_stream().cuda_stream)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                run()                      # populates the workspace cache
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run()
+        k.mul_(1.5)                        # replay must recompute
+        v.mul_(-0.5)
+        y.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        ref = fusedtok.attention_decode(q, k, v).cpu().numpy()
         np.testing.assert_allclose(y.cpu().numpy(), ref, rtol=1e-5,
                                    atol=1e-6)

@@ -35,7 +35,7 @@ traffic and launch overhead.
 | ✅ | decode_step | the whole decode step fused: penalty -> temperature -> nucleus sample, one call, one readback |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
 | ✅ | qgemm | INT8 matmul, int32-exact: tensor-core IMMA GEMM + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
-| ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: per-warp online softmax, per-sequence lengths, one kernel launch |
+| ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths |
 
 ## Install
 

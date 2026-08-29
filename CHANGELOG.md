@@ -11,20 +11,32 @@ adheres to [Semantic Versioning](https://semver.org/).
   (decode step) causal attention with GQA over a contiguous
   [B, Hkv, T, D] kv-cache - `out = softmax(q . K^T / sqrt(D)) . V` with
   q head h attending via kv head h // (Hq/Hkv) (contiguous groups; Hq ==
-  Hkv is plain MHA). One block per (batch, q head); the block's 8 warps
-  stride the key rows, each keeping a running ONLINE softmax (max,
-  denominator, [D] accumulator) in registers, and a shared-memory merge
-  folds the warp partials - scores are never materialized, q/K/V are
-  read exactly once, and the whole step is one stream-ordered,
-  CUDA-graph-capturable kernel launch. Optional per-sequence `lens`
-  mark valid cache rows so variable-length batches share one cache
-  tensor (padding rows are ignored; a zero-length sequence produces a
-  zero output row). float32; dim multiple of 4, at most 512.
+  Hkv is plain MHA). Two strategies behind one launcher: short caches /
+  saturated grids take a single kernel (one block per (batch, q head),
+  8 warps striding the rows with a running ONLINE softmax each, merged
+  in shared memory); long caches (>= ~512 rows) take a flash-decoding
+  split path - the sequence is sliced, stage-1 blocks (one per
+  (batch, kv head, slice)) compute the partials of ALL q heads of the
+  GQA group over their slice in one pass (k/v rows read once, reused
+  across the group) into a process-cached workspace, and stage-2 blocks
+  max-rescale-merge the partials. Scores never materialize; q/K/V are
+  read exactly once. Stream-ordered and CUDA-graph capturable on both
+  paths (workspace allocation happens outside captures; a first call
+  racing an active capture falls back to the single-kernel path).
+  Optional per-sequence `lens` mark valid cache rows so
+  variable-length batches share one cache tensor (padding rows are
+  ignored; a zero-length sequence produces a zero output row). float32;
+  dim multiple of 4, at most 512. RTX 3060 vs pre-expanded
+  torch SDPA (Lq=1): 4.2x @ T=512, 6.5x @ 4k, 9.3x @ 32k (163 GB/s
+  effective); 13.3x against the expand+SDPA composite most code
+  actually writes.
 - tests/test_attention.py: GQA mapping (constant-V probe), float64
   reference parity across shapes (single key, odd T, empty cache, long
   4096-row cache, D=4..256), padding-poisoning, error contract, staged
   and zero-copy paths, an independent torch repeat_interleave
-  crosscheck, and graph capture-replay with mutation.
+  crosscheck, graph capture-replay with mutation on both kernel paths,
+  and split-path pins for every templated group width (1/2/4/8/16),
+  lens crossing slice boundaries, batched long caches and 16k rows.
 
 ## [0.4.1] - 2026-08-29
 
