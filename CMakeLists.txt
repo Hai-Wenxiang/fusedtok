@@ -38,6 +38,7 @@ pybind11_add_module(_fusedtok
     src/sampling.cu
     src/quantize.cu
     src/qgemm.cu
+    src/attention.cu
     src/bindings.cpp)
 target_include_directories(_fusedtok PRIVATE include src)
 # Static CUDA runtime: the wheel then carries no libcudart.so dependency,

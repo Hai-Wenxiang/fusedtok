@@ -59,6 +59,7 @@ __all__ = [
     "qadd_int8",
     "qgemm",
     "decode_step",
+    "attention_decode",
 ]
 
 
@@ -461,6 +462,76 @@ def rope(q, k=None, *, theta=10000.0, pos_offset=0, neox=False, cuda=False):
         if k_res is not None:
             k_res = _numpy_to_torch_like(k_res, k)
     return q_res, k_res
+
+
+# ---------------------------------------------------------------------------
+# attention (decode step)
+# ---------------------------------------------------------------------------
+
+
+def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
+    """Single-token (decode step) causal attention with GQA:
+
+    ``out[b, h] = softmax(q[b,h] . K[b,kv(h)]^T / sqrt(D)) . V[b,kv(h)]``
+
+    q: [B, Hq, D] (the new token's queries); k_cache / v_cache:
+    [B, Hkv, T, D] contiguous kv-cache; optional lens: [B] ints giving
+    each sequence's valid cache length (<= T; None = all rows valid, so
+    rows past lens[b] are treated as padding and variable-length batches
+    share one cache tensor). q head h attends with kv head
+    ``h // (Hq // Hkv)`` - contiguous GQA groups; ``Hq == Hkv`` is plain
+    MHA. Sequences with length 0 produce zero output rows. float32 only.
+    """
+    if _device_path(q, cuda) == "torch-cuda":
+        for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
+            _check_torch_f32(t, name)
+        if q.ndim != 3 or k_cache.ndim != 4 or v_cache.ndim != 4:
+            raise ValueError("q must be [B, Hq, D]; k/v caches [B, Hkv, T, D]")
+        b, hq, d = q.shape
+        b2, hkv, t_rows, d2 = k_cache.shape
+        if (b2, d2) != (b, d) or v_cache.shape != k_cache.shape:
+            raise ValueError("k_cache/v_cache must match q's batch and dim")
+        if hq % hkv:
+            raise ValueError("q heads must be a multiple of kv heads")
+        lens_ptr = None
+        if lens is not None:
+            if _is_torch(lens):
+                lt = lens
+                if not lt.is_cuda:
+                    lt = lt.to(q.device)
+                if lt.dtype is not torch.int32:
+                    lt = lt.to(torch.int32)
+                lt = lt.contiguous()
+            else:
+                lt = torch.as_tensor(lens, dtype=torch.int32,
+                                     device=q.device)
+            if lt.ndim != 1 or lt.numel() != b:
+                raise ValueError("lens must be 1-D with batch entries")
+            if lt.numel() and (int(lt.min()) < 0 or int(lt.max()) > t_rows):
+                raise ValueError("lens entries must be in [0, T]")
+            lens_ptr = lt.data_ptr()
+        out = torch.empty((b, hq, d), dtype=torch.float32, device=q.device)
+        if b * hq > 0:
+            _fusedtok.attention_decode_launch(
+                q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+                lens_ptr, out.data_ptr(), b, hq, hkv, t_rows, d,
+                _cuda_stream())
+        return out
+    arr_q = _as_numpy(q, "q")
+    arr_k = _as_numpy(k_cache, "k_cache")
+    arr_v = _as_numpy(v_cache, "v_cache")
+    if arr_q.ndim != 3 or arr_k.ndim != 4 or arr_v.ndim != 4:
+        raise ValueError("q must be [B, Hq, D]; k/v caches [B, Hkv, T, D]")
+    b, hq, d = arr_q.shape
+    b2, hkv, t_rows, d2 = arr_k.shape
+    if (b2, d2) != (b, d) or arr_v.shape != arr_k.shape:
+        raise ValueError("k_cache/v_cache must match q's batch and dim")
+    arr_lens = None if lens is None else np.ascontiguousarray(
+        np.asarray(lens, dtype=np.int32))
+    call = (_fusedtok.attention_decode if _device_path(q, cuda) == "staged"
+            else _fusedtok.attention_decode_cpu)
+    res = call(arr_q, arr_k, arr_v, arr_lens, b, hq, hkv, t_rows, d)
+    return _numpy_to_torch_like(res, q) if _is_torch(q) else res
 
 
 # ---------------------------------------------------------------------------

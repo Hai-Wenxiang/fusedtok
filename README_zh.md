@@ -35,6 +35,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | decode_step | 整个解码步融合：惩罚 -> 温度 -> 核采样，一次调用一次回读 |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称 per-tensor INT8，融合反量化-加-重量化 |
 | ✅ | qgemm | INT8 矩阵乘，int32 精确：tensor-core IMMA GEMM + 每 warp 一行的 GEMV（M=1 解码；比 fp16 投影快 2 倍） |
+| ✅ | attention_decode | 解码步因果注意力：GQA + 连续 kv-cache，每 warp 一路在线 softmax、支持每序列长度，单次 kernel 启动 |
 
 ## 安装
 

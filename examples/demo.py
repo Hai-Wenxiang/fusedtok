@@ -247,6 +247,29 @@ def main():
             ALL_OK &= ok
 
     print(SEP)
+    print("attention: decode step, GQA + kv-cache + per-sequence lens")
+    q = rng.standard_normal((2, 8, 16)).astype(np.float32)     # B=2 Hq=8 D=16
+    k = rng.standard_normal((2, 2, 6, 16)).astype(np.float32)  # Hkv=2 T=6
+    v = rng.standard_normal((2, 2, 6, 16)).astype(np.float32)
+    lens = np.array([6, 3], dtype=np.int32)
+    ref = np.zeros((2, 8, 16), dtype=np.float64)
+    for bi, length in enumerate(lens):
+        for h in range(8):
+            kv = h // 4                                        # GQA group 4
+            s = k[bi, kv, :length].astype(np.float64) @ q[bi, h] / 4.0
+            p = np.exp(s - s.max())
+            ref[bi, h] = (p / p.sum()) @ v[bi, kv, :length].astype(np.float64)
+    out = fusedtok.attention_decode(q, k, v, lens, cuda=True) if have_cuda \
+        else fusedtok.attention_decode(q, k, v, lens)
+    check("gqa + lens vs eager", out, ref, tol=1e-4)
+    if have_cuda and HAS_TORCH:
+        qt, kt, vt = (torch.from_numpy(x).cuda() for x in (q, k, v))
+        lt = torch.from_numpy(lens).cuda()
+        yt = fusedtok.attention_decode(qt, kt, vt, lt)
+        torch.cuda.synchronize()
+        check("torch cuda zero-copy", yt.cpu().numpy(), ref, tol=1e-4)
+
+    print(SEP)
     print("ALL PASS" if ALL_OK else "SOME CHECKS FAILED")
     return 0 if ALL_OK else 1
 

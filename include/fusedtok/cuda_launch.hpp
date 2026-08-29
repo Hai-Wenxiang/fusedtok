@@ -107,6 +107,19 @@ void repetition_penalty_launch(const float* logits, const long long* ids,
                                int n, int m, float penalty, float* y, std::uintptr_t stream = 0);
 
 
+// --- attention (decode step) -------------------------------------------------
+// Single-token causal attention with GQA over a contiguous kv-cache:
+// out[B,Hq,D] = softmax(q . K^T / sqrt(D)) . V with q heads in contiguous
+// groups over kv heads (h -> h*Hkv/Hq). k/v: [B,Hkv,T,D]; lens may be null
+// (all rows valid) else per-sequence valid lengths in [0, T] (zero length
+// writes zero rows). dim: multiple of 4, at most 512. One kernel launch,
+// no allocations/syncs: stream-ordered and CUDA-graph capturable.
+void attention_decode_launch(const float* q, const float* k, const float* v,
+                             const int* lens, float* out,
+                             int batch, int q_heads, int kv_heads,
+                             int cache_rows, int dim,
+                             std::uintptr_t stream = 0);
+
 // --- bf16 variants: float32 compute, bf16 storage ---------------------------
 // Weight/bias parameters stay float32 (norm weights are commonly kept fp32
 // in bf16 checkpoints). Available for: elementwise unary/binary, norms,

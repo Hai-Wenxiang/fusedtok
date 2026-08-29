@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- attention_decode(q, k_cache, v_cache, lens=None): single-token
+  (decode step) causal attention with GQA over a contiguous
+  [B, Hkv, T, D] kv-cache - `out = softmax(q . K^T / sqrt(D)) . V` with
+  q head h attending via kv head h // (Hq/Hkv) (contiguous groups; Hq ==
+  Hkv is plain MHA). One block per (batch, q head); the block's 8 warps
+  stride the key rows, each keeping a running ONLINE softmax (max,
+  denominator, [D] accumulator) in registers, and a shared-memory merge
+  folds the warp partials - scores are never materialized, q/K/V are
+  read exactly once, and the whole step is one stream-ordered,
+  CUDA-graph-capturable kernel launch. Optional per-sequence `lens`
+  mark valid cache rows so variable-length batches share one cache
+  tensor (padding rows are ignored; a zero-length sequence produces a
+  zero output row). float32; dim multiple of 4, at most 512.
+- tests/test_attention.py: GQA mapping (constant-V probe), float64
+  reference parity across shapes (single key, odd T, empty cache, long
+  4096-row cache, D=4..256), padding-poisoning, error contract, staged
+  and zero-copy paths, an independent torch repeat_interleave
+  crosscheck, and graph capture-replay with mutation.
+
 ## [0.4.1] - 2026-08-29
 
 ### Added

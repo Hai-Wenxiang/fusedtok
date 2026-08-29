@@ -31,6 +31,7 @@
 #include "fusedtok/activations.hpp"
 #include "fusedtok/softmax.hpp"
 #include "fusedtok/layernorm.hpp"
+#include "fusedtok/attention.hpp"
 #include "fusedtok/cuda_launch.hpp"
 
 namespace py = pybind11;
@@ -858,6 +859,85 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("ids"), py::arg("n"), py::arg("m"),
        py::arg("penalty") = 1.0, py::arg("p") = 0.9, py::arg("t") = 1.0,
        py::arg("seed") = 0, py::arg("stream") = 0);
+
+    // ==================================================================
+    // attention (decode step): GQA over a contiguous kv-cache
+    // ==================================================================
+    using IArray = py::array_t<int, py::array::c_style | py::array::forcecast>;
+
+    m.def("attention_decode_cpu", [](FArray q, FArray k, FArray v,
+                                     py::object lens, int batch, int hq,
+                                     int hkv, int t_seq, int dim) {
+        if (q.size() != (py::ssize_t)batch * hq * dim ||
+            k.size() != (py::ssize_t)batch * hkv * t_seq * dim ||
+            v.size() != (py::ssize_t)batch * hkv * t_seq * dim)
+            throw std::invalid_argument("attention operand size mismatch");
+        std::vector<int> lv;
+        const std::vector<int>* lp = nullptr;
+        if (!lens.is_none()) {
+            IArray l_arr = lens;
+            if (l_arr.size() != (py::ssize_t)batch)
+                throw std::invalid_argument("lens must have batch entries");
+            lv.assign(l_arr.data(), l_arr.data() + l_arr.size());
+            lp = &lv;
+        }
+        auto out = ft::attention_decode_cpu(to_vec(q), to_vec(k), to_vec(v),
+                                            lp, batch, hq, hkv, t_seq, dim);
+        return wrap_vec(out, {(py::ssize_t)batch, (py::ssize_t)hq,
+                              (py::ssize_t)dim});
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lens"),
+       py::arg("batch"), py::arg("hq"), py::arg("hkv"), py::arg("t_seq"),
+       py::arg("dim"));
+
+    m.def("attention_decode", [](FArray q, FArray k, FArray v,
+                                 py::object lens, int batch, int hq,
+                                 int hkv, int t_seq, int dim) {
+        if (q.size() != (py::ssize_t)batch * hq * dim ||
+            k.size() != (py::ssize_t)batch * hkv * t_seq * dim ||
+            v.size() != (py::ssize_t)batch * hkv * t_seq * dim)
+            throw std::invalid_argument("attention operand size mismatch");
+        const bool has_lens = !lens.is_none();
+        IArray l_arr;
+        if (has_lens) {
+            l_arr = lens;
+            if (l_arr.size() != (py::ssize_t)batch)
+                throw std::invalid_argument("lens must have batch entries");
+        }
+        const size_t kv_bytes = (size_t)batch * hkv * t_seq * dim * 4;
+        const size_t out_n = (size_t)batch * hq * dim;
+        py::array_t<float> out(
+            std::vector<py::ssize_t>{batch, hq, dim});
+        if (out_n == 0) return out;
+        DevBuf dq(q.size() * 4), dk(kv_bytes), dv(kv_bytes),
+              dl(has_lens ? (size_t)batch * 4 : 0), dy(out_n * 4);
+        h2d(dq.get(), q.data(), q.size() * 4);
+        h2d(dk.get(), k.data(), kv_bytes);
+        h2d(dv.get(), v.data(), kv_bytes);
+        if (has_lens) h2d(dl.get(), l_arr.data(), (size_t)batch * 4);
+        ft::attention_decode_launch(
+            dq.fget(), dk.fget(), dv.fget(),
+            has_lens ? static_cast<const int*>(dl.get()) : nullptr,
+            dy.fget(), batch, hq, hkv, t_seq, dim);
+        d2h(out.mutable_data(), dy.get(), out_n * 4);
+        sync_device("attention decode kernel");
+        return out;
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lens"),
+       py::arg("batch"), py::arg("hq"), py::arg("hkv"), py::arg("t_seq"),
+       py::arg("dim"));
+
+    m.def("attention_decode_launch", [](py::int_ q, py::int_ k, py::int_ v,
+                                        py::object lens, py::int_ out,
+                                        int batch, int hq, int hkv,
+                                        int t_seq, int dim,
+                                        std::uintptr_t stream) {
+        const int* lp = nullptr;
+        if (!lens.is_none())
+            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        ft::attention_decode_launch(df(q), df(k), df(v), lp, dfm(out),
+                                    batch, hq, hkv, t_seq, dim, stream);
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lens"),
+       py::arg("out"), py::arg("batch"), py::arg("hq"), py::arg("hkv"),
+       py::arg("t_seq"), py::arg("dim"), py::arg("stream") = 0);
 
     m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
                                    unsigned long long seed,
