@@ -88,7 +88,7 @@ jobs:
           if ($size -lt 20MB) { throw "installer too small: $size bytes" }
           # documented enterprise silent mode: toolkit components only;
           # ABSOLUTE path - Start-Process refuses relative .\ paths here
-          Start-Process -Wait -FilePath $installer -ArgumentList "-s","cudatoolkit"
+          Start-Process -Wait -FilePath $installer -ArgumentList "-s","cudatoolkit_12.4"
           Remove-Item $installer -Force
           $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
           if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
