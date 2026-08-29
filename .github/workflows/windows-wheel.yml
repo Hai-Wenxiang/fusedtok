@@ -52,7 +52,7 @@ jobs:
           }
           "CUDA_PATH=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$env:CUDA_PATH\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          nvcc --version
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
 
       - name: Build the wheel
         shell: pwsh
