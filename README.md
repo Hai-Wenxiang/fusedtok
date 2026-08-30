@@ -5,9 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/pyproject.toml)
 
-**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU and friends,
-with **zero-copy torch tensor support**: up to **6.2x faster than PyTorch eager**
-(RoPE, RTX 3060, see [Benchmarks](#benchmarks)).
+**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU / attention
+decode and friends, with **zero-copy torch tensor support**: up to
+**9.3x faster than PyTorch SDPA** (attention decode, RTX 3060, see
+[Benchmarks](#benchmarks)).
 
 **中文文档请看 [README_zh.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README_zh.md)** | English below.
 
@@ -44,9 +45,9 @@ traffic and launch overhead.
 pip install fusedtok
 ```
 
-Prebuilt Linux x86_64 wheels (manylinux, built with CUDA 12.4) are on PyPI.
-On Windows (or any platform without a matching wheel) pip builds from
-source automatically:
+Prebuilt wheels on PyPI (built with CUDA 12.4): **Linux x86_64** (manylinux,
+cp310) and **Windows x86_64** (cp312). On other platforms or Python versions
+pip builds from source automatically:
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
@@ -110,6 +111,15 @@ yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch tensor
 # RoPE with kv-cache position offset, NeoX (LLaMA-HF) layout
 q = torch.randn(1, 4096, device="cuda")          # new token only
 q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
+
+# attention over a GQA kv-cache: one call per decode step, no score
+# materialization, variable-length batches share one cache tensor
+out = fusedtok.attention_decode(
+    q_heads,                                    # [B, Hq, D] new token
+    k_cache, v_cache,                           # [B, Hkv, T, D]
+    lens=torch.tensor([1023, 512], dtype=torch.int32, device="cuda"))
+# fresh-sequence prefill (causal by default; convenience path)
+ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
 
 # sampling side: the whole decode step in one fused call
 token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,

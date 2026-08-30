@@ -5,9 +5,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/pyproject.toml)
 
-**面向 LLM 推理的融合 CUDA 算子库** —— RMSNorm / RoPE / SwiGLU 等，支持
-**torch 张量零拷贝**：对比 PyTorch eager 最高 **6.2 倍加速**（RoPE，
-RTX 3060，见[性能基准](#性能基准)）。
+**面向 LLM 推理的融合 CUDA 算子库** —— RMSNorm / RoPE / SwiGLU / 解码注意力
+等，支持**torch 张量零拷贝**：对比 PyTorch SDPA 最高 **9.3 倍加速**
+（attention decode，RTX 3060，见[性能基准](#性能基准)）。
 
 **English version: [README.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README.md)**
 
@@ -44,8 +44,9 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 pip install fusedtok
 ```
 
-PyPI 提供 Linux x86_64 预编译 wheel（manylinux，CUDA 12.4 构建）。
-Windows（或无匹配 wheel 的平台）下 pip 会自动从源码构建：
+PyPI 提供预编译 wheel（CUDA 12.4 构建）：**Linux x86_64**（manylinux，
+cp310）与 **Windows x86_64**（cp312）。其他平台或 Python 版本 pip 会自动
+从源码构建：
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
@@ -105,6 +106,15 @@ yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch 张量
 # 带 kv-cache 位置偏移的 RoPE，NeoX（LLaMA-HF）布局
 q = torch.randn(1, 4096, device="cuda")          # 只传入新 token
 q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
+
+# GQA kv-cache 上的注意力：解码步一次调用，分数不落盘，
+# 变长 batch 共享同一份 cache 张量
+out = fusedtok.attention_decode(
+    q_heads,                                    # [B, Hq, D] 新 token
+    k_cache, v_cache,                           # [B, Hkv, T, D]
+    lens=torch.tensor([1023, 512], dtype=torch.int32, device="cuda"))
+# 新序列 prefill（默认因果；便捷路径）
+ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
 
 # 采样侧：整个解码步一次融合调用
 token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,

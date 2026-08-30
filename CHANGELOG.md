@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- docs: README headline speedup refreshed to the 0.5.0 attention numbers
+  (9.3x vs SDPA at decode; the old 6.2x RoPE line predated attention);
+  install notes now mention the PyPI Windows wheel (cp312); the usage
+  tour covers attention_decode / attention_prefill; both languages.
+- CONTRIBUTING new-kernel checklist: two v0.5 lessons added (runtime
+  loop bounds demote register arrays to local memory - a measured 7x;
+  full-warp-mask shuffles deadlock under warp divergence).
+
 ## [0.5.0] - 2026-08-30
 
 ### Added
