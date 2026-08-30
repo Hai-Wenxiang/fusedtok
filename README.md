@@ -29,7 +29,7 @@ traffic and launch overhead.
 | ✅ | Softmax (row-wise) | numerically stable |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
 | ✅ | add / mul | elementwise binary (fused add+residual pattern) |
-| ✅ | top-k / top-p (nucleus) | arrival-ticket radix + early-exit compaction, replayed from a cached CUDA graph; deterministic ties (1.5x vs torch/CUB @131k on a 36-SM RTX 5060 Ti) |
+| ✅ | top-k / top-p (nucleus) | arrival-ticket radix + early-exit compaction, replayed from a cached CUDA graph; deterministic ties (1.5x vs torch/CUB @131k k=50, parity-to-winning across the whole k range on both test GPUs) |
 | ✅ | argmax / temperature | greedy decoding helpers |
 | ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, global-mass threshold |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
@@ -177,7 +177,8 @@ timed region). Largest shape per op; full data:
 | RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
 | RMSNorm (+residual) | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
 | SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
-| top-k (k=50) | [131072] | 80 µs | 127 µs | **1.59x** |
+| top-k (k=50) | [131072] | 79 µs | 137 µs | **1.75x** |
+| top-k (k=4096, mid-k) | [131072] | 113 µs | 127 µs | 1.12x |
 | LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
@@ -201,6 +202,7 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 | RMSNorm (+residual) | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |
+| top-k (k=4096, mid-k) | [131072] | 50 µs | 54 µs (CUB) | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x (incl. host readback) |
 | int8 qgemm (IMMA) | [4096×4096×4096] | 2063 µs (66.6 TOPS) | 800 µs (cuBLASLt) | 0.39x (honest) |
@@ -221,8 +223,10 @@ Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
 intermediate tensors through global memory. The v0.4 selection pipeline
 (arrival-ticket radix rounds + early-exit compaction, replayed from a
 cached CUDA graph) beats torch's CUB radix select at small k on both
-GPUs; mid-range k (2048..n) stays at or below parity — honest numbers,
-a pipelined tensor-core sort stays future work. attention_decode wins
+GPUs; the v1.0 retune (in-block-sort threshold and sort chunk both
+dropped 2048 -> 1024 - a single block bitonic-sorting 2048 keys was the
+whole mid-k regression) brings the mid-k window to parity-or-winning as
+well (k=4096 @131k: 1.12x / 1.09x). attention_decode wins
 big at decode (one launch streams the GQA cache once at up to ~157 GB/s
 effective while SDPA pays head expansion or small-query inefficiency);
 attention_prefill is the honest convenience path at ~0.45x of SDPA's

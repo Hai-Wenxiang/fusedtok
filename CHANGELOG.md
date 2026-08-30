@@ -41,6 +41,21 @@ adheres to [Semantic Versioning](https://semver.org/).
   cuBLASLt (torch._int_mm); the honest gap to cuBLASLt (~83 TOPS, about
   82% of the sm_86 dense-INT8 peak) is analyzed in the README
   performance section.
+- top-k selection retuned for the mid-k range (v0.4's documented weak
+  spot): the early-exit compaction threshold and the per-block sort
+  chunk BOTH drop from 2048 to 1024. The entire regression window was a
+  single block bitonic-sorting 2048 keys - every SM but one idle - and
+  for k > 1024 the parallel chunk+merge tail does the same work spread
+  across the device. Measured on the canonical 3-round protocol at
+  n=131072, k=4096: RTX 3060 143 -> 113 us (0.87-0.93x -> 1.12x vs
+  torch.topk), RTX 5060 Ti 0.79-0.84x -> 1.09x; large k improves too
+  (k=16384 on the 3060: 1.59x -> 2.12x), small k unchanged. The first
+  fused-kernel attempt (chunk sort + merge ladder + decode in ONE
+  launch behind arrival-ticket barriers) measured SLOWER - inside the
+  cached graph the per-kernel savings are ~1-2us while the 16-block
+  co-residency cap cuts the ladder's natural parallelism - and was
+  reverted; the one measurement that mattered was the sort's serial
+  span.
 
 ### Fixed
 - qgemm with K == 0 zero-fills the output on every path (the v0.4

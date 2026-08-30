@@ -28,7 +28,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | Softmax（按行） | 数值稳定版 |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | 逐元素 |
 | ✅ | add / mul | 逐元素二元（融合加残差模式） |
-| ✅ | top-k / top-p（核采样） | 到达票据 radix + 早退压缩，缓存 CUDA 图整管线回放；平局取先下标（36 SM 的 RTX 5060 Ti 上 131k 词表 1.5x vs torch/CUB） |
+| ✅ | top-k / top-p（核采样） | 到达票据 radix + 早退压缩，缓存 CUDA 图整管线回放；平局取先下标（131k k=50 上 1.5x vs torch/CUB，双卡全 k 范围持平到领先） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
 | ✅ | sample_topp | 融合核采样：softmax -> top-p -> 种子抽取，全局质量阈值 |
 | ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
@@ -168,7 +168,8 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
 | RMSNorm（含残差） | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
 | SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
-| top-k (k=50) | [131072] | 80 µs | 127 µs | **1.59x** |
+| top-k (k=50) | [131072] | 79 µs | 137 µs | **1.75x** |
+| top-k（k=4096，中段 k） | [131072] | 113 µs | 127 µs | 1.12x |
 | LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
@@ -192,6 +193,7 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | RMSNorm（含残差） | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.50x** |
+| top-k（k=4096，中段 k） | [131072] | 50 µs | 54 µs（CUB） | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x（含主机回读） |
 | int8 qgemm（IMMA） | [4096×4096×4096] | 2063 µs（66.6 TOPS） | 800 µs（cuBLASLt） | 0.39x（诚实） |
@@ -209,9 +211,10 @@ Blackwell（sm_120）驱动上验证 JIT 运行正确。
 
 融合算子（RoPE / RMSNorm / SwiGLU）优势明显：eager 模式的中间张量要在显存间
 来回搬运。v0.4 选择管线（到达票据 radix 轮 + 早退压缩，缓存 CUDA 图整管线
-回放）在两张卡上小 k 场景均超过 torch 的 CUB radix select；中等 k
-（2048..n）仍持平或落后 —— 数字诚实，流水线化 tensor-core 排序留作后续
-工作。attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
+回放）在两张卡上小 k 场景均超过 torch 的 CUB radix select；v1.0 重调
+（块内排序阈值与排序 chunk 双双从 2048 降到 1024 —— 单 block 位排序
+2048 个 key 正是中段 k 退步的全部来源）让中段 k 窗口也持平到领先
+（k=4096 @131k：1.12x / 1.09x）。attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
 有效带宽最高约 157 GB/s，而 SDPA 要付头展开或小查询低效的代价）；
 attention_prefill 是诚实的便捷路径，约为 SDPA flash 后端的 0.45x ——
 设计上不用 tensor core，重度 prefill 请继续用 SDPA/FlashAttention。
