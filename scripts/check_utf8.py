@@ -19,6 +19,7 @@ Scanned set: every git-tracked file whose extension looks like text
 printed with file/line context.
 """
 
+import os
 import re
 import subprocess
 import sys
