@@ -33,14 +33,24 @@ CUDA cases skip automatically.
    tests (multiple shapes, edge cases, error paths, GPU-vs-CPU comparison).
 2. **Determinism where promised**: selection ops (top-k / top-p / argmax)
    resolve ties toward the earliest index; keep that invariant.
-3. **Error contract**: shape problems raise `ValueError`, CUDA problems
-   raise `RuntimeError` (mapped from `std::invalid_argument` /
-   `std::runtime_error` in C++).
-4. **Comments in English**, explaining *why* (design constraints, GPU
+3. **Error contract**: shape and value problems (bad k / p / temperature,
+   mismatched shapes, out-of-range ids) raise `ValueError`; dtype,
+   device-family and mixed-input problems raise `TypeError`; CUDA
+   execution failures raise `RuntimeError` (mapped from
+   `std::runtime_error` in C++). The full surface is pinned by
+   `tests/test_api.py`.
+4. **API freeze (1.0)**: the names in `fusedtok.__all__` are frozen.
+   Additions may land in minor releases; changing a signature, renaming
+   or removing a public name requires a major release and a deprecation
+   window of at least one minor release (DeprecationWarning) before it.
+   `python/fusedtok/__init__.pyi` + `py.typed` ship the typed surface -
+   keep them in sync with `__all__` in the same change (the API test
+   fails otherwise).
+5. **Comments in English**, explaining *why* (design constraints, GPU
    micro-arch reasons), not *what*.
-5. Benchmarks use CUDA events, never wall clock (WDDM makes host timing
+6. Benchmarks use CUDA events, never wall clock (WDDM makes host timing
    on Windows meaningless).
-6. Keep the CI green: `ubuntu-latest` + CUDA container build and CPU tests
+7. Keep the CI green: `ubuntu-latest` + CUDA container build and CPU tests
    run on every push.
 
 ## New-kernel checklist

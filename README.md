@@ -165,6 +165,15 @@ See `examples/demo.py` for a runnable tour of every operator.
 Every kernel ships with a CPU reference implementation and element-wise parity tests
 (pytest). Tests run on machines without a GPU (CUDA cases skip automatically).
 
+## API stability
+
+1.0 freezes the public surface: the names in `fusedtok.__all__` (30
+operators + helpers) keep their signatures across the 1.x series.
+Type stubs (`__init__.pyi`, PEP 561 `py.typed`) ship with the package.
+New operators arrive in minor releases; breaking changes require a new
+major version and a deprecation window. Determinism promises: selection
+ties resolve to the earliest index; sampling is deterministic per seed.
+
 ## Benchmarks
 
 RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing over

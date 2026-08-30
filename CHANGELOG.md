@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- API freeze infrastructure for 1.0: `python/fusedtok/__init__.pyi`
+  type stubs (full signatures for the whole frozen surface) plus the
+  PEP 561 `py.typed` marker - IDEs and type checkers now see every
+  operator signature. `tests/test_api.py` pins the frozen surface
+  (an accidental addition to or removal from `__all__` fails), keeps
+  every public callable documented, pins `__version__` as semver,
+  guards against undocumented public leaks, and asserts the stub
+  tracks `__all__`. The error contract is now written down completely:
+  ValueError for shape/value problems, TypeError for dtype/device/
+  mixed-input problems, RuntimeError for CUDA execution failures, and
+  the 1.0 stability policy (additions in minor releases; signature
+  changes need a major + a deprecation window) is documented in
+  CONTRIBUTING and both READMEs.
 - scripts/check_utf8.py: a repository-wide text hygiene gate - every
   tracked text file must be strict UTF-8, BOM-free, without U+FFFD
   replacement characters or the double-encoded (UTF-8-as-CP1252)
