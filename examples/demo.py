@@ -233,6 +233,16 @@ def main():
         print(f"  {'GEMV decode shape parity':<26} {'PASS' if ok else 'FAIL'}")
         ALL_OK &= ok
 
+        print("qgemm_perchannel: W8A8 (per-output-channel weight scales)")
+        wpc = torch.randint(-127, 128, (260, 500), device="cuda", dtype=torch.int8)
+        sb = (torch.rand(260, device="cuda") + 0.01).float()
+        ypc = fusedtok.qgemm_perchannel(a, 0.03, wpc, sb)
+        ref_pc = (an @ wpc.cpu().numpy().astype(np.int64).T).astype(np.float32) \
+            * (np.float32(0.03) * sb.cpu().numpy())
+        ok = np.array_equal(ypc.cpu().numpy(), ref_pc)
+        print(f"  {'per-channel bit-exact parity':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+
         print("decode_step: fused penalty -> temperature -> nucleus sample")
         lg = torch.from_numpy((rng.standard_normal(4096) * 2).astype(np.float32)).cuda()
         lgn = lg.cpu().numpy()
@@ -244,6 +254,28 @@ def main():
             reftok = fusedtok.sample_topp(pen, 0.9, temperature=0.8, seed=seed)
             ok = tok == reftok
             print(f"  {f'seed {seed} matches composed':<26} {'PASS' if ok else 'FAIL'}")
+            ALL_OK &= ok
+
+    print("sample_topk: fused top-k sampling (runs everywhere)")
+    lg = (rng.standard_normal(2048) * 3).astype(np.float32)
+    kk = 64
+    order = sorted(range(2048), key=lambda i: (-(lg[i] / 0.8), i))
+    top = set(order[:kk])
+    draws = {fusedtok.sample_topk(lg, kk, temperature=0.8, seed=s)
+             for s in range(16)}
+    ok = bool(draws) and draws.issubset(top)
+    print(f"  {'draws stay in the top-k set':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    greedy = int(np.argmax(lg / 0.8))
+    ok = all(fusedtok.sample_topk(lg, 1, seed=s) == greedy for s in range(4))
+    print(f"  {'k=1 is exactly greedy':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    if have_cuda and HAS_TORCH:
+        lt = torch.from_numpy(lg).cuda()
+        for seed in (0, 7):
+            ok = fusedtok.sample_topk(lt, 128, temperature=0.8, seed=seed) == \
+                fusedtok.sample_topk(lg, 128, temperature=0.8, seed=seed)
+            print(f"  {f'seed {seed} cuda matches cpu':<26} {'PASS' if ok else 'FAIL'}")
             ALL_OK &= ok
 
     print(SEP)
