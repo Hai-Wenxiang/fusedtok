@@ -90,7 +90,11 @@ constexpr int kSelWarps = kSelBlock / 32;
 constexpr int kSelSortChunk = 2048;
 // Early-exit threshold: a radix boundary bin with at most this many
 // survivors is resolved by an in-block sort instead of further rounds.
-constexpr int kSelEarlyOut = 2048;
+// 1024 (v1.0, was 2048): a single block bitonic-sorting 2048 keys keeps
+// every SM but one idle, while the parallel chunk+merge tail spreads the
+// same work over the whole device - measured as the entire mid-k
+// regression window on both test GPUs.
+constexpr int kSelEarlyOut = 1024;
 // merge tile: one co-rank search + shared staging per this many outputs
 constexpr int kSelMergeTile = 256;
 // grid cap for the pipelined kernels (ticket scans stay short)
