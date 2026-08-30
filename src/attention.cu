@@ -22,9 +22,19 @@
 //     being pinned at B*Hq blocks, which is what keeps long caches
 //     bandwidth-saturated on small batches.
 //
-// Lanes cover the head dimension in float4 chunks (D is a multiple of 4;
-// every row base stays 16B aligned since the caller's buffers are
-// torch/cudaMalloc allocations and row strides are multiples of 16B).
+// Lanes cover the head dimension in 4-element chunks (D is a multiple of
+// 4; every row base stays aligned for the storage width since the
+// caller's buffers are torch/cudaMalloc allocations and row strides are
+// multiples of the chunk size).
+//
+// STORAGE DTYPES (v1.1): q/k/v/out may be float32, bfloat16 or float16 -
+// the kernels are templated on the storage type and compute entirely in
+// float32 (loads widen at the boundary, stores narrow back
+// round-to-nearest). bf16/fp16 cache rows are 8B per 4-element chunk vs
+// f32's 16B: half the global bytes on the bandwidth-bound decode path.
+// The workspace and every softmax/accumulator state stay float32 on all
+// paths, so numerics are identical across storage dtypes up to the
+// input rounding.
 //
 // Sequences with len == 0 (or an empty cache) write zero rows. No host
 // round trips: stream-ordered on the caller's stream and CUDA-graph
@@ -37,6 +47,7 @@
 #include "cuda_util.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <map>
@@ -61,6 +72,67 @@ constexpr int kAttMaxSlices = 32;    // workspace cap on the split grid
 // every (dim band, LPR) combination the launcher picks
 constexpr int kAttPrefChunks = 8;
 
+// ---------------------------------------------------------------------------
+// storage-dtype chunk traits: one 4-element chunk of q/k/v/out per access,
+// widened to float4 for compute and narrowed back on store. float keeps
+// the native float4 (16B); bf16/fp16 pack 4 elements into a uint2 (8B) -
+// half the bytes per cache row, which is exactly the win the
+// bandwidth-bound decode path is after. Alignment: D % 4 == 0 makes every
+// row offset a multiple of the 8B chunk, and torch/cudaMalloc bases are
+// far stricter than that.
+// ---------------------------------------------------------------------------
+template <typename T> struct AttChunk;
+
+template <> struct AttChunk<float> {
+    using Vec = float4;
+    __device__ __forceinline__ static float4 ld(const float* p) {
+        return *reinterpret_cast<const float4*>(p);
+    }
+    __device__ __forceinline__ static void st(float* p, float4 v) {
+        *reinterpret_cast<float4*>(p) = v;
+    }
+};
+
+template <> struct AttChunk<__nv_bfloat16> {
+    using Vec = uint2;
+    __device__ __forceinline__ static float4 ld(const __nv_bfloat16* p) {
+        const uint2 u = *reinterpret_cast<const uint2*>(p);
+        const float2 lo = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        const float2 hi = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(&u.y));
+        return make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+    __device__ __forceinline__ static void st(__nv_bfloat16* p, float4 v) {
+        const __nv_bfloat162 lo = __float22bfloat162_rn(make_float2(v.x, v.y));
+        const __nv_bfloat162 hi = __float22bfloat162_rn(make_float2(v.z, v.w));
+        uint2 u;
+        u.x = *reinterpret_cast<const unsigned*>(&lo);
+        u.y = *reinterpret_cast<const unsigned*>(&hi);
+        *reinterpret_cast<uint2*>(p) = u;
+    }
+};
+
+template <> struct AttChunk<__half> {
+    using Vec = uint2;
+    __device__ __forceinline__ static float4 ld(const __half* p) {
+        const uint2 u = *reinterpret_cast<const uint2*>(p);
+        const float2 lo = __half22float2(
+            *reinterpret_cast<const __half2*>(&u.x));
+        const float2 hi = __half22float2(
+            *reinterpret_cast<const __half2*>(&u.y));
+        return make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+    __device__ __forceinline__ static void st(__half* p, float4 v) {
+        const __half2 lo = __float22half2_rn(make_float2(v.x, v.y));
+        const __half2 hi = __float22half2_rn(make_float2(v.z, v.w));
+        uint2 u;
+        u.x = *reinterpret_cast<const unsigned*>(&lo);
+        u.y = *reinterpret_cast<const unsigned*>(&hi);
+        *reinterpret_cast<uint2*>(p) = u;
+    }
+};
+
 void attention_check(int batch, int hq, int hkv, int t_seq, int dim) {
     if (batch < 0 || hq < 1 || hkv < 1 || t_seq < 0 || dim < 1)
         throw std::invalid_argument(
@@ -72,36 +144,35 @@ void attention_check(int batch, int hq, int hkv, int t_seq, int dim) {
         throw std::invalid_argument("dim must be a multiple of 4 and at most 512");
 }
 
-__global__ void attn_decode_kernel(const float* __restrict__ q,
-                                   const float* __restrict__ k,
-                                   const float* __restrict__ v,
+template <typename T>
+__global__ void attn_decode_kernel(const T* __restrict__ q,
+                                   const T* __restrict__ k,
+                                   const T* __restrict__ v,
                                    const int* __restrict__ lens,
-                                   float* __restrict__ out,
+                                   T* __restrict__ out,
                                    int hq, int hkv, int t_seq, int dim) {
+    using C = AttChunk<T>;
     const int bi = blockIdx.x / hq;
     const int h = blockIdx.x % hq;
     const int len = lens ? lens[bi] : t_seq;
 
-    float4* o4 = reinterpret_cast<float4*>(
-        out + ((size_t)bi * hq + h) * dim);
+    T* oraw = out + ((size_t)bi * hq + h) * dim;
     const int chunks = dim / 4;
 
     // empty sequence: an empty softmax is defined as a zero row
     if (len == 0) {
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int c = threadIdx.x; c < chunks; c += kAttBlock)
-            o4[c] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            C::st(oraw + c * 4, zero);
         return;
     }
 
     // GQA: q heads form contiguous groups over kv heads
     const int kv = (int)((long long)h * hkv / hq);
     const float scale = 1.0f / sqrtf((float)dim);
-    const float4* q4 = reinterpret_cast<const float4*>(
-        q + ((size_t)bi * hq + h) * dim);
-    const float4* k4 = reinterpret_cast<const float4*>(
-        k + (((size_t)bi * hkv + kv) * t_seq) * dim);
-    const float4* v4 = reinterpret_cast<const float4*>(
-        v + (((size_t)bi * hkv + kv) * t_seq) * dim);
+    const T* qp = q + ((size_t)bi * hq + h) * dim;
+    const T* kp = k + (((size_t)bi * hkv + kv) * t_seq) * dim;
+    const T* vp = v + (((size_t)bi * hkv + kv) * t_seq) * dim;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -113,21 +184,21 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
     float4 qv[kAttLaneChunks];
     float4 acc[kAttLaneChunks];
     int j = 0;
-    for (int c = lane; c < chunks; c += 32, ++j) {
-        qv[j] = q4[c];
-        acc[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
+    for (int c = lane; c < chunks; c += 32, ++j)
+        qv[j] = C::ld(qp + c * 4);
+    for (int i = 0; i < kAttLaneChunks; ++i)
+        acc[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float m = -INFINITY;   // running max of this warp's scaled scores
     float l = 0.0f;        // running softmax denominator
 
     // 8 warps stride the sequence, each with an independent online
     // softmax; warp-local maxima merge later in shared memory
     for (int t = warp; t < len; t += kAttWarps) {
-        const float4* krow = k4 + (size_t)t * chunks;
+        const T* krow = kp + (size_t)t * dim;
         float dot = 0.0f;
         j = 0;
         for (int c = lane; c < chunks; c += 32, ++j) {
-            const float4 kk = krow[c];
+            const float4 kk = C::ld(krow + c * 4);
             dot += qv[j].x * kk.x + qv[j].y * kk.y
                  + qv[j].z * kk.z + qv[j].w * kk.w;
         }
@@ -144,7 +215,7 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
         l = l * rescale + p;
         j = 0;
         for (int c = lane; c < chunks; c += 32, ++j) {
-            const float4 vv = v4[(size_t)t * chunks + c];
+            const float4 vv = C::ld(vp + ((size_t)t * chunks + c) * 4);
             acc[j].x = acc[j].x * rescale + p * vv.x;
             acc[j].y = acc[j].y * rescale + p * vv.y;
             acc[j].z = acc[j].z * rescale + p * vv.z;
@@ -194,8 +265,8 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
                 s.w += src->w * wgt;
             }
         }
-        o4[c] = make_float4(s.x / denom, s.y / denom, s.z / denom,
-                            s.w / denom);
+        C::st(oraw + c * 4, make_float4(s.x / denom, s.y / denom,
+                                        s.z / denom, s.w / denom));
     }
 }
 
@@ -214,15 +285,16 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
 // groups larger than 16 stay on the single-kernel path.
 // ---------------------------------------------------------------------------
 
-template <int G>
-__global__ void attn_split_kernel(const float* __restrict__ q,
-                                  const float* __restrict__ k,
-                                  const float* __restrict__ v,
+template <int G, typename T>
+__global__ void attn_split_kernel(const T* __restrict__ q,
+                                  const T* __restrict__ k,
+                                  const T* __restrict__ v,
                                   const int* __restrict__ lens,
                                   float* __restrict__ ws_ml,
                                   float* __restrict__ ws_acc,
                                   int hq, int hkv, int t_seq, int dim,
                                   int slices, int slice_len) {
+    using C = AttChunk<T>;
     const int slice = blockIdx.x % slices;
     const int kv = (blockIdx.x / slices) % hkv;
     const int bi = blockIdx.x / (slices * hkv);
@@ -232,12 +304,9 @@ __global__ void attn_split_kernel(const float* __restrict__ q,
 
     const float scale = 1.0f / sqrtf((float)dim);
     const int chunks = dim / 4;
-    const float4* k4 = reinterpret_cast<const float4*>(
-        k + (((size_t)bi * hkv + kv) * t_seq) * dim);
-    const float4* v4 = reinterpret_cast<const float4*>(
-        v + (((size_t)bi * hkv + kv) * t_seq) * dim);
-    const float4* q4 = reinterpret_cast<const float4*>(
-        q + ((size_t)bi * hq + (size_t)kv * G) * dim);
+    const T* kp = k + (((size_t)bi * hkv + kv) * t_seq) * dim;
+    const T* vp = v + (((size_t)bi * hkv + kv) * t_seq) * dim;
+    const T* qp = q + ((size_t)bi * hq + (size_t)kv * G) * dim;
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -258,19 +327,19 @@ __global__ void attn_split_kernel(const float* __restrict__ q,
     for (int c = lane; c < chunks; c += 32, ++nj)
         #pragma unroll
         for (int g = 0; g < G; ++g) {
-            qv[g][nj] = q4[(size_t)g * chunks + c];
+            qv[g][nj] = C::ld(qp + (size_t)g * dim + c * 4);
             acc[g][nj] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
 
     // warps stride the slice; the k/v rows are read once and reused
     // across the whole GQA group
     for (int t = t0 + warp; t < t1; t += kAttWarps) {
-        const float4* krow = k4 + (size_t)t * chunks;
-        const float4* vrow = v4 + (size_t)t * chunks;
+        const T* krow = kp + (size_t)t * dim;
+        const T* vrow = vp + (size_t)t * dim;
         float4 kc[kAttLaneChunks], vc[kAttLaneChunks];
         for (int j = 0; j < nj; ++j) {
-            kc[j] = krow[lane + (size_t)j * 32];
-            vc[j] = vrow[lane + (size_t)j * 32];
+            kc[j] = C::ld(krow + (lane + (size_t)j * 32) * 4);
+            vc[j] = C::ld(vrow + (lane + (size_t)j * 32) * 4);
         }
         for (int g = 0; g < G; ++g) {
             float dot = 0.0f;
@@ -358,11 +427,13 @@ __global__ void attn_split_kernel(const float* __restrict__ q,
 // cross-thread communication needed until the final divide.
 // ---------------------------------------------------------------------------
 
+template <typename T>
 __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
                                    const float* __restrict__ ws_acc,
-                                   float* __restrict__ out,
+                                   T* __restrict__ out,
                                    int hq, int hkv, int dim,
                                    int group, int slices) {
+    using C = AttChunk<T>;
     const int bi = blockIdx.x / hq;
     const int h = blockIdx.x % hq;
     const int kv = h / group;
@@ -370,8 +441,7 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
     const int chunks = dim / 4;
     const int lane = threadIdx.x & 31;
 
-    float4* o4 = reinterpret_cast<float4*>(
-        out + ((size_t)bi * hq + h) * dim);
+    T* oraw = out + ((size_t)bi * hq + h) * dim;
 
     float4 o[kAttLaneChunks];
     float m = -INFINITY, l = 0.0f;
@@ -412,13 +482,15 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
         m = m_new;
     }
     if (l <= 0.0f) {                       // every slice empty: zero row
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int c = threadIdx.x; c < chunks; c += kAttBlock)
-            o4[c] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            C::st(oraw + c * 4, zero);
         return;
     }
     j = 0;
     for (int c = lane; c < chunks; c += 32, ++j)
-        o4[c] = make_float4(o[j].x / l, o[j].y / l, o[j].z / l, o[j].w / l);
+        C::st(oraw + c * 4, make_float4(o[j].x / l, o[j].y / l,
+                                        o[j].z / l, o[j].w / l));
 }
 
 // ---------------------------------------------------------------------------
@@ -439,18 +511,19 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
 //   dim <= 128: 64-row tile, 8 rows/warp,  4 lanes/row
 //   dim <= 256: 32-row tile, 4 rows/warp,  8 lanes/row
 //   dim <= 512: 16-row tile, 2 rows/warp, 16 lanes/row
-//   dim  <  32: generic fallback (warp-per-row reduction), since the
-//               head dimension cannot feed 4 lanes
+//   dim  <  32: the dim<=128 band, with the surplus lanes of a row
+//               group contributing zero (bounds-guarded loads/stores)
 // Causality falls out of each row's own limit (row i stops at key i+1).
 // ---------------------------------------------------------------------------
 
-template <int QTILE, int KVTILE, int LPR>
-__global__ void attn_prefill_kernel(const float* __restrict__ q,
-                                    const float* __restrict__ k,
-                                    const float* __restrict__ v,
-                                    float* __restrict__ out,
+template <int QTILE, int KVTILE, int LPR, typename T>
+__global__ void attn_prefill_kernel(const T* __restrict__ q,
+                                    const T* __restrict__ k,
+                                    const T* __restrict__ v,
+                                    T* __restrict__ out,
                                     int hq, int hkv, int seq, int dim,
                                     int tiles, int causal) {
+    using C = AttChunk<T>;
     constexpr int RPW = 32 / LPR;      // query rows per warp
     const int tile = blockIdx.x % tiles;
     const int h = (blockIdx.x / tiles) % hq;
@@ -465,14 +538,9 @@ __global__ void attn_prefill_kernel(const float* __restrict__ q,
     const int lane_chunks = (chunks + LPR - 1) / LPR;
     const float scale = 1.0f / sqrtf((float)dim);
 
-    const float4* k4 = reinterpret_cast<const float4*>(
-        k + (((size_t)bi * hkv + kv) * seq) * dim);
-    const float4* v4 = reinterpret_cast<const float4*>(
-        v + (((size_t)bi * hkv + kv) * seq) * dim);
-    const float4* q4 = reinterpret_cast<const float4*>(
-        q + (((size_t)bi * hq + h) * seq) * dim);
-    float4* o4 = reinterpret_cast<float4*>(
-        out + (((size_t)bi * hq + h) * seq) * dim);
+    const T* kp = k + (((size_t)bi * hkv + kv) * seq) * dim;
+    const T* vp = v + (((size_t)bi * hkv + kv) * seq) * dim;
+    const T* qp = q + (((size_t)bi * hq + h) * seq) * dim;
 
     // dynamic shared layout: [QTILE x dim q tile][KVTILE x dim k][v]
     extern __shared__ float sm[];
@@ -484,9 +552,10 @@ __global__ void attn_prefill_kernel(const float* __restrict__ q,
     for (int idx = threadIdx.x; idx < QTILE * chunks; idx += kAttBlock) {
         const int r = idx / chunks, c = idx % chunks;
         const int row = row0 + r;
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         *reinterpret_cast<float4*>(&q_s[r * dim + c * 4]) =
-            (row < seq) ? q4[(size_t)row * chunks + c]
-                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            (row < seq) ? C::ld(qp + ((size_t)row * chunks + c) * 4)
+                        : zero;
     }
     __syncthreads();
 
@@ -524,17 +593,16 @@ __global__ void attn_prefill_kernel(const float* __restrict__ q,
     const int row_end = min(seq, causal ? row0 + QTILE : seq);
     for (int t0 = 0; t0 < row_end; t0 += KVTILE) {
         // stage one k/v chunk (zero-padded past seq)
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int idx = threadIdx.x; idx < KVTILE * chunks;
              idx += kAttBlock) {
             const int r = idx / chunks, c = idx % chunks;
             const int row = t0 + r;
             const bool klive = row < seq;
             *reinterpret_cast<float4*>(&k_s[r * dim + c * 4]) =
-                klive ? k4[(size_t)row * chunks + c]
-                      : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                klive ? C::ld(kp + ((size_t)row * chunks + c) * 4) : zero;
             *reinterpret_cast<float4*>(&v_s[r * dim + c * 4]) =
-                klive ? v4[(size_t)row * chunks + c]
-                      : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                klive ? C::ld(vp + ((size_t)row * chunks + c) * 4) : zero;
         }
         __syncthreads();
 
@@ -597,112 +665,18 @@ __global__ void attn_prefill_kernel(const float* __restrict__ q,
 
     if (live) {
         // lim >= 1 always holds, so l > 0 (the row saw key 0)
-        float4* orow = o4 + (size_t)row_abs * chunks;
+        T* orow = out + (((size_t)bi * hq + h) * seq + (size_t)row_abs) * dim;
         #pragma unroll
         for (int j = 0; j < kAttPrefChunks; ++j) {
             if (j >= lane_chunks) break;
             const int c = i_in_row + j * LPR;
             if (c < chunks)
-                orow[c] = make_float4(acc[j].x / l, acc[j].y / l,
-                                      acc[j].z / l, acc[j].w / l);
+                C::st(orow + c * 4, make_float4(acc[j].x / l, acc[j].y / l,
+                                                acc[j].z / l, acc[j].w / l));
         }
     }
 }
 
-// generic fallback for dim < 32 (at most 8 float4 chunks: one chunk
-// per lane, classic warp reduction; each warp services two rows) ----
-
-__global__ void attn_prefill_small_kernel(const float* __restrict__ q,
-                                          const float* __restrict__ k,
-                                          const float* __restrict__ v,
-                                          float* __restrict__ out,
-                                          int hq, int hkv, int seq,
-                                          int dim, int tiles, int causal) {
-    constexpr int QTILE = 16;
-    const int tile = blockIdx.x % tiles;
-    const int h = (blockIdx.x / tiles) % hq;
-    const int bi = blockIdx.x / (tiles * hq);
-    const int group = hq / hkv;
-    const int kv = h / group;
-    const int row0 = tile * QTILE;
-    const int chunks = dim / 4;
-    const float scale = 1.0f / sqrtf((float)dim);
-
-    const float4* k4 = reinterpret_cast<const float4*>(
-        k + (((size_t)bi * hkv + kv) * seq) * dim);
-    const float4* v4 = reinterpret_cast<const float4*>(
-        v + (((size_t)bi * hkv + kv) * seq) * dim);
-    const float4* q4 = reinterpret_cast<const float4*>(
-        q + (((size_t)bi * hq + h) * seq) * dim);
-    float4* o4 = reinterpret_cast<float4*>(
-        out + (((size_t)bi * hq + h) * seq) * dim);
-
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int row_a = row0 + warp * 2, row_b = row0 + warp * 2 + 1;
-    const bool has_a = row_a < seq, has_b = row_b < seq;
-    const int lim_a = causal ? row_a + 1 : seq;
-    const int lim_b = causal ? row_b + 1 : seq;
-    const int tmax = max(has_a ? lim_a : 0, has_b ? lim_b : 0);
-
-    // one float4 chunk per lane (chunks <= 8 on this path)
-    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float4 qc_a = (has_a && lane < chunks)
-        ? q4[(size_t)row_a * chunks + lane] : zero;
-    const float4 qc_b = (has_b && lane < chunks)
-        ? q4[(size_t)row_b * chunks + lane] : zero;
-
-    float m_a = -INFINITY, l_a = 0.0f, m_b = -INFINITY, l_b = 0.0f;
-    float4 acc_a = zero, acc_b = zero;
-    for (int t = 0; t < tmax; ++t) {
-        const float4 kc = (lane < chunks)
-            ? k4[(size_t)t * chunks + lane] : zero;
-        const float4 vc = (lane < chunks)
-            ? v4[(size_t)t * chunks + lane] : zero;
-        if (has_a && t < lim_a) {
-            float dot = qc_a.x * kc.x + qc_a.y * kc.y
-                      + qc_a.z * kc.z + qc_a.w * kc.w;
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                dot += __shfl_down_sync(0xffffffffu, dot, off);
-            const float s = __shfl_sync(0xffffffffu, dot, 0) * scale;
-            const float m_new = fmaxf(m_a, s);
-            const float rescale = expf(m_a - m_new);
-            const float p = expf(s - m_new);
-            l_a = l_a * rescale + p;
-            m_a = m_new;
-            acc_a.x = acc_a.x * rescale + p * vc.x;
-            acc_a.y = acc_a.y * rescale + p * vc.y;
-            acc_a.z = acc_a.z * rescale + p * vc.z;
-            acc_a.w = acc_a.w * rescale + p * vc.w;
-        }
-        if (has_b && t < lim_b) {
-            float dot = qc_b.x * kc.x + qc_b.y * kc.y
-                      + qc_b.z * kc.z + qc_b.w * kc.w;
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                dot += __shfl_down_sync(0xffffffffu, dot, off);
-            const float s = __shfl_sync(0xffffffffu, dot, 0) * scale;
-            const float m_new = fmaxf(m_b, s);
-            const float rescale = expf(m_b - m_new);
-            const float p = expf(s - m_new);
-            l_b = l_b * rescale + p;
-            m_b = m_new;
-            acc_b.x = acc_b.x * rescale + p * vc.x;
-            acc_b.y = acc_b.y * rescale + p * vc.y;
-            acc_b.z = acc_b.z * rescale + p * vc.z;
-            acc_b.w = acc_b.w * rescale + p * vc.w;
-        }
-    }
-    if (has_a && lane < chunks)
-        o4[(size_t)row_a * chunks + lane] =
-            make_float4(acc_a.x / l_a, acc_a.y / l_a,
-                        acc_a.z / l_a, acc_a.w / l_a);
-    if (has_b && lane < chunks)
-        o4[(size_t)row_b * chunks + lane] =
-            make_float4(acc_b.x / l_b, acc_b.y / l_b,
-                        acc_b.z / l_b, acc_b.w / l_b);
-}
 
 // ---------------------------------------------------------------------------
 // per-shape workspace cache for the split path (process lifetime, like
@@ -823,12 +797,16 @@ std::vector<float> attention_decode_cpu(const std::vector<float>& q,
 // unusual group sizes, flash-decoding split path (stage1 partials +
 // stage2 reduce) for long caches. Stream-ordered and graph-capturable on
 // both paths (the workspace is allocated outside captures on first use).
+// Templated on the storage dtype; float32 / bfloat16 / float16 entry
+// points share everything but the kernel instantiation (the workspace is
+// float32 on every path, so its cache is shared across dtypes).
 // ---------------------------------------------------------------------------
 
-void attention_decode_launch(const float* q, const float* k, const float* v,
-                             const int* lens, float* out,
-                             int batch, int hq, int hkv, int t_seq, int dim,
-                             std::uintptr_t stream) {
+template <typename T>
+void attention_decode_launch_t(const T* q, const T* k, const T* v,
+                               const int* lens, T* out,
+                               int batch, int hq, int hkv, int t_seq,
+                               int dim, std::uintptr_t stream) {
     attention_check(batch, hq, hkv, t_seq, dim);
     if (batch == 0)
         return;                        // nothing to compute
@@ -844,7 +822,7 @@ void attention_decode_launch(const float* q, const float* k, const float* v,
         slices = att_choose_slices(batch, hkv, t_seq,
                                    sm_multi_processor_count());
     if (slices <= 1) {
-        attn_decode_kernel<<<batch * hq, kAttBlock, 0, cs>>>(
+        attn_decode_kernel<T><<<batch * hq, kAttBlock, 0, cs>>>(
             q, k, v, lens, out, hq, hkv, t_seq, dim);
         check_launch("attention decode kernel launch");
         return;
@@ -862,7 +840,7 @@ void attention_decode_launch(const float* q, const float* k, const float* v,
             // first use raced an active capture: the single-kernel path
             // needs no workspace, use it for THIS launch (and for the
             // whole capture); later uncaptured calls populate the cache
-            attn_decode_kernel<<<batch * hq, kAttBlock, 0, cs>>>(
+            attn_decode_kernel<T><<<batch * hq, kAttBlock, 0, cs>>>(
                 q, k, v, lens, out, hq, hkv, t_seq, dim);
             check_launch("attention decode kernel launch");
             return;
@@ -875,7 +853,7 @@ void attention_decode_launch(const float* q, const float* k, const float* v,
                     != cudaSuccess) {
                 cudaGetLastError();
                 // allocation failed: fall back, stay correct
-                attn_decode_kernel<<<batch * hq, kAttBlock, 0, cs>>>(
+                attn_decode_kernel<T><<<batch * hq, kAttBlock, 0, cs>>>(
                     q, k, v, lens, out, hq, hkv, t_seq, dim);
                 check_launch("attention decode kernel launch");
                 return;
@@ -888,29 +866,59 @@ void attention_decode_launch(const float* q, const float* k, const float* v,
     const int grid1 = batch * hkv * slices;
     const int slice_len = (t_seq + slices - 1) / slices;
     if (group == 1)
-        attn_split_kernel<1><<<grid1, kAttBlock, 0, cs>>>(
+        attn_split_kernel<1, T><<<grid1, kAttBlock, 0, cs>>>(
             q, k, v, lens, ws.ml, ws.acc, hq, hkv, t_seq, dim,
             slices, slice_len);
     else if (group == 2)
-        attn_split_kernel<2><<<grid1, kAttBlock, 0, cs>>>(
+        attn_split_kernel<2, T><<<grid1, kAttBlock, 0, cs>>>(
             q, k, v, lens, ws.ml, ws.acc, hq, hkv, t_seq, dim,
             slices, slice_len);
     else if (group == 4)
-        attn_split_kernel<4><<<grid1, kAttBlock, 0, cs>>>(
+        attn_split_kernel<4, T><<<grid1, kAttBlock, 0, cs>>>(
             q, k, v, lens, ws.ml, ws.acc, hq, hkv, t_seq, dim,
             slices, slice_len);
     else if (group == 8)
-        attn_split_kernel<8><<<grid1, kAttBlock, 0, cs>>>(
+        attn_split_kernel<8, T><<<grid1, kAttBlock, 0, cs>>>(
             q, k, v, lens, ws.ml, ws.acc, hq, hkv, t_seq, dim,
             slices, slice_len);
     else                          // splittable already pinned group == 16
-        attn_split_kernel<16><<<grid1, kAttBlock, 0, cs>>>(
+        attn_split_kernel<16, T><<<grid1, kAttBlock, 0, cs>>>(
             q, k, v, lens, ws.ml, ws.acc, hq, hkv, t_seq, dim,
             slices, slice_len);
     check_launch("attention split kernel launch");
-    attn_reduce_kernel<<<batch * hq, kAttBlock, 0, cs>>>(
+    attn_reduce_kernel<T><<<batch * hq, kAttBlock, 0, cs>>>(
         ws.ml, ws.acc, out, hq, hkv, dim, group, slices);
     check_launch("attention reduce kernel launch");
+}
+
+void attention_decode_launch(const float* q, const float* k, const float* v,
+                             const int* lens, float* out,
+                             int batch, int hq, int hkv, int t_seq, int dim,
+                             std::uintptr_t stream) {
+    attention_decode_launch_t(q, k, v, lens, out, batch, hq, hkv,
+                              t_seq, dim, stream);
+}
+
+void attention_decode_launch_bf16(const void* q, const void* k,
+                                  const void* v, const int* lens, void* out,
+                                  int batch, int hq, int hkv, int t_seq,
+                                  int dim, std::uintptr_t stream) {
+    attention_decode_launch_t(static_cast<const __nv_bfloat16*>(q),
+                              static_cast<const __nv_bfloat16*>(k),
+                              static_cast<const __nv_bfloat16*>(v),
+                              lens, static_cast<__nv_bfloat16*>(out),
+                              batch, hq, hkv, t_seq, dim, stream);
+}
+
+void attention_decode_launch_fp16(const void* q, const void* k,
+                                  const void* v, const int* lens, void* out,
+                                  int batch, int hq, int hkv, int t_seq,
+                                  int dim, std::uintptr_t stream) {
+    attention_decode_launch_t(static_cast<const __half*>(q),
+                              static_cast<const __half*>(k),
+                              static_cast<const __half*>(v),
+                              lens, static_cast<__half*>(out),
+                              batch, hq, hkv, t_seq, dim, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -968,28 +976,25 @@ std::vector<float> attention_prefill_cpu(const std::vector<float>& q,
 
 // ---------------------------------------------------------------------------
 // prefill launcher: one block per (batch, q head, 16-row tile);
-// stream-ordered, no workspace, CUDA-graph capturable as-is
+// stream-ordered, no workspace, CUDA-graph capturable as-is. float32 /
+// bfloat16 / float16 entry points share the tile heuristics and differ
+// only in the kernel instantiation (staging shared memory stays float32).
 // ---------------------------------------------------------------------------
 
-void attention_prefill_launch(const float* q, const float* k,
-                              const float* v, float* out,
-                              int batch, int hq, int hkv, int seq, int dim,
-                              bool causal, std::uintptr_t stream) {
+template <typename T>
+void attention_prefill_launch_t(const T* q, const T* k, const T* v, T* out,
+                                int batch, int hq, int hkv, int seq, int dim,
+                                bool causal, std::uintptr_t stream) {
     attention_check(batch, hq, hkv, seq, dim);
     if (batch == 0 || seq == 0)
         return;                        // nothing to compute
     cudaStream_t cs = (cudaStream_t)stream;
-    // tile shape by head size: bigger tiles for smaller heads, inside
-    // heads below 32 floats cannot feed 4 lanes and take the generic
-    // warp-reduction fallback
-    if (dim < 32) {
-        const int tiles = (seq + 15) / 16;
-        dim3 grid((unsigned)(batch * hq * tiles));
-        attn_prefill_small_kernel<<<grid, kAttBlock, 0, cs>>>(
-            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
-        check_launch("attention prefill kernel launch");
-        return;
-    }
+    // Tile shape by head size: bigger tiles for smaller heads. The old
+    // dim<32 warp-per-row fallback kernel is GONE (v1.1): the tiled
+    // kernel handles tiny heads correctly through its zero-padded
+    // staging and per-lane bounds guards, in every storage dtype - the
+    // dedicated fallback miscompiled under dtype templating and bought
+    // nothing but a second code path.
     int qtile, kvtile, lpr;
     if (dim <= 128) { qtile = 64; kvtile = 16; lpr = 4; }
     else if (dim <= 256) { qtile = 32; kvtile = 8; lpr = 8; }
@@ -998,15 +1003,47 @@ void attention_prefill_launch(const float* q, const float* k,
     const int tiles = (seq + qtile - 1) / qtile;
     dim3 grid((unsigned)(batch * hq * tiles));
     if (lpr == 4)
-        attn_prefill_kernel<64, 16, 4><<<grid, kAttBlock, smem, cs>>>(
+        attn_prefill_kernel<64, 16, 4, T><<<grid, kAttBlock, smem, cs>>>(
             q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
     else if (lpr == 8)
-        attn_prefill_kernel<32, 8, 8><<<grid, kAttBlock, smem, cs>>>(
+        attn_prefill_kernel<32, 8, 8, T><<<grid, kAttBlock, smem, cs>>>(
             q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
     else
-        attn_prefill_kernel<16, 4, 16><<<grid, kAttBlock, smem, cs>>>(
+        attn_prefill_kernel<16, 4, 16, T><<<grid, kAttBlock, smem, cs>>>(
             q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
     check_launch("attention prefill kernel launch");
+}
+
+void attention_prefill_launch(const float* q, const float* k,
+                              const float* v, float* out,
+                              int batch, int hq, int hkv, int seq, int dim,
+                              bool causal, std::uintptr_t stream) {
+    attention_prefill_launch_t(q, k, v, out, batch, hq, hkv, seq, dim,
+                               causal, stream);
+}
+
+void attention_prefill_launch_bf16(const void* q, const void* k,
+                                   const void* v, void* out,
+                                   int batch, int hq, int hkv, int seq,
+                                   int dim, bool causal,
+                                   std::uintptr_t stream) {
+    attention_prefill_launch_t(static_cast<const __nv_bfloat16*>(q),
+                               static_cast<const __nv_bfloat16*>(k),
+                               static_cast<const __nv_bfloat16*>(v),
+                               static_cast<__nv_bfloat16*>(out),
+                               batch, hq, hkv, seq, dim, causal, stream);
+}
+
+void attention_prefill_launch_fp16(const void* q, const void* k,
+                                   const void* v, void* out,
+                                   int batch, int hq, int hkv, int seq,
+                                   int dim, bool causal,
+                                   std::uintptr_t stream) {
+    attention_prefill_launch_t(static_cast<const __half*>(q),
+                               static_cast<const __half*>(k),
+                               static_cast<const __half*>(v),
+                               static_cast<__half*>(out),
+                               batch, hq, hkv, seq, dim, causal, stream);
 }
 
 } // namespace fusedtok

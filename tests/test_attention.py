@@ -460,11 +460,23 @@ class TestTorchZeroCopy:
             np.testing.assert_allclose(y[bi].cpu().numpy(), ref,
                                        rtol=1e-4, atol=1e-5)
 
-    def test_bf16_rejected(self):
+    def test_bf16_accepted_since_1_1(self):
+        # bf16/fp16 storage was REJECTED before v1.1 and is now the
+        # supported half-precision path: same inputs, same GQA answer as
+        # the f32 path on the half-rounded inputs (out dtype = input)
         q = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(1, 2, 32, 64, device="cuda", dtype=torch.bfloat16)
+        out = fusedtok.attention_decode(q, k, k)
+        assert out.dtype is torch.bfloat16
+        ref = fusedtok.attention_decode(q.float(), k.float(), k.float())
+        np.testing.assert_allclose(out.float().cpu().numpy(),
+                                   ref.cpu().numpy(), rtol=2e-2, atol=2e-2)
         with pytest.raises(TypeError):
-            fusedtok.attention_decode(q, k, k)
+            # int8 was never an attention dtype
+            fusedtok.attention_decode(
+                torch.zeros(1, 8, 64, device="cuda", dtype=torch.int8),
+                torch.randn(1, 2, 32, 64, device="cuda"),
+                torch.randn(1, 2, 32, 64, device="cuda"))
 
     def test_graph_capture_replay(self):
         # the launcher is capture-safe (no allocs/syncs/readbacks); the
@@ -535,3 +547,177 @@ class TestTorchZeroCopy:
         ref = fusedtok.attention_decode(q, k, v).cpu().numpy()
         np.testing.assert_allclose(y.cpu().numpy(), ref, rtol=1e-5,
                                    atol=1e-6)
+
+if HAS_TORCH:
+    HALF_DTYPES = [pytest.param(torch.bfloat16, 2e-2, 2e-2, id="bf16"),
+                   pytest.param(torch.float16, 2e-3, 2e-3, id="fp16")]
+    HALF_DTYPE_OBJECTS = [torch.bfloat16, torch.float16]
+else:
+    # empty lists keep the class importable on torch-less machines
+    HALF_DTYPES = []
+    HALF_DTYPE_OBJECTS = []
+
+
+@pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
+                    reason="no torch/GPU")
+class TestHalfStorage:
+    """bfloat16 / float16 storage (v1.1): q/k/v/out in half width,
+    softmax and accumulators in float32.
+
+    Reference protocol: compute the float64 eager attention on the
+    HALF-ROUNDED inputs (the kernel never sees the original f32 bits),
+    so the only tolerated error is softmax accumulation + the final
+    store rounding - bf16 keeps ~3 significant digits, fp16 ~3.5.
+    """
+
+
+
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
+    def test_decode_matches_f32reference(self, dt, rtol, atol):
+        rng = np.random.default_rng(101)
+        b, hq, hkv, t, d = 2, 8, 2, 512, 128
+        q = torch.randn(b, hq, d, device="cuda").to(dt)
+        k = torch.randn(b, hkv, t, d, device="cuda").to(dt)
+        v = torch.randn(b, hkv, t, d, device="cuda").to(dt)
+        out = fusedtok.attention_decode(q, k, v)
+        assert out.dtype is dt                       # out matches storage
+        ref = ref_decode(q.float().cpu().numpy(),
+                         k.float().cpu().numpy(),
+                         v.float().cpu().numpy())
+        np.testing.assert_allclose(out.float().cpu().numpy(), ref,
+                                   rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
+    def test_decode_gqa_mapping_and_lens(self, dt, rtol, atol):
+        # constant-V probe: V is IDENTICAL across the rows of each kv
+        # head, so every output row of a GQA group must equal that
+        # head's constant vector (softmax over any subset of identical
+        # values is uniform) - pins the h -> h // group mapping without
+        # any score math
+        b, hq, hkv, t, d = 1, 8, 2, 300, 128
+        q = torch.randn(b, hq, d, device="cuda").to(dt)
+        k = torch.randn(b, hkv, t, d, device="cuda").to(dt)
+        v0 = torch.randn(hkv, d, device="cuda").to(dt)
+        v = v0[None, :, None, :].expand(b, hkv, t, d).contiguous()
+        lens = torch.tensor([300], dtype=torch.int32, device="cuda")
+        out = fusedtok.attention_decode(q, k, v, lens)
+        for h in range(hq):
+            np.testing.assert_allclose(out[0, h].float().cpu().numpy(),
+                                       v0[h // 4].float().cpu().numpy(),
+                                       rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
+    def test_decode_padding_and_zero_len(self, dt, rtol, atol):
+        # rows past lens[b] must be ignored even when poisoned with huge
+        # values, and lens[b] == 0 must yield a zero output row in the
+        # same dtype
+        b, hq, hkv, t, d = 2, 8, 2, 256, 128
+        q = torch.randn(b, hq, d, device="cuda").to(dt)
+        k = torch.randn(b, hkv, t, d, device="cuda").to(dt)
+        v = torch.randn(b, hkv, t, d, device="cuda").to(dt)
+        lens = torch.tensor([100, 0], dtype=torch.int32, device="cuda")
+        k[0, :, 100:] = 30000.0                      # poison the padding
+        v[0, :, 100:] = 30000.0
+        out = fusedtok.attention_decode(q, k, v, lens)
+        ref0 = ref_decode(q[0:1].float().cpu().numpy(),
+                          k[0:1, :, :100].float().cpu().numpy(),
+                          v[0:1, :, :100].float().cpu().numpy())
+        np.testing.assert_allclose(out[0].float().cpu().numpy(), ref0[0],
+                                   rtol=rtol, atol=atol)
+        np.testing.assert_array_equal(out[1].float().cpu().numpy(),
+                                      np.zeros((hq, d), np.float32))
+
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
+    def test_prefill_causal_and_bidirectional(self, dt, rtol, atol):
+        b, hq, hkv, s, d = 1, 4, 2, 96, 128
+        q = torch.randn(b, hq, s, d, device="cuda").to(dt)
+        k = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+        v = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+
+        def ref(qn, kn, vn, causal):
+            group = hq // hkv
+            out = np.zeros_like(qn, dtype=np.float64)
+            for h in range(hq):
+                kvh = h // group
+                scores = qn[0, h].astype(np.float64) @ \
+                    kn[0, kvh].astype(np.float64).T / math.sqrt(d)
+                for i in range(s):
+                    lim = i + 1 if causal else s
+                    p = np.exp(scores[i, :lim] - scores[i, :lim].max())
+                    p /= p.sum()
+                    out[0, h, i] = p @ vn[0, kvh, :lim].astype(np.float64)
+            return out
+
+        out = fusedtok.attention_prefill(q, k, v, causal=True)
+        assert out.dtype is dt
+        np.testing.assert_allclose(
+            out.float().cpu().numpy(),
+            ref(q.float().cpu().numpy(), k.float().cpu().numpy(),
+                v.float().cpu().numpy(), True), rtol=rtol, atol=atol)
+        outb = fusedtok.attention_prefill(q, k, v, causal=False)
+        np.testing.assert_allclose(
+            outb.float().cpu().numpy(),
+            ref(q.float().cpu().numpy(), k.float().cpu().numpy(),
+                v.float().cpu().numpy(), False), rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dt", HALF_DTYPE_OBJECTS)
+    def test_split_and_single_paths_match(self, dt):
+        # the same shape across the split threshold: both kernel paths
+        # must agree within half-precision tolerance
+        b, hq, hkv, t, d = 1, 8, 2, 2000, 128
+        q = (np.random.default_rng(105).standard_normal((b, hq, d)) *
+             .5).astype(np.float32)
+        k = (np.random.default_rng(106).standard_normal(
+            (b, hkv, t, d)) * .5).astype(np.float32)
+        v = (np.random.default_rng(107).standard_normal(
+            (b, hkv, t, d)) * .5).astype(np.float32)
+        qt = torch.from_numpy(q).cuda().to(dt)
+        kt = torch.from_numpy(k).cuda().to(dt)
+        vt = torch.from_numpy(v).cuda().to(dt)
+        y = fusedtok.attention_decode(qt, kt, vt)
+        # f32 path on the same (half-rounded) inputs is the reference
+        y32 = fusedtok.attention_decode(qt.float(), kt.float(), vt.float())
+        np.testing.assert_allclose(y.float().cpu().numpy(),
+                                   y32.cpu().numpy(), rtol=2e-2, atol=2e-2)
+
+    def test_mixed_dtypes_rejected(self):
+        q = torch.randn(1, 8, 64, device="cuda")
+        k16 = torch.randn(1, 2, 32, 64, device="cuda").to(torch.float16)
+        with pytest.raises(TypeError):
+            fusedtok.attention_decode(q, k16, k16)
+        with pytest.raises(TypeError):
+            fusedtok.attention_decode(
+                torch.zeros(1, 8, 64, device="cuda", dtype=torch.int8),
+                torch.randn(1, 2, 32, 64, device="cuda"),
+                torch.randn(1, 2, 32, 64, device="cuda"))
+
+    def test_graph_capture_bf16(self):
+        # capture-replay with mutation on the bf16 split path
+        from fusedtok import _fusedtok
+        b, hq, hkv, t, d = 1, 8, 2, 1024, 128
+        q = torch.randn(b, hq, d, device="cuda").to(torch.bfloat16)
+        k = torch.randn(b, hkv, t, d, device="cuda").to(torch.bfloat16)
+        v = torch.randn(b, hkv, t, d, device="cuda").to(torch.bfloat16)
+        y = torch.empty(b, hq, d, device="cuda", dtype=torch.bfloat16)
+
+        def run():
+            _fusedtok.attention_decode_launch_bf16(
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), 0, y.data_ptr(),
+                b, hq, hkv, t, d, torch.cuda.current_stream().cuda_stream)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run()
+        k.mul_(1.25)
+        y.fill_(0)
+        g.replay()
+        torch.cuda.synchronize()
+        ref = fusedtok.attention_decode(q, k, v)
+        np.testing.assert_allclose(y.float().cpu().numpy(),
+                                   ref.float().cpu().numpy(),
+                                   rtol=2e-2, atol=2e-2)
