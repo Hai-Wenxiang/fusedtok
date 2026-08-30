@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.1] - 2026-08-30
+
+Maintenance release: honest sampling benchmarks, an x8 sampling-window retry jump, documentation and metadata corrections. No API changes; all 338 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
 
 ### Added
 - benchmarks/bench.py: sample_topp rows in TWO honestly labeled
