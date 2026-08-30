@@ -41,15 +41,20 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          # container jobs do not inherit setup-python's PATH entry
+          export PATH="$pythonLocation/bin:$PATH"
           apt-get update
           apt-get install -y --no-install-recommends patchelf
           pip install --no-cache-dir build auditwheel "patchelf>=0.14.5"
 
       - name: Build the wheel
-        run: python -m build --wheel --outdir dist .
+        run: |
+          export PATH="$pythonLocation/bin:$PATH"
+          python -m build --wheel --outdir dist .
 
       - name: Repair wheel to manylinux
         run: |
+          export PATH="$pythonLocation/bin:$PATH"
           auditwheel show dist/fusedtok-*.whl
           auditwheel repair dist/fusedtok-*.whl -w wheelhouse/
           rm -f dist/fusedtok-*.whl
@@ -57,6 +62,7 @@ jobs:
 
       - name: Smoke-test the wheel (import + CPU op)
         run: |
+          export PATH="$pythonLocation/bin:$PATH"
           pip install dist/fusedtok-*.whl pytest numpy
           python -c "import fusedtok; print(fusedtok.__version__); print(fusedtok.rmsnorm([[1.0, 2.0]], [1.0, 1.0]))"
           python -m pytest tests -q
