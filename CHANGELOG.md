@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- attention_decode / attention_prefill accept **bfloat16 and float16**
+  CUDA tensors (v1.1 headline): the kernels are templated on the
+  storage dtype and compute entirely in float32, so half-precision
+  caches halve the global bytes on the bandwidth-bound decode path
+  while the softmax numerics stay float32. Output matches the input
+  dtype; CPU paths remain float32 (numpy has no bf16/fp16). 12 new
+  tests pin half-precision parity (vs float64 attention on the
+  half-rounded inputs), the GQA mapping through a constant-V probe,
+  poisoned-padding and zero-length handling, single-vs-split path
+  agreement, graph capture, and mixed-dtype rejection. Benchmarked
+  against SDPA in the SAME dtype: bf16 decode @T=16384 = 2.11x on a
+  3060 / 1.17x on a 5060 Ti (vs our own f32 path the absolute gain at
+  batch 1 is modest - the kernel is latency-bound there; the byte
+  savings grow with batch).
+- benchmarks/bench.py: attention decode bf16 rows; sample_topp rows in
+  two labeled regimes (peaked / flat worst case, see the 1.0.1 notes).
+- examples/demo.py: qgemm_perchannel and sample_topk tours.
+- test_select_pipeline: large-window (n=40000) sampling determinism
+  pin - the same seed reproduces the same token across calls in the
+  exp-precompute regime.
+
+### Changed
+- sampling serial scans precompute their exp column in PARALLEL
+  (exp_window_kernel writes exp(v - row_max) into the idle ping-pong
+  key buffer; zero extra memory) and the single-threaded walkers then
+  only add. The accumulation order of every walk is UNCHANGED, so
+  per-seed tokens are bit-identical to the 1.0 serial scans - only the
+  expf compute left the serial path. Flat-distribution worst case:
+  25.4ms -> 13.9ms at n=131072 on a 3060 (1.8x), 6.5ms -> 3.1ms at
+  n=32000.
+- the dim<32 prefill fallback kernel is GONE: under dtype templating it
+  miscompiled (hq >= 2 with dim 16 produced wrong rows even in
+  float32), and the tiled kernel's dim<=128 band handles tiny heads
+  correctly through zero-padded staging and per-lane bounds guards -
+  one code path fewer, correct in all three storage dtypes.
+
 ## [1.0.1] - 2026-08-30
 
 Maintenance release: honest sampling benchmarks, an x8 sampling-window retry jump, documentation and metadata corrections. No API changes; all 338 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
