@@ -1,7 +1,9 @@
 """fusedtok benchmark suite: fusedtok zero-copy torch path vs PyTorch eager.
 
-Timing uses CUDA events (wall-clock-free, WDDM-safe). Each configuration is
-warmed up, then measured over enough iterations to average out jitter.
+Timing uses CUDA events (wall-clock-free, WDDM-safe). Every
+configuration is measured over THREE independent timed rounds (each with
+its own warmup) and averaged; the per-round values travel with the JSON
+so variance stays auditable.
 Results are printed as a table, dumped to JSON, and rendered into ONE
 single-panel chart per GPU next to this script under ../docs/.
 
@@ -40,37 +42,46 @@ import matplotlib.pyplot as plt  # noqa: E402
 RESULTS = []
 
 
-def bench(fn, iters, warmup=10):
-    """Average GPU time per call in microseconds, via CUDA events."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters * 1000.0
+def bench(fn, iters, warmup=10, rounds=3):
+    """Average GPU time per call in microseconds over `rounds`
+    independent timed runs (each with its own warmup), via CUDA events.
+    Returns (mean, per-round values) so the JSON dump keeps the variance
+    auditable instead of hiding it inside a single number."""
+    times = []
+    for _ in range(rounds):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) / iters * 1000.0)
+    return sum(times) / len(times), times
 
 
 def record(op, shape, ft_fn, torch_fn, iters, bytes_moved=None):
-    t_ft = bench(ft_fn, iters)
-    t_tr = bench(torch_fn, iters)
+    t_ft, ft_rounds = bench(ft_fn, iters)
+    t_tr, tr_rounds = bench(torch_fn, iters)
     row = {
         "op": op,
         "shape": shape,
         "fusedtok_us": round(t_ft, 2),
         "torch_us": round(t_tr, 2),
         "speedup": round(t_tr / t_ft, 2),
+        "fusedtok_rounds_us": [round(v, 2) for v in ft_rounds],
+        "torch_rounds_us": [round(v, 2) for v in tr_rounds],
     }
     if bytes_moved:
         row["bandwidth_gbs"] = round(bytes_moved / (t_ft * 1e-6) / 1e9, 1)
     RESULTS.append(row)
+    spread = (max(ft_rounds) - min(ft_rounds)) / t_ft * 100.0
     extra = f"  {row['bandwidth_gbs']:6.1f} GB/s" if bytes_moved else ""
     print(f"{op:<16} {shape:<18} fusedtok {t_ft:9.1f} us | torch {t_tr:9.1f} us"
-          f" | {t_tr / t_ft:5.2f}x{extra}")
+          f" | {t_tr / t_ft:5.2f}x | round spread {spread:4.1f}%{extra}")
     return row
 
 
@@ -214,6 +225,7 @@ def main():
         "torch": torch.__version__,
         "fusedtok": fusedtok.__version__,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timing": "mean over 3 independent timed rounds; per-round values in each row",
         "results": RESULTS,
     }
     with open(json_path, "w") as f:
@@ -260,6 +272,14 @@ def main():
                linestyle="--", zorder=2)
     ax.annotate("parity (1.0x)", xy=(1.0, y[-1] - 0.55),
                 fontsize=8, color="#6b7280", ha="center")
+    # ticks must ALWAYS include 1 (the parity anchor): matplotlib's
+    # default step-2 ticks at x_max ~ 9.5 read 0/2/4/6/8 and lose the
+    # reference point the whole chart is judged against
+    if x_max <= 10:
+        ticks = list(range(0, int(x_max) + 1))
+    else:
+        ticks = [0, 1] + list(range(2, int(x_max) + 1, 2))
+    ax.set_xticks(ticks)
     ax.set_yticks(y)
     ax.set_yticklabels([r["op"] for r in ops], fontsize=9.5)
     ax.set_xlabel("speedup vs PyTorch reference (linear, higher is better)")
