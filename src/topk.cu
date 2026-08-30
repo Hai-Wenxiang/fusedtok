@@ -85,9 +85,13 @@ void topk_check(const std::vector<float>& x, int k) {
 
 constexpr int kSelBlock = 256;
 constexpr int kSelWarps = kSelBlock / 32;
-// Per-block sort chunk (shared-memory bitonic): 2048 keys = 16KB shared.
-// Powers of two keep the chunk-merge arithmetic exact.
-constexpr int kSelSortChunk = 2048;
+// Per-block sort chunk (shared-memory bitonic): 1024 keys = 8KB shared.
+// Powers of two keep the chunk-merge arithmetic exact. 1024 (v1.0, was
+// 2048): the sort is the mid-k bottleneck and a 2048-key bitonic runs in
+// ONE block - halving the chunk halves its serial span and buys one
+// parallel merge level instead (the ladder costs ~2us per level inside
+// the cached graph; the single-block sort cost ~20us at k=2048).
+constexpr int kSelSortChunk = 1024;
 // Early-exit threshold: a radix boundary bin with at most this many
 // survivors is resolved by an in-block sort instead of further rounds.
 // 1024 (v1.0, was 2048): a single block bitonic-sorting 2048 keys keeps
