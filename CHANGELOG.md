@@ -4,7 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] - 2026-08-30
+
+First stable release. The public surface (30 operators and helpers in
+`fusedtok.__all__`) is now frozen: additions land in minor releases,
+signature changes require a major version and a deprecation window.
+Typed (PEP 561 `py.typed` + stubs), bilingual docs, a text-hygiene CI
+gate, and a seven-way release wheel matrix (Linux cp310-cp313, Windows
+cp311-cp313).
 
 ### Added
 - API freeze infrastructure for 1.0: `python/fusedtok/__init__.pyi`
