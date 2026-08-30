@@ -741,11 +741,32 @@ __global__ void topp_crossing_kernel(const SelArgs* __restrict__ a,
 // stage 4b tail: serial sampling scan (window > kSelEarlyOut)
 // ---------------------------------------------------------------------------
 
+// Parallel pre-pass for the sampling scans: materialize exp(v - row_max)
+// for the whole sorted window into `exps` (a free ping-pong key buffer).
+// The serial walkers below then only do sequential float adds - no expf
+// in the single-threaded path, which is what made flat-distribution
+// windows (up to 131k entries) cost milliseconds. row_max comes from
+// keys[0] (descending order), the exact same value the walkers used to
+// derive, so the stored values are bit-identical to the old on-the-fly
+// __expf and the accumulation order of every walk is UNCHANGED - per-seed
+// tokens are exactly what the pre-1.1 serial scans produced.
+__global__ void exp_window_kernel(const unsigned long long* __restrict__ keys,
+                                  float* __restrict__ exps, int k) {
+    const float row_max = unfkey((unsigned)(keys[0] >> 32));
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < k;
+         i += gridDim.x * blockDim.x) {
+        exps[i] = __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+    }
+}
+
 // Identical arithmetic and accumulation order to the in-finisher sample
 // scan (and to the CPU reference): one thread walks the sorted keys. The
 // serial walk is what keeps per-seed CPU/GPU token parity stable; big
 // windows only occur for flat distributions (the host widening loop).
+// `exps` carries the precomputed exp column (exp_window_kernel); the
+// walk is two sequential passes - total mass, then inverse-CDF.
 __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys,
+                                     const float* __restrict__ exps,
                                      unsigned long long* __restrict__ ws,
                                      int k, int n, float p_stop,
                                      unsigned long long seed,
@@ -757,14 +778,13 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     // window == n with float-drift cum < p*total: the nucleus is
     // everything by definition - force coverage (matches the CPU
     // reference, which compares an identical serial accumulation).
-    const float row_max = unfkey((unsigned)(keys[0] >> 32));
     const float total = *reinterpret_cast<const float*>(&ws[kWsTotal]);
     float cum = 0.0f;
     int nucleus = 0;
     float nucleus_mass = 0.0f;
     bool covered = false;
     for (int i = 0; i < k; ++i) {
-        cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+        cum += exps[i];
         nucleus = i + 1;
         if (cum >= p_stop * total) { nucleus_mass = cum; covered = true; break; }
     }
@@ -781,7 +801,7 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     const float target = u * nucleus_mass;
     cum = 0.0f;
     for (int i = 0; i < nucleus; ++i) {
-        cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+        cum += exps[i];
         if (cum >= target) {
             *token_out = (int)(0xFFFFFFFFu - (unsigned)(keys[i] & 0xFFFFFFFFu));
             break;
@@ -1254,13 +1274,17 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
                 const int gmerge = (int)std::max<long long>(
                     1LL, std::min<long long>(ntiles, kMaxGrid));
                 merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
-                                                                bufs[cur ^ 1],
-                                                                m, run);
+                                                                 bufs[cur ^ 1],
+                                                                 m, run);
                 cur ^= 1;
             }
-            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], ws, window,
-                                                   n, p, seed, token_out,
-                                                   nullptr);
+            // parallel exp precompute; the serial walk then only adds
+            float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
+            exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+                bufs[cur], exps, window);
+            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], exps, ws,
+                                                   window, n, p, seed,
+                                                   token_out, nullptr);
             check_launch("sample tail launch");
         }
         cudaError_t err = cudaDeviceSynchronize();   // surface kernel faults
@@ -1370,9 +1394,13 @@ long long decode_step_launch(const float* x, const long long* ids,
                     bufs[cur], bufs[cur ^ 1], mm, run);
                 cur ^= 1;
             }
-            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], ws, window,
-                                                   n, p, seed, token_out,
-                                                   nullptr);
+            // parallel exp precompute; the serial walk then only adds
+            float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
+            exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+                bufs[cur], exps, window);
+            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], exps, ws,
+                                                   window, n, p, seed,
+                                                   token_out, nullptr);
             check_launch("decode step tail launch");
         }
         cudaError_t err = cudaDeviceSynchronize();
@@ -1404,13 +1432,13 @@ long long decode_step_launch(const float* x, const long long* ids,
 // CDF - per-seed CPU/GPU token parity is bit-stable away from draws
 // landing exactly on an exp-rounding boundary.
 __global__ void sample_topk_serial_kernel(
-    const unsigned long long* __restrict__ keys, int* __restrict__ token_out,
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps, int* __restrict__ token_out,
     int k, unsigned long long seed) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    const float row_max = unfkey((unsigned)(keys[0] >> 32));
     float window_mass = 0.0f;
     for (int i = 0; i < k; ++i)
-        window_mass += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+        window_mass += exps[i];
     unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
@@ -1419,7 +1447,7 @@ __global__ void sample_topk_serial_kernel(
     const float target = u * window_mass;
     float cum = 0.0f;
     for (int i = 0; i < k; ++i) {
-        cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+        cum += exps[i];
         if (cum >= target) {
             *token_out = (int)(0xFFFFFFFFu -
                                (unsigned)(keys[i] & 0xFFFFFFFFu));
@@ -1478,8 +1506,12 @@ long long sample_topk_launch(const float* x, int n, int k, float t,
                                                          mm, run);
         cur ^= 1;
     }
-    sample_topk_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], token_out, k,
-                                                seed);
+    // parallel exp precompute; the serial walk then only adds
+    float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
+    exp_window_kernel<<<selection_grid(k), kSelBlock, 0, cs>>>(
+        bufs[cur], exps, k);
+    sample_topk_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], exps, token_out,
+                                                k, seed);
     check_launch("sample topk tail launch");
     cudaError_t err = cudaDeviceSynchronize();    // surface kernel faults
     if (err != cudaSuccess)
