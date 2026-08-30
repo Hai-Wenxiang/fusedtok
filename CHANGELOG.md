@@ -25,6 +25,22 @@ adheres to [Semantic Versioning](https://semver.org/).
   b_scales equal the output is bit-equal to per-tensor qgemm. New
   end-to-end test quantizes spiky weight rows per channel and asserts
   the 5x+ error reduction over per-tensor scales on non-outlier rows.
+- sample_topk(logits, k, temperature=1.0, seed=0): fused top-k sampling
+  - softmax of the temperature-scaled logits, top-k truncation,
+  renormalization WITHIN the k survivors, and a seeded inverse-CDF
+  draw, one call with one readback. The k window is covered by
+  construction, so unlike the nucleus sampler there is no global-mass
+  threshold and no widening loop; the serial draw reuses the identical
+  splitmix RNG and accumulation order as sample_topp (deterministic per
+  seed; same caveat: exact-exp on CPU vs __expf on GPU can move draws
+  sitting exactly on an exp-rounding boundary). Measured vs the
+  composite an inference loop would write (torch.topk + softmax +
+  multinomial): 2.13x on a 3060 and 1.91x on a 5060 Ti at
+  k=50 @131072 - the timing is the fair part, the composite's draw is
+  not seed-reproducible while fusedtok's is. 16 new tests pin set
+  membership, k=1-is-greedy, full-vocab clamping, cold-temperature
+  collapse to argmax, mass concentration, per-seed determinism and
+  cross-path parity.
 
 ### Changed
 - qgemm (INT8 matmul) rewritten as a cp.async double-buffered pipelined

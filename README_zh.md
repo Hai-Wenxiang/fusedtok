@@ -31,6 +31,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | top-k / top-p（核采样） | 到达票据 radix + 早退压缩，缓存 CUDA 图整管线回放；平局取先下标（131k k=50 上 1.5x vs torch/CUB，双卡全 k 范围持平到领先） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
 | ✅ | sample_topp | 融合核采样：softmax -> top-p -> 种子抽取，全局质量阈值 |
+| ✅ | sample_topk | 融合 top-k 采样：softmax -> top-k -> 窗口内重归一 -> 种子抽取（131k 上 2.1x / 1.9x vs topk+multinomial 组合式） |
 | ✅ | repetition penalty | CTRL 风格，作用于已采样 token |
 | ✅ | decode_step | 整个解码步融合：惩罚 -> 温度 -> 核采样，一次调用一次回读 |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称 per-tensor INT8，融合反量化-加-重量化 |
@@ -123,6 +124,8 @@ token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,
 # 或分步执行：
 logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
 token = fusedtok.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+# top-k 采样变体（在 k 个幸存者内重归一）
+token = fusedtok.sample_topk(logits, k=50, temperature=0.8, seed=step)
 ```
 
 一个最小的逐 token 采样循环：
@@ -173,6 +176,7 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
+| sample_topk k=50 | [131072] | 133 µs | 282 µs（topk+multinomial） | **2.13x** |
 | argmax | [131072] | 65 µs | 45 µs | 0.69x（含主机回读） |
 | int8 qgemm（IMMA） | [4096×4096×4096] | 3554 µs（38.7 TOPS） | 1634 µs（cuBLASLt） | 0.46x（诚实） |
 | int8 qgemm pc（W8A8） | [4096×4096×4096] | 3553 µs（38.7 TOPS） | 2046 µs（cuBLASLt + 广播） | 0.58x（诚实） |
@@ -195,6 +199,7 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.50x** |
 | top-k（k=4096，中段 k） | [131072] | 50 µs | 54 µs（CUB） | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
+| sample_topk k=50 | [131072] | 49 µs | 93 µs（topk+multinomial） | **1.91x** |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x（含主机回读） |
 | int8 qgemm（IMMA） | [4096×4096×4096] | 2063 µs（66.6 TOPS） | 800 µs（cuBLASLt） | 0.39x（诚实） |
 | int8 qgemm pc（W8A8） | [4096×4096×4096] | 2079 µs（66.1 TOPS） | 1142 µs（cuBLASLt + 广播） | 0.55x（诚实） |
@@ -257,7 +262,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - v0.4.1（已完成）：按行 kernel（归一化/softmax）运行时线程块自动调优
 - v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
 - v0.5（已完成）：attention —— GQA 解码注意力（连续 kv-cache、长 cache 自动 flash-decoding 切分、每序列长度）+ 分块 prefill 路径（诚实约 0.45x vs SDPA flash，定位便捷路径）；每 GPU 单图 benchmark；Windows wheel 进入 PyPI 发布管线
-- 1.0（开发中）：流水线化 tensor-core INT8 GEMM（cp.async 双缓冲、运行时 tile 调优；3060 上 17 -> 39 TOPS）与逐通道权重 scale（W8A8）、融合 top-k 采样、top-k 中段 k 补平、文本卫生门禁、wheel 矩阵扩容、API 冻结
+- 1.0（开发中）：流水线化 tensor-core INT8 GEMM（cp.async 双缓冲、运行时 tile 调优；3060 上 17 -> 39 TOPS）与逐通道权重 scale（W8A8）、融合 top-k 采样（vs topk+multinomial 组合式 2.1x）、top-k 中段 k 补平、文本卫生门禁、wheel 矩阵扩容、API 冻结
 
 ## 社区
 

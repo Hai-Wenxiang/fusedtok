@@ -32,6 +32,7 @@ traffic and launch overhead.
 | ✅ | top-k / top-p (nucleus) | arrival-ticket radix + early-exit compaction, replayed from a cached CUDA graph; deterministic ties (1.5x vs torch/CUB @131k k=50, parity-to-winning across the whole k range on both test GPUs) |
 | ✅ | argmax / temperature | greedy decoding helpers |
 | ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, global-mass threshold |
+| ✅ | sample_topk | fused top-k sampling: softmax -> top-k -> renormalize within the window -> seeded draw (2.1x / 1.9x vs the topk+multinomial composite @131k) |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
 | ✅ | decode_step | the whole decode step fused: penalty -> temperature -> nucleus sample, one call, one readback |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
@@ -128,6 +129,8 @@ token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,
 # or step by step:
 logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
 token = fusedtok.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+# top-k sampling variant (renormalizes within the k survivors)
+token = fusedtok.sample_topk(logits, k=50, temperature=0.8, seed=step)
 ```
 
 A minimal per-token sampling loop:
@@ -182,6 +185,7 @@ timed region). Largest shape per op; full data:
 | LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
+| sample_topk k=50 | [131072] | 133 µs | 282 µs (topk+multinomial) | **2.13x** |
 | argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) |
 | int8 qgemm (IMMA) | [4096×4096×4096] | 3554 µs (38.7 TOPS) | 1634 µs (cuBLASLt) | 0.46x (honest) |
 | int8 qgemm pc (W8A8) | [4096×4096×4096] | 3553 µs (38.7 TOPS) | 2046 µs (cuBLASLt + broadcast) | 0.58x (honest) |
@@ -204,6 +208,7 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |
 | top-k (k=4096, mid-k) | [131072] | 50 µs | 54 µs (CUB) | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
+| sample_topk k=50 | [131072] | 49 µs | 93 µs (topk+multinomial) | **1.91x** |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x (incl. host readback) |
 | int8 qgemm (IMMA) | [4096×4096×4096] | 2063 µs (66.6 TOPS) | 800 µs (cuBLASLt) | 0.39x (honest) |
 | int8 qgemm pc (W8A8) | [4096×4096×4096] | 2079 µs (66.1 TOPS) | 1142 µs (cuBLASLt + broadcast) | 0.55x (honest) |
@@ -283,9 +288,9 @@ suite on every push.
   the PyPI publish pipeline
 - 1.0 (in development): pipelined tensor-core INT8 GEMM (cp.async
   double-buffering, runtime tile tuning; 17 -> 39 TOPS on a 3060) with
-  per-channel weight scales (W8A8), fused top-k sampling, top-k
-  mid-range-k parity, text hygiene gate, wheel matrix expansion,
-  API freeze
+  per-channel weight scales (W8A8), fused top-k sampling (2.1x vs the
+  topk+multinomial composite), top-k mid-range-k parity, text hygiene
+  gate, wheel matrix expansion, API freeze
 
 ## Community
 
