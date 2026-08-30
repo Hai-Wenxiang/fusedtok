@@ -108,4 +108,11 @@ std::vector<float> qgemm_cpu(const std::vector<signed char>& aq,
                              const std::vector<signed char>& bq,
                              int m, int n, int k, float sa, float sb);
 
+// Per-channel variant: sb holds n scales (one per output row of B_q);
+// y[i,j] = (A_q . B_q^T) * f32(sa * sb[j]).
+std::vector<float> qgemm_perchannel_cpu(const std::vector<signed char>& aq,
+                                        const std::vector<signed char>& bq,
+                                        const std::vector<float>& sb,
+                                        int m, int n, int k, float sa);
+
 } // namespace fusedtok

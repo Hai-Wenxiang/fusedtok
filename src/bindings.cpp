@@ -823,6 +823,72 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("a"), py::arg("b"), py::arg("y"), py::arg("m"), py::arg("n"),
        py::arg("k"), py::arg("sa"), py::arg("sb"), py::arg("stream") = 0);
 
+    // per-channel weight scales (W8A8): sb has n entries, one per output
+    // row of B_q; y[i,j] = (A_q . B_q^T) * f32(sa * sb[j])
+    m.def("qgemm_perchannel_cpu", [](py::array_t<signed char, py::array::c_style> a,
+                                     py::array_t<signed char, py::array::c_style> b,
+                                     FArray sb, int m, int n, int k, float sa) {
+        if (a.size() != (py::ssize_t)m * k || b.size() != (py::ssize_t)n * k)
+            throw std::invalid_argument("qgemm operand size mismatch");
+        if (sb.size() != n)
+            throw std::invalid_argument("per-channel scale vector must have n entries");
+        auto ia = a.request(), ib = b.request(), is = sb.request();
+        std::vector<float> y = ft::qgemm_perchannel_cpu(
+            std::vector<signed char>(static_cast<const signed char*>(ia.ptr),
+                                     static_cast<const signed char*>(ia.ptr) + a.size()),
+            std::vector<signed char>(static_cast<const signed char*>(ib.ptr),
+                                     static_cast<const signed char*>(ib.ptr) + b.size()),
+            std::vector<float>(static_cast<const float*>(is.ptr),
+                               static_cast<const float*>(is.ptr) + sb.size()),
+            m, n, k, sa);
+        py::array_t<float> out(std::vector<py::ssize_t>{m, n});
+        if (!y.empty())
+            std::memcpy(out.mutable_data(), y.data(), y.size() * 4);
+        return out;
+    }, py::arg("a"), py::arg("b"), py::arg("sb"), py::arg("m"), py::arg("n"),
+       py::arg("k"), py::arg("sa"));
+
+    m.def("qgemm_perchannel", [](py::array_t<signed char, py::array::c_style> a,
+                                 py::array_t<signed char, py::array::c_style> b,
+                                 FArray sb, int m, int n, int k, float sa) {
+        // staged: copy operands + scale vector up, run, copy the result back
+        if (a.size() != (py::ssize_t)m * k || b.size() != (py::ssize_t)n * k)
+            throw std::invalid_argument("qgemm operand size mismatch");
+        if (sb.size() != n)
+            throw std::invalid_argument("per-channel scale vector must have n entries");
+        if ((long long)m * n * k > (1LL << 38))
+            throw std::invalid_argument("qgemm operands too large");
+        DevBuf da(a.size()), db(b.size()), dsb((size_t)n * 4);
+        h2d(da.get(), a.data(), a.size());
+        h2d(db.get(), b.data(), b.size());
+        h2d(dsb.get(), sb.data(), (size_t)n * 4);
+        DevBuf dy((size_t)m * n * 4);
+        // the launcher no-ops empty operands and zero-fills K == 0
+        if (m > 0 && n > 0)
+            ft::qgemm_perchannel_launch(
+                reinterpret_cast<const signed char*>(da.fget()),
+                reinterpret_cast<const signed char*>(db.fget()),
+                reinterpret_cast<const float*>(dsb.fget()),
+                dy.fget(), m, n, k, sa, 0);
+        py::array_t<float> out(std::vector<py::ssize_t>{m, n});
+        if ((long long)m * n > 0)
+            d2h(out.mutable_data(), dy.get(), (size_t)m * n * 4);
+        sync_device("qgemm per-channel kernel");
+        return out;
+    }, py::arg("a"), py::arg("b"), py::arg("sb"), py::arg("m"), py::arg("n"),
+       py::arg("k"), py::arg("sa"));
+
+    m.def("qgemm_perchannel_launch", [](py::int_ a, py::int_ b, py::int_ sb,
+                                        py::int_ y, int m, int n, int k,
+                                        float sa, std::uintptr_t stream) {
+        ft::qgemm_perchannel_launch(
+            reinterpret_cast<const signed char*>((uintptr_t)a),
+            reinterpret_cast<const signed char*>((uintptr_t)b),
+            reinterpret_cast<const float*>((uintptr_t)sb),
+            dfm(y), m, n, k, sa, stream);
+    }, py::arg("a"), py::arg("b"), py::arg("sb"), py::arg("y"), py::arg("m"),
+       py::arg("n"), py::arg("k"), py::arg("sa"), py::arg("stream") = 0);
+
     // staged decode step: numpy logits + python ids in, token out
     m.def("decode_step", [](FArray logits, py::array_t<long long, py::array::c_style> ids,
                             double penalty, double p, double t,

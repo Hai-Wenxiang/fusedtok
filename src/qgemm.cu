@@ -108,10 +108,11 @@ constexpr int qgemm_smem_bytes() {
 // GEMM: cp.async double-buffered pipeline, IMMA wmma, templated tile
 // ---------------------------------------------------------------------------
 
-template <int TILE_M, int TILE_N, int SLAB, int MT, int NT, int BLOCK>
+template <int TILE_M, int TILE_N, int SLAB, int MT, int NT, int BLOCK, bool PC>
 __global__ __launch_bounds__(BLOCK) void qgemm_pipe_kernel(
     const signed char* __restrict__ aq, const signed char* __restrict__ bq,
-    float* __restrict__ y, int m, int n, int k, float scale) {
+    const float* __restrict__ sb_vec, float* __restrict__ y,
+    int m, int n, int k, float scale) {
     // Warp tiling: warps_m x warps_n over the block tile; each warp owns
     // (MT x NT) m16n16k16 mma tiles (MT*16 x NT*16 outputs). The config
     // constants below make the sub-tiles cover the block exactly.
@@ -363,7 +364,11 @@ __global__ __launch_bounds__(BLOCK) void qgemm_pipe_kernel(
 
     // Epilogue: int32 accumulators through shared (coalesced global
     // stores), one float scale applied exactly once - the bit-identical
-    // contract lives or dies with this single application.
+    // contract lives or dies with this single application. PC (per-
+    // channel) composes the output scale as f32(sa * sb_vec[gn]): one
+    // rounding for the scale, one for the product - the CPU reference
+    // performs the identical two-rounding sequence per element, and
+    // consecutive lanes read consecutive sb entries (coalesced).
     #pragma unroll
     for (int i = 0; i < MT; ++i)
         #pragma unroll
@@ -375,8 +380,12 @@ __global__ __launch_bounds__(BLOCK) void qgemm_pipe_kernel(
     for (int t = threadIdx.x; t < TILE_M * TILE_N; t += BLOCK) {
         const int r = t / TILE_N, c = t % TILE_N;
         const int gm = gm0 + r, gn = gn0 + c;
-        if (gm < m && gn < n)
-            y[(size_t)gm * n + gn] = (float)cs[t] * scale;
+        if (gm < m && gn < n) {
+            float s = scale;
+            if (PC)
+                s *= __ldg(&sb_vec[gn]);
+            y[(size_t)gm * n + gn] = (float)cs[t] * s;
+        }
     }
 }
 
@@ -413,29 +422,44 @@ int qgemm_smem_for(const QgConfig& cfg) {
     return qgemm_smem_bytes<64, 64, 64>();
 }
 
-void qgemm_launch_config(const QgConfig& cfg,
+void qgemm_launch_config(const QgConfig& cfg, bool pc,
                          const signed char* aq, const signed char* bq,
-                         float* y, int m, int n, int k, float scale,
+                         const float* sb_vec, float* y,
+                         int m, int n, int k, float scale,
                          dim3 grid, cudaStream_t cs) {
     const int smem = qgemm_smem_for(cfg);
     if (cfg.tile == 128) {
-        qgemm_pipe_kernel<128, 128, 64, 2, 2, 512>
-            <<<grid, cfg.block, smem, cs>>>(aq, bq, y, m, n, k, scale);
+        if (pc)
+            qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, true>
+                <<<grid, cfg.block, smem, cs>>>(aq, bq, sb_vec, y, m, n, k, scale);
+        else
+            qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, false>
+                <<<grid, cfg.block, smem, cs>>>(aq, bq, nullptr, y, m, n, k, scale);
     } else if (cfg.slab == 128) {
-        qgemm_pipe_kernel<64, 64, 128, 2, 1, 256>
-            <<<grid, cfg.block, smem, cs>>>(aq, bq, y, m, n, k, scale);
+        if (pc)
+            qgemm_pipe_kernel<64, 64, 128, 2, 1, 256, true>
+                <<<grid, cfg.block, smem, cs>>>(aq, bq, sb_vec, y, m, n, k, scale);
+        else
+            qgemm_pipe_kernel<64, 64, 128, 2, 1, 256, false>
+                <<<grid, cfg.block, smem, cs>>>(aq, bq, nullptr, y, m, n, k, scale);
     } else {
-        qgemm_pipe_kernel<64, 64, 64, 2, 1, 256>
-            <<<grid, cfg.block, smem, cs>>>(aq, bq, y, m, n, k, scale);
+        if (pc)
+            qgemm_pipe_kernel<64, 64, 64, 2, 1, 256, true>
+                <<<grid, cfg.block, smem, cs>>>(aq, bq, sb_vec, y, m, n, k, scale);
+        else
+            qgemm_pipe_kernel<64, 64, 64, 2, 1, 256, false>
+                <<<grid, cfg.block, smem, cs>>>(aq, bq, nullptr, y, m, n, k, scale);
     }
 }
 
-int qgemm_pick_config(const signed char* aq, const signed char* bq, float* y,
-                      int m, int n, int k, float scale, cudaStream_t cs) {
+int qgemm_pick_config(const signed char* aq, const signed char* bq,
+                      const float* sb_vec, float* y,
+                      int m, int n, int k, float scale, bool pc,
+                      cudaStream_t cs) {
     static std::mutex mu;
-    static std::map<std::tuple<int, int, int>, int> cache;
+    static std::map<std::tuple<int, int, int, bool>, int> cache;
     std::lock_guard<std::mutex> lock(mu);
-    const auto key = std::make_tuple(m, n, k);
+    const auto key = std::make_tuple(m, n, k, pc);
     auto it = cache.find(key);
     if (it != cache.end())
         return it->second;                // winning candidate index
@@ -451,7 +475,8 @@ int qgemm_pick_config(const signed char* aq, const signed char* bq, float* y,
             // opt-in dynamic smem above the 48 KB static ceiling; safe to
             // repeat. Never executed during a capture (tuning is skipped).
             if (cudaFuncSetAttribute(
-                    qgemm_pipe_kernel<128, 128, 64, 2, 2, 512>,
+                    (pc ? qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, true>
+                        : qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, false>),
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     qgemm_smem_for(cfg)) != cudaSuccess) {
                 cudaGetLastError();
@@ -468,7 +493,8 @@ int qgemm_pick_config(const signed char* aq, const signed char* bq, float* y,
         bool ok = true;
         try {
             for (int i = 0; i < 3; ++i)
-                qgemm_launch_config(cfg, aq, bq, y, m, n, k, scale, grid, cs);
+                qgemm_launch_config(cfg, pc, aq, bq, sb_vec, y, m, n, k,
+                                    scale, grid, cs);
         } catch (const std::runtime_error&) {
             cudaGetLastError();
             ok = false;
@@ -477,8 +503,8 @@ int qgemm_pick_config(const signed char* aq, const signed char* bq, float* y,
             cudaEventRecord(ev0, cs);
             try {
                 for (int i = 0; i < 8; ++i)
-                    qgemm_launch_config(cfg, aq, bq, y, m, n, k, scale,
-                                        grid, cs);
+                    qgemm_launch_config(cfg, pc, aq, bq, sb_vec, y, m, n, k,
+                                        scale, grid, cs);
             } catch (const std::runtime_error&) {
                 ok = false;
             }
@@ -504,11 +530,15 @@ int qgemm_pick_config(const signed char* aq, const signed char* bq, float* y,
 }
 
 // ---------------------------------------------------------------------------
-// GEMV: M == 1 decode step, one warp per output row
+// GEMV: M == 1 decode step, one warp per output row. PC composes the
+// output scale as f32(sa * sb_vec[warp]) - the same two-rounding
+// sequence as the GEMM epilogue and the CPU reference.
 // ---------------------------------------------------------------------------
 
+template <bool PC>
 __global__ void qgemv_kernel(const signed char* __restrict__ xq,
                              const signed char* __restrict__ wq,
+                             const float* __restrict__ sb_vec,
                              float* __restrict__ y,
                              int n, int k, float scale) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -539,7 +569,12 @@ __global__ void qgemv_kernel(const signed char* __restrict__ xq,
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) y[warp] = (float)acc * scale;
+    if (lane == 0) {
+        float s = scale;
+        if (PC)
+            s *= __ldg(&sb_vec[warp]);
+        y[warp] = (float)acc * s;
+    }
 }
 
 void qgemm_check(int m, int n, int k) {
@@ -574,6 +609,29 @@ std::vector<float> qgemm_cpu(const std::vector<signed char>& aq,
     return y;
 }
 
+std::vector<float> qgemm_perchannel_cpu(const std::vector<signed char>& aq,
+                                        const std::vector<signed char>& bq,
+                                        const std::vector<float>& sb,
+                                        int m, int n, int k, float sa) {
+    qgemm_check(m, n, k);
+    if ((size_t)m * k > aq.size() || (size_t)n * k > bq.size())
+        throw std::invalid_argument("qgemm operand size mismatch");
+    if (sb.size() != (size_t)n)
+        throw std::invalid_argument("per-channel scale vector must have n entries");
+    // Per element: f32(sa * sb[j]) once, then one product by the exact
+    // int32 accumulator - identical operation order to the GPU epilogue.
+    std::vector<float> y((size_t)m * n, 0.0f);
+    for (int i = 0; i < m; ++i)
+        for (int j = 0; j < n; ++j) {
+            int acc = 0;
+            const signed char* arow = aq.data() + (size_t)i * k;
+            const signed char* brow = bq.data() + (size_t)j * k;
+            for (int p = 0; p < k; ++p) acc += (int)arow[p] * (int)brow[p];
+            y[(size_t)i * n + j] = (float)acc * (sa * sb[j]);
+        }
+    return y;
+}
+
 // ---------------------------------------------------------------------------
 // launcher: dispatches M == 1 to the GEMV kernel, M > 1 to the pipelined
 // IMMA kernel with runtime config selection
@@ -595,7 +653,8 @@ void qgemm_launch(const signed char* aq, const signed char* bq,
     if (m == 1) {
         // one warp per output row; 256-thread blocks = 8 rows per block
         const int grid = (n + 7) / 8;
-        qgemv_kernel<<<grid, kQgBlockSmall, 0, cs>>>(aq, bq, y, n, k, sa * sb);
+        qgemv_kernel<false><<<grid, kQgBlockSmall, 0, cs>>>(
+            aq, bq, nullptr, y, n, k, sa * sb);
         check_launch("qgemv kernel launch");
         return;
     }
@@ -604,17 +663,57 @@ void qgemm_launch(const signed char* aq, const signed char* bq,
         // graph capture: no events/syncs during tuning - take the default
         dim3 grid((n + kQgTileSmall - 1) / kQgTileSmall,
                   (m + kQgTileSmall - 1) / kQgTileSmall);
-        qgemm_pipe_kernel<64, 64, 64, 2, 1, 256>
+        qgemm_pipe_kernel<64, 64, 64, 2, 1, 256, false>
             <<<grid, kQgBlockSmall, qgemm_smem_bytes<64, 64, 64>(), cs>>>(
-                aq, bq, y, m, n, k, scale);
+                aq, bq, nullptr, y, m, n, k, scale);
         check_launch("qgemm pipe kernel launch");
         return;
     }
-    const int ci = qgemm_pick_config(aq, bq, y, m, n, k, scale, cs);
+    const int ci = qgemm_pick_config(aq, bq, nullptr, y, m, n, k, scale,
+                                     false, cs);
     const QgConfig& cfg = kQgCands[ci];
     dim3 grid((n + cfg.tile - 1) / cfg.tile, (m + cfg.tile - 1) / cfg.tile);
-    qgemm_launch_config(cfg, aq, bq, y, m, n, k, scale, grid, cs);
+    qgemm_launch_config(cfg, false, aq, bq, nullptr, y, m, n, k, scale,
+                        grid, cs);
     check_launch("qgemm pipe kernel launch");
+}
+
+void qgemm_perchannel_launch(const signed char* aq, const signed char* bq,
+                             const float* sb_vec, float* y,
+                             int m, int n, int k, float sa,
+                             std::uintptr_t stream) {
+    qgemm_check(m, n, k);
+    if (!sb_vec)
+        throw std::invalid_argument("per-channel scale vector is required");
+    if (m == 0 || n == 0) return;
+    cudaStream_t cs = (cudaStream_t)stream;
+    if (k == 0) {
+        cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs);
+        return;
+    }
+    if (m == 1) {
+        const int grid = (n + 7) / 8;
+        qgemv_kernel<true><<<grid, kQgBlockSmall, 0, cs>>>(
+            aq, bq, sb_vec, y, n, k, sa);
+        check_launch("qgemv per-channel kernel launch");
+        return;
+    }
+    if (stream_is_capturing(cs)) {
+        dim3 grid((n + kQgTileSmall - 1) / kQgTileSmall,
+                  (m + kQgTileSmall - 1) / kQgTileSmall);
+        qgemm_pipe_kernel<64, 64, 64, 2, 1, 256, true>
+            <<<grid, kQgBlockSmall, qgemm_smem_bytes<64, 64, 64>(), cs>>>(
+                aq, bq, sb_vec, y, m, n, k, sa);
+        check_launch("qgemm pipe per-channel kernel launch");
+        return;
+    }
+    const int ci = qgemm_pick_config(aq, bq, sb_vec, y, m, n, k, sa,
+                                     true, cs);
+    const QgConfig& cfg = kQgCands[ci];
+    dim3 grid((n + cfg.tile - 1) / cfg.tile, (m + cfg.tile - 1) / cfg.tile);
+    qgemm_launch_config(cfg, true, aq, bq, sb_vec, y, m, n, k, sa,
+                        grid, cs);
+    check_launch("qgemm pipe per-channel kernel launch");
 }
 
 } // namespace fusedtok

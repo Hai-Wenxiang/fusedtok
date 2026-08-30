@@ -207,6 +207,21 @@ def main():
                    max(20, iters // 4),
                    bytes_moved=a.numel() + b.numel() + m * n * 4,
                    ops=2 * m * n * k)
+        # per-channel weight scales (W8A8): the torch reference is what
+        # real code writes - cuBLASLt _int_mm plus the scale broadcast
+        # (that epilogue runs inside the fusedtok kernel for free)
+        for m, n, k in [(512, 4096, 4096), (4096, 4096, 4096)]:
+            a = torch.randint(-127, 128, (m, k), device="cuda",
+                              dtype=torch.int8)
+            b = torch.randint(-127, 128, (n, k), device="cuda",
+                              dtype=torch.int8)
+            sb = (torch.rand(n, device="cuda") + 0.5) * 0.1
+            record("int8 qgemm pc", f"[{m}x{n}x{k}]",
+                   lambda: fusedtok.qgemm_perchannel(a, 0.02, b, sb),
+                   lambda: torch._int_mm(a, b.t()) * (0.02 * sb),
+                   max(20, iters // 4),
+                   bytes_moved=a.numel() + b.numel() + m * n * 4,
+                   ops=2 * m * n * k)
 
     # --- attention (decode step over a kv-cache; fresh-sequence prefill) ------
     # references use PRE-EXPANDED heads (repeat_interleave outside the
