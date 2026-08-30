@@ -107,13 +107,15 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
     const int lane = threadIdx.x & 31;
 
     // per-lane q chunks (lane owns chunk c for c = lane, lane+32, ...)
-    // plus the running online-softmax accumulator over this warp's keys
+    // plus the running online-softmax accumulator over this warp's keys;
+    // `j` is the per-lane chunk index used consistently from load to
+    // store (a second name for the same mapping hides the invariant)
     float4 qv[kAttLaneChunks];
     float4 acc[kAttLaneChunks];
-    int nc = 0;
-    for (int c = lane; c < chunks; c += 32, ++nc) {
-        qv[nc] = q4[c];
-        acc[nc] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    int j = 0;
+    for (int c = lane; c < chunks; c += 32, ++j) {
+        qv[j] = q4[c];
+        acc[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
     float m = -INFINITY;   // running max of this warp's scaled scores
     float l = 0.0f;        // running softmax denominator
@@ -123,7 +125,7 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
     for (int t = warp; t < len; t += kAttWarps) {
         const float4* krow = k4 + (size_t)t * chunks;
         float dot = 0.0f;
-        int j = 0;
+        j = 0;
         for (int c = lane; c < chunks; c += 32, ++j) {
             const float4 kk = krow[c];
             dot += qv[j].x * kk.x + qv[j].y * kk.y
@@ -160,7 +162,7 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
         sm_ml[warp][1] = l;
     }
     {
-        int j = 0;
+        j = 0;
         for (int c = lane; c < chunks; c += 32, ++j)
             *reinterpret_cast<float4*>(&sm_acc[warp][c * 4]) = acc[j];
     }
@@ -178,7 +180,7 @@ __global__ void attn_decode_kernel(const float* __restrict__ q,
             denom += sm_ml[w][1] * expf(sm_ml[w][0] - m_all);
 
     // each lane rescales its own chunks across all warp partials
-    int j = 0;
+    j = 0;
     for (int c = lane; c < chunks; c += 32, ++j) {
         float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int w = 0; w < kAttWarps; ++w) {
@@ -242,7 +244,8 @@ __global__ void attn_split_kernel(const float* __restrict__ q,
 
     // per-lane q chunks for each head of the group + running state.
     // Lanes that own no chunk (chunks < 32, e.g. D=4) keep the empty
-    // online state, which the merge skips via l == 0.
+    // online state, which the merge skips via l == 0. `nj` is the
+    // per-lane chunk count; `j` below walks the same mapping.
     float4 qv[G][kAttLaneChunks];
     float4 acc[G][kAttLaneChunks];
     float m[G], l[G];
@@ -251,12 +254,12 @@ __global__ void attn_split_kernel(const float* __restrict__ q,
         m[g] = -INFINITY;
         l[g] = 0.0f;
     }
-    int nc = 0;
-    for (int c = lane; c < chunks; c += 32, ++nc)
+    int nj = 0;
+    for (int c = lane; c < chunks; c += 32, ++nj)
         #pragma unroll
         for (int g = 0; g < G; ++g) {
-            qv[g][nc] = q4[(size_t)g * chunks + c];
-            acc[g][nc] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            qv[g][nj] = q4[(size_t)g * chunks + c];
+            acc[g][nj] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
 
     // warps stride the slice; the k/v rows are read once and reused
@@ -265,10 +268,9 @@ __global__ void attn_split_kernel(const float* __restrict__ q,
         const float4* krow = k4 + (size_t)t * chunks;
         const float4* vrow = v4 + (size_t)t * chunks;
         float4 kc[kAttLaneChunks], vc[kAttLaneChunks];
-        int nj = 0;
-        for (int c = lane; c < chunks; c += 32, ++nj) {
-            kc[nj] = krow[c];
-            vc[nj] = vrow[c];
+        for (int j = 0; j < nj; ++j) {
+            kc[j] = krow[lane + (size_t)j * 32];
+            vc[j] = vrow[lane + (size_t)j * 32];
         }
         for (int g = 0; g < G; ++g) {
             float dot = 0.0f;
@@ -373,9 +375,11 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
 
     float4 o[kAttLaneChunks];
     float m = -INFINITY, l = 0.0f;
-    int nc = 0;
-    for (int c = lane; c < chunks; c += 32, ++nc)
-        o[nc] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // per-lane partial chunks (lane owns chunk c for c = lane, lane+32,
+    // ...); `j` walks the same mapping from reset to store
+    int j = 0;
+    for (int c = lane; c < chunks; c += 32, ++j)
+        o[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     const size_t base = (((size_t)bi * hkv + kv) * slices) * group + gi;
     for (int s = 0; s < slices; ++s) {
@@ -389,7 +393,7 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
         if (l == 0.0f) {                   // first live partial: adopt
             m = ms;
             l = ls;
-            int j = 0;
+            j = 0;
             for (int c = lane; c < chunks; c += 32, ++j)
                 o[j] = pa[c];
             continue;
@@ -397,7 +401,7 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
         const float m_new = fmaxf(m, ms);
         const float r_old = expf(m - m_new), r_new = expf(ms - m_new);
         l = l * r_old + ls * r_new;
-        int j = 0;
+        j = 0;
         for (int c = lane; c < chunks; c += 32, ++j) {
             const float4 a = pa[c];
             o[j].x = o[j].x * r_old + a.x * r_new;
@@ -412,7 +416,7 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
             o4[c] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
-    int j = 0;
+    j = 0;
     for (int c = lane; c < chunks; c += 32, ++j)
         o4[c] = make_float4(o[j].x / l, o[j].y / l, o[j].z / l, o[j].w / l);
 }

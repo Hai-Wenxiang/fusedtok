@@ -45,7 +45,7 @@ CUDA cases skip automatically.
 
 ## New-kernel checklist
 
-Lessons baked into the v0.3/v0.4 sprints - run through this before
+Lessons baked into the v0.3/v0.4/v0.5 sprints - run through this before
 pushing any new GPU kernel:
 
 - [ ] **Sanitizer trio before review**: `compute-sanitizer --tool memcheck`
@@ -65,6 +65,16 @@ pushing any new GPU kernel:
       capturable. If the kernel sequence is cached in a graph, remember
       kernel *parameters* get baked - per-call values must travel through
       device memory.
+- [ ] **Compile-time loop bounds for register arrays**: a per-thread
+      array indexed by a loop whose trip count is a RUNTIME value is
+      demoted to local memory (spill traffic every iteration - the
+      v0.5 prefill kernel lost 7x to this before the bound became a
+      `#pragma unroll`-able constant with an early `break`).
+- [ ] **Masked shuffles under warp divergence**: `__shfl_*_sync` with a
+      full-warp mask deadlocks when only part of the warp arrives (the
+      v0.5 prefill lanes split into per-row groups with different
+      `live` flags). Compute the mask for the lane group that actually
+      executes the shuffle.
 - [ ] **Platform traps**: `1ULL << 64` is UB in device code; `char4`
       fields are plain `char` (unsigned on MSVC - cast through
       `(signed char)`); single-thread serial volatile loads are latency

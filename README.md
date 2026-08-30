@@ -5,9 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/pyproject.toml)
 
-**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU and friends,
-with **zero-copy torch tensor support**: up to **6.2x faster than PyTorch eager**
-(RoPE, RTX 3060, see [Benchmarks](#benchmarks)).
+**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU / attention
+decode and friends, with **zero-copy torch tensor support**: up to
+**9.3x faster than PyTorch SDPA** (attention decode, RTX 3060, see
+[Benchmarks](#benchmarks)).
 
 **中文文档请看 [README_zh.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README_zh.md)** | English below.
 
@@ -44,9 +45,9 @@ traffic and launch overhead.
 pip install fusedtok
 ```
 
-Prebuilt Linux x86_64 wheels (manylinux, built with CUDA 12.4) are on PyPI.
-On Windows (or any platform without a matching wheel) pip builds from
-source automatically:
+Prebuilt wheels on PyPI (built with CUDA 12.4): **Linux x86_64** (manylinux,
+cp310) and **Windows x86_64** (cp312). On other platforms or Python versions
+pip builds from source automatically:
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
@@ -111,6 +112,15 @@ yt = fusedtok.rmsnorm(xt, wt)          # -> CUDA torch tensor
 q = torch.randn(1, 4096, device="cuda")          # new token only
 q_rot, k_rot = fusedtok.rope(q, k=None, pos_offset=1023, neox=True)
 
+# attention over a GQA kv-cache: one call per decode step, no score
+# materialization, variable-length batches share one cache tensor
+out = fusedtok.attention_decode(
+    q_heads,                                    # [B, Hq, D] new token
+    k_cache, v_cache,                           # [B, Hkv, T, D]
+    lens=torch.tensor([1023, 512], dtype=torch.int32, device="cuda"))
+# fresh-sequence prefill (causal by default; convenience path)
+ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
+
 # sampling side: the whole decode step in one fused call
 token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,
                              p=0.9, temperature=0.8, seed=step)
@@ -153,7 +163,8 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 
 ## Benchmarks
 
-RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing, vs
+RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing over
+3 independent rounds (means below; per-round values in the JSON), vs
 the equivalent PyTorch reference (composite eager expressions; attention
 references use **pre-expanded** heads - `repeat_interleave` outside the
 timed region). Largest shape per op; full data:
@@ -161,16 +172,16 @@ timed region). Largest shape per op; full data:
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| attention_decode (GQA) | T=16384, D=128 | 857 µs | 7667 µs (SDPA) | **8.9x** |
-| RoPE NeoX (q+k) | [8192×4096] | 1654 µs | 10092 µs | **6.1x** |
-| RMSNorm (+residual) | [4096×4096] | 613 µs | 2058 µs | **3.4x** |
-| SwiGLU | [4096×4096] | 610 µs | 1031 µs | **1.7x** |
-| top-k (k=50) | [131072] | 78 µs | 125 µs | **1.6x** |
-| LayerNorm | [4096×4096] | 441 µs | 615 µs | **1.4x** |
-| Softmax | [4096×4096] | 415 µs | 427 µs | 1.0x |
-| SiLU / GeLU / add | [4096×4096] | ~414 µs | ~411 µs | ~1.0x |
-| argmax | [131072] | 39 µs | 35 µs | 0.9x (incl. host readback) |
-| attention_prefill (causal) | S=1024, D=128 | 5764 µs | 2607 µs (SDPA flash) | 0.45x (honest) |
+| attention_decode (GQA) | T=16384, D=128 | 853 µs | 7614 µs (SDPA) | **8.92x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
+| RMSNorm (+residual) | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
+| SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
+| top-k (k=50) | [131072] | 80 µs | 127 µs | **1.59x** |
+| LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
+| Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
+| SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
+| argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) |
+| attention_prefill (causal) | S=1024, D=128 | 5732 µs | 2560 µs (SDPA flash) | 0.45x (honest) |
 
 Row-wise kernels (norms, softmax) autotune their thread-block size per
 shape at first call (v0.4.1); the table reflects the tuned choices.
@@ -182,14 +193,14 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [8192×4096] | 1385 µs | 8372 µs | **6.0x** |
-| RMSNorm (+residual) | [4096×4096] | 505 µs | 1658 µs | **3.3x** |
-| attention_decode (GQA) | T=16384, D=128 | 572 µs | 2669 µs (SDPA) | **4.7x** |
-| SwiGLU | [4096×4096] | 505 µs | 858 µs | **1.7x** |
-| top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.5x** |
-| LayerNorm / Softmax | [4096×4096] | ~344 µs | ~347 µs | 1.0x |
-| argmax | [131072] | 17 µs | 14 µs | 0.8x (incl. host readback) |
-| attention_prefill (causal) | S=1024, D=128 | 3299 µs | 1420 µs (SDPA flash) | 0.43x (honest) |
+| RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8368 µs | **6.04x** |
+| attention_decode (GQA) | T=16384, D=128 | 575 µs | 2682 µs (SDPA) | **4.67x** |
+| RMSNorm (+residual) | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
+| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
+| top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |
+| LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
+| argmax | [131072] | 17 µs | 14 µs | 0.83x (incl. host readback) |
+| attention_prefill (causal) | S=1024, D=128 | 3291 µs | 1421 µs (SDPA flash) | 0.43x (honest) |
 
 On smaller shapes the Blackwell card shows bigger wins (softmax 2.5x,
 RMSNorm 3.2x at 256 rows, attention decode 3.8x at T=4096 running
