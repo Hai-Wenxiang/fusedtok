@@ -194,7 +194,8 @@ timed region). Largest shape per op; full data:
 | LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
-| sample_topk k=50 | [131072] | 133 µs | 282 µs (topk+multinomial) | **2.13x** |
+| sample_topk k=50 | [131072] | 135 µs | 292 µs (topk+multinomial) | **2.16x** |
+| sample_topp p=0.9 (peaked) | [131072] | 160 µs | 496 µs (sort+mask+multinomial) | **3.11x** |
 | argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) |
 | int8 qgemm (IMMA) | [4096×4096×4096] | 3554 µs (38.7 TOPS) | 1634 µs (cuBLASLt) | 0.46x (honest) |
 | int8 qgemm pc (W8A8) | [4096×4096×4096] | 3553 µs (38.7 TOPS) | 2046 µs (cuBLASLt + broadcast) | 0.58x (honest) |

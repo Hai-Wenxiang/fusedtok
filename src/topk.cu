@@ -1274,7 +1274,13 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
             return token;                  // nucleus covered, token sampled
         if (window == n)
             throw std::runtime_error("sample nucleus not covered");
-        window = std::min(n, window * 4);  // widen and retry
+        // x8: flat distributions need windows 50-100x the vocab tail;
+        // x4 needed up to five full pipeline attempts on n=131072, each
+        // re-histogramming every key. The sampled token is unaffected by
+        // the jump size (a covered nucleus samples identically - the
+        // threshold is the global mass, the renormalization the nucleus
+        // mass), only the number of retries changes.
+        window = std::min(n, window * 8);  // widen and retry
     }
 }
 
@@ -1380,7 +1386,7 @@ long long decode_step_launch(const float* x, const long long* ids,
             return token;
         if (window == n)
             throw std::runtime_error("decode step nucleus not covered");
-        window = std::min(n, window * 4);
+        window = std::min(n, window * 8);  // same jump-size rationale
     }
 }
 
