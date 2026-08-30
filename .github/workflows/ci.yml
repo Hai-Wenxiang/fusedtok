@@ -17,14 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Text hygiene gate (strict UTF-8, no BOM, no mojibake)
-        run: python3 scripts/check_utf8.py
-
       - name: Install build dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends python3-dev python3-pip
           pip3 install --no-cache-dir pybind11 pytest numpy cmake ninja
+
+      # Runs after python3 exists (the CUDA base image ships none) and
+      # before anything expensive compiles: text hygiene is the cheapest
+      # gate, so a mojibake'd doc fails the build in seconds.
+      - name: Text hygiene gate (strict UTF-8, no BOM, no mojibake)
+        run: python3 scripts/check_utf8.py
 
       - name: Configure
         run: >
