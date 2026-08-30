@@ -183,7 +183,9 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
-| sample_topk k=50 | [131072] | 133 µs | 282 µs（topk+multinomial） | **2.13x** |
+| sample_topk k=50 | [131072] | 135 µs | 292 µs（topk+multinomial） | **2.16x** |
+| sample_topp p=0.9（峰值分布） | [131072] | 160 µs | 496 µs（排序+掩码+multinomial） | **3.11x** |
+| sample_topp p=0.9（平坦最坏） | [131072] | 25388 µs | 391 µs | 0.02x（诚实，见下） |
 | argmax | [131072] | 65 µs | 45 µs | 0.69x（含主机回读） |
 | int8 qgemm（IMMA） | [4096×4096×4096] | 3554 µs（38.7 TOPS） | 1634 µs（cuBLASLt） | 0.46x（诚实） |
 | int8 qgemm pc（W8A8） | [4096×4096×4096] | 3553 µs（38.7 TOPS） | 2046 µs（cuBLASLt + 广播） | 0.58x（诚实） |
@@ -206,7 +208,9 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.50x** |
 | top-k（k=4096，中段 k） | [131072] | 50 µs | 54 µs（CUB） | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
-| sample_topk k=50 | [131072] | 49 µs | 93 µs（topk+multinomial） | **1.91x** |
+| sample_topk k=50 | [131072] | 47 µs | 93 µs（topk+multinomial） | **1.98x** |
+| sample_topp p=0.9（峰值分布） | [131072] | 62 µs | 155 µs（排序+掩码+multinomial） | **2.49x** |
+| sample_topp p=0.9（平坦最坏） | [131072] | 17635 µs | 159 µs | 0.01x（诚实，见下） |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x（含主机回读） |
 | int8 qgemm（IMMA） | [4096×4096×4096] | 2063 µs（66.6 TOPS） | 800 µs（cuBLASLt） | 0.39x（诚实） |
 | int8 qgemm pc（W8A8） | [4096×4096×4096] | 2079 µs（66.1 TOPS） | 1142 µs（cuBLASLt + 广播） | 0.55x（诚实） |
@@ -226,7 +230,13 @@ Blackwell（sm_120）驱动上验证 JIT 运行正确。
 回放）在两张卡上小 k 场景均超过 torch 的 CUB radix select；v1.0 重调
 （块内排序阈值与排序 chunk 双双从 2048 降到 1024 —— 单 block 位排序
 2048 个 key 正是中段 k 退步的全部来源）让中段 k 窗口也持平到领先
-（k=4096 @131k：1.12x / 1.09x）。attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
+（k=4096 @131k：1.12x / 1.09x）。融合采样器在真实解码形态的 logits 上
+胜过 eager 组合式（sample_topp 峰值：3.11x / 2.49x；sample_topk：
+2.16x / 1.98x）；平坦分布下 sample_topp 诚实为 0.01-0.02x —— 此时核
+覆盖大半个词表，扩窗循环要在越来越大的窗口上重跑整条管线（1.0.1 起步
+长 ×8），最终串行扫描按设计是单线程的（v0.4 起就明确记录；torch 的全
+并行排序天然适合这种 regime）。
+attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
 有效带宽最高约 157 GB/s，而 SDPA 要付头展开或小查询低效的代价）；
 attention_prefill 是诚实的便捷路径，约为 SDPA flash 后端的 0.45x ——
 设计上不用 tensor core，重度 prefill 请继续用 SDPA/FlashAttention。

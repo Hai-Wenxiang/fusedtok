@@ -196,8 +196,8 @@ timed region). Largest shape per op; full data:
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
 | sample_topk k=50 | [131072] | 135 µs | 292 µs (topk+multinomial) | **2.16x** |
 | sample_topp p=0.9 (peaked) | [131072] | 160 µs | 496 µs (sort+mask+multinomial) | **3.11x** |
-| argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) |
-| int8 qgemm (IMMA) | [4096×4096×4096] | 3554 µs (38.7 TOPS) | 1634 µs (cuBLASLt) | 0.46x (honest) |
+| sample_topp p=0.9 (flat worst case) | [131072] | 25388 µs | 391 µs | 0.02x (honest, see below) |
+| argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) || int8 qgemm (IMMA) | [4096×4096×4096] | 3554 µs (38.7 TOPS) | 1634 µs (cuBLASLt) | 0.46x (honest) |
 | int8 qgemm pc (W8A8) | [4096×4096×4096] | 3553 µs (38.7 TOPS) | 2046 µs (cuBLASLt + broadcast) | 0.58x (honest) |
 | attention_prefill (causal) | S=1024, D=128 | 5732 µs | 2560 µs (SDPA flash) | 0.45x (honest) |
 
@@ -218,7 +218,9 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |
 | top-k (k=4096, mid-k) | [131072] | 50 µs | 54 µs (CUB) | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
-| sample_topk k=50 | [131072] | 49 µs | 93 µs (topk+multinomial) | **1.91x** |
+| sample_topk k=50 | [131072] | 47 µs | 93 µs (topk+multinomial) | **1.98x** |
+| sample_topp p=0.9 (peaked) | [131072] | 62 µs | 155 µs (sort+mask+multinomial) | **2.49x** |
+| sample_topp p=0.9 (flat worst case) | [131072] | 17635 µs | 159 µs | 0.01x (honest, see below) |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x (incl. host readback) |
 | int8 qgemm (IMMA) | [4096×4096×4096] | 2063 µs (66.6 TOPS) | 800 µs (cuBLASLt) | 0.39x (honest) |
 | int8 qgemm pc (W8A8) | [4096×4096×4096] | 2079 µs (66.1 TOPS) | 1142 µs (cuBLASLt + broadcast) | 0.55x (honest) |
@@ -241,7 +243,15 @@ cached CUDA graph) beats torch's CUB radix select at small k on both
 GPUs; the v1.0 retune (in-block-sort threshold and sort chunk both
 dropped 2048 -> 1024 - a single block bitonic-sorting 2048 keys was the
 whole mid-k regression) brings the mid-k window to parity-or-winning as
-well (k=4096 @131k: 1.12x / 1.09x). attention_decode wins
+well (k=4096 @131k: 1.12x / 1.09x). The fused samplers win against the
+eager composites when the logits look like real decode output
+(sample_topp peaked: 3.11x / 2.49x; sample_topk: 2.16x / 1.98x); on a
+FLAT distribution sample_topp is honestly 0.01-0.02x - the nucleus then
+spans most of the vocab, the widening loop reruns the pipeline on
+ever-larger windows (x8 jumps since 1.0.1), and the final serial scan
+is single-threaded by design (documented since v0.4; torch's fully
+parallel sort handles that regime natively).
+attention_decode wins
 big at decode (one launch streams the GQA cache once at up to ~157 GB/s
 effective while SDPA pays head expansion or small-query inefficiency);
 attention_prefill is the honest convenience path at ~0.45x of SDPA's
