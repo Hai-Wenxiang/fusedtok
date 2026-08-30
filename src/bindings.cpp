@@ -1047,6 +1047,42 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("out"), py::arg("batch"), py::arg("hq"), py::arg("hkv"),
        py::arg("t_seq"), py::arg("dim"), py::arg("stream") = 0);
 
+    // bfloat16 / float16 zero-copy variants: q/k/v/out are half-width
+    // device buffers (out matches the input dtype); lens stays int32
+    m.def("attention_decode_launch_bf16",
+          [](py::int_ q, py::int_ k, py::int_ v, py::object lens,
+             py::int_ out, int batch, int hq, int hkv, int t_seq, int dim,
+             std::uintptr_t stream) {
+        const int* lp = nullptr;
+        if (!lens.is_none())
+            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        ft::attention_decode_launch_bf16(
+            reinterpret_cast<const void*>((uintptr_t)q),
+            reinterpret_cast<const void*>((uintptr_t)k),
+            reinterpret_cast<const void*>((uintptr_t)v), lp,
+            reinterpret_cast<void*>((uintptr_t)out),
+            batch, hq, hkv, t_seq, dim, stream);
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lens"),
+       py::arg("out"), py::arg("batch"), py::arg("hq"), py::arg("hkv"),
+       py::arg("t_seq"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("attention_decode_launch_fp16",
+          [](py::int_ q, py::int_ k, py::int_ v, py::object lens,
+             py::int_ out, int batch, int hq, int hkv, int t_seq, int dim,
+             std::uintptr_t stream) {
+        const int* lp = nullptr;
+        if (!lens.is_none())
+            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        ft::attention_decode_launch_fp16(
+            reinterpret_cast<const void*>((uintptr_t)q),
+            reinterpret_cast<const void*>((uintptr_t)k),
+            reinterpret_cast<const void*>((uintptr_t)v), lp,
+            reinterpret_cast<void*>((uintptr_t)out),
+            batch, hq, hkv, t_seq, dim, stream);
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lens"),
+       py::arg("out"), py::arg("batch"), py::arg("hq"), py::arg("hkv"),
+       py::arg("t_seq"), py::arg("dim"), py::arg("stream") = 0);
+
     m.def("attention_prefill_cpu", [](FArray q, FArray k, FArray v,
                                       int batch, int hq, int hkv, int seq,
                                       int dim, bool causal) {
@@ -1096,6 +1132,34 @@ PYBIND11_MODULE(_fusedtok, m) {
         ft::attention_prefill_launch(df(q), df(k), df(v), dfm(out),
                                      batch, hq, hkv, seq, dim, causal,
                                      stream);
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+       py::arg("batch"), py::arg("hq"), py::arg("hkv"), py::arg("seq"),
+       py::arg("dim"), py::arg("causal"), py::arg("stream") = 0);
+
+    m.def("attention_prefill_launch_bf16",
+          [](py::int_ q, py::int_ k, py::int_ v, py::int_ out,
+             int batch, int hq, int hkv, int seq, int dim, bool causal,
+             std::uintptr_t stream) {
+        ft::attention_prefill_launch_bf16(
+            reinterpret_cast<const void*>((uintptr_t)q),
+            reinterpret_cast<const void*>((uintptr_t)k),
+            reinterpret_cast<const void*>((uintptr_t)v),
+            reinterpret_cast<void*>((uintptr_t)out),
+            batch, hq, hkv, seq, dim, causal, stream);
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+       py::arg("batch"), py::arg("hq"), py::arg("hkv"), py::arg("seq"),
+       py::arg("dim"), py::arg("causal"), py::arg("stream") = 0);
+
+    m.def("attention_prefill_launch_fp16",
+          [](py::int_ q, py::int_ k, py::int_ v, py::int_ out,
+             int batch, int hq, int hkv, int seq, int dim, bool causal,
+             std::uintptr_t stream) {
+        ft::attention_prefill_launch_fp16(
+            reinterpret_cast<const void*>((uintptr_t)q),
+            reinterpret_cast<const void*>((uintptr_t)k),
+            reinterpret_cast<const void*>((uintptr_t)v),
+            reinterpret_cast<void*>((uintptr_t)out),
+            batch, hq, hkv, seq, dim, causal, stream);
     }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
        py::arg("batch"), py::arg("hq"), py::arg("hkv"), py::arg("seq"),
        py::arg("dim"), py::arg("causal"), py::arg("stream") = 0);

@@ -136,6 +136,22 @@ void attention_decode_launch(const float* q, const float* k, const float* v,
                              int cache_rows, int dim,
                              std::uintptr_t stream = 0);
 
+// bfloat16 / float16 storage variants: q/k/v/out are half-precision
+// (out matches the input dtype); softmax and every accumulator still
+// run in float32, so numerics match the float32 path up to input
+// rounding. Pointers alias half-width buffers (out: [B,Hq,D] elements
+// of the same dtype).
+void attention_decode_launch_bf16(const void* q, const void* k,
+                                  const void* v, const int* lens, void* out,
+                                  int batch, int q_heads, int kv_heads,
+                                  int cache_rows, int dim,
+                                  std::uintptr_t stream = 0);
+void attention_decode_launch_fp16(const void* q, const void* k,
+                                  const void* v, const int* lens, void* out,
+                                  int batch, int q_heads, int kv_heads,
+                                  int cache_rows, int dim,
+                                  std::uintptr_t stream = 0);
+
 // Prefill (fresh-sequence) attention: q [B,Hq,S,D] attends over k/v
 // [B,Hkv,S,D]; causal=true masks query row i to key rows [0, i] (the
 // prefill diagonal), causal=false attends everywhere (bidirectional).
@@ -147,6 +163,19 @@ void attention_prefill_launch(const float* q, const float* k,
                               int batch, int q_heads, int kv_heads,
                               int seq, int dim, bool causal,
                               std::uintptr_t stream = 0);
+
+// bfloat16 / float16 storage variants: q/k/v/out are half-precision
+// (out matches the input dtype); staging and accumulators stay float32.
+void attention_prefill_launch_bf16(const void* q, const void* k,
+                                   const void* v, void* out,
+                                   int batch, int q_heads, int kv_heads,
+                                   int seq, int dim, bool causal,
+                                   std::uintptr_t stream = 0);
+void attention_prefill_launch_fp16(const void* q, const void* k,
+                                   const void* v, void* out,
+                                   int batch, int q_heads, int kv_heads,
+                                   int seq, int dim, bool causal,
+                                   std::uintptr_t stream = 0);
 
 // --- bf16 variants: float32 compute, bf16 storage ---------------------------
 // Weight/bias parameters stay float32 (norm weights are commonly kept fp32

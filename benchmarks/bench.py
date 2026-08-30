@@ -268,7 +268,9 @@ def main():
 
     # --- attention (decode step over a kv-cache; fresh-sequence prefill) ------
     # references use PRE-EXPANDED heads (repeat_interleave outside the
-    # timed region) - the fair fight; fusedtok reads the GQA cache as-is
+    # timed region) - the fair fight; fusedtok reads the GQA cache as-is.
+    # bf16 rows (v1.1): half-width kv-cache = half the bytes; the SDPA
+    # reference runs the same dtype so the fight stays fair.
     for cache_rows in [4096, 16384]:
         b, hq, hkv, d = 1, 32, 8, 128
         q = torch.randn(b, hq, d, device="cuda")
@@ -282,6 +284,17 @@ def main():
                lambda: torch.nn.functional.scaled_dot_product_attention(
                    q.unsqueeze(2), kk, vv).squeeze(2),
                max(20, iters // 2), bytes_moved=kv_bytes)
+        qb = q.to(torch.bfloat16)
+        kb = k.to(torch.bfloat16)
+        vb = v.to(torch.bfloat16)
+        kkb = kk.to(torch.bfloat16)
+        vvb = vv.to(torch.bfloat16)
+        record("attn decode bf16", f"T={cache_rows}",
+               lambda: fusedtok.attention_decode(qb, kb, vb),
+               lambda: torch.nn.functional.scaled_dot_product_attention(
+                   qb.unsqueeze(2), kkb, vvb).squeeze(2),
+               max(20, iters // 2),
+               bytes_moved=(2 * kb.numel() + qb.numel() * 2) * 2)
 
     b, hq, hkv, d, s = 1, 32, 8, 128, 1024
     qp = torch.randn(b, hq, s, d, device="cuda")

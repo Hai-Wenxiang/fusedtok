@@ -111,9 +111,31 @@ def _check_torch_f32(t, name):
 def _check_torch_float(t, name):
     """Accept float32 or bfloat16 (the two dtypes with CUDA kernels)."""
     if t.dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError(f"{name} must be float32 or bfloat16, got {t.dtype}")
+        raise TypeError(f"{name} must be float32 or bfloat16, got {t.dtype} "
+                        "(convert with .to(torch.float32))")
     if not t.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+
+
+def _check_torch_att(t, name):
+    """Accept the three attention storage dtypes: float32, bfloat16,
+    float16 (attention kernels are templated on the storage dtype and
+    compute in float32)."""
+    if t.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise TypeError(f"{name} must be float32, bfloat16 or float16, "
+                        f"got {t.dtype} (convert with .to(torch.float32))")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _att_launch_fn(t, base):
+    """The bindings entry point for t's storage dtype ('_launch' suffix
+    style: attention_decode_launch / ..._bf16 / ..._fp16)."""
+    if t.dtype is torch.bfloat16:
+        return getattr(_fusedtok, base + "_bf16")
+    if t.dtype is torch.float16:
+        return getattr(_fusedtok, base + "_fp16")
+    return getattr(_fusedtok, base)
 
 
 def _norm_weight_f32(weight, ref):
@@ -483,11 +505,20 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
     rows past lens[b] are treated as padding and variable-length batches
     share one cache tensor). q head h attends with kv head
     ``h // (Hq // Hkv)`` - contiguous GQA groups; ``Hq == Hkv`` is plain
-    MHA. Sequences with length 0 produce zero output rows. float32 only.
+    MHA. Sequences with length 0 produce zero output rows.
+
+    CUDA tensors may be float32, bfloat16 or float16 - output matches
+    the input dtype and every accumulator stays float32, so the
+    half-precision paths halve the kv-cache bytes (the decode-step
+    bottleneck) without changing the softmax numerics. Non-CUDA inputs
+    run the float32 CPU reference (numpy has no bf16/fp16).
     """
     if _device_path(q, cuda) == "torch-cuda":
         for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
-            _check_torch_f32(t, name)
+            _check_torch_att(t, name)
+        for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
+            if t.dtype is not q.dtype:
+                raise TypeError(f"{name} must have the same dtype as q")
         if q.ndim != 3 or k_cache.ndim != 4 or v_cache.ndim != 4:
             raise ValueError("q must be [B, Hq, D]; k/v caches [B, Hkv, T, D]")
         b, hq, d = q.shape
@@ -513,9 +544,9 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
             if lt.numel() and (int(lt.min()) < 0 or int(lt.max()) > t_rows):
                 raise ValueError("lens entries must be in [0, T]")
             lens_ptr = lt.data_ptr()
-        out = torch.empty((b, hq, d), dtype=torch.float32, device=q.device)
+        out = torch.empty((b, hq, d), dtype=q.dtype, device=q.device)
         if b * hq > 0:
-            _fusedtok.attention_decode_launch(
+            _att_launch_fn(q, "attention_decode_launch")(
                 q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
                 lens_ptr, out.data_ptr(), b, hq, hkv, t_rows, d,
                 _cuda_stream())
@@ -547,11 +578,20 @@ def attention_prefill(q, k, v, causal=True, *, cuda=False):
 
     q: [B, Hq, S, D]; k / v: [B, Hkv, S, D]; out: [B, Hq, S, D]. Same
     contiguous-group GQA mapping as :func:`attention_decode` (Hq must be
-    a multiple of Hkv). float32; dim multiple of 4, at most 512.
+    a multiple of Hkv). dim: multiple of 4, at most 512.
+
+    CUDA tensors may be float32, bfloat16 or float16 - output matches
+    the input dtype and every accumulator stays float32 (this is the
+    convenience path: half precision halves the IO bytes, the heavy
+    prefill still belongs to SDPA/FlashAttention). Non-CUDA inputs run
+    the float32 CPU reference.
     """
     if _device_path(q, cuda) == "torch-cuda":
         for name, t in (("q", q), ("k", k), ("v", v)):
-            _check_torch_f32(t, name)
+            _check_torch_att(t, name)
+        for name, t in (("k", k), ("v", v)):
+            if t.dtype is not q.dtype:
+                raise TypeError(f"{name} must have the same dtype as q")
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("q/k/v must be [B, heads, S, D]")
         b, hq, s, d = q.shape
@@ -560,10 +600,9 @@ def attention_prefill(q, k, v, causal=True, *, cuda=False):
             raise ValueError("k/v must match q's batch, seq and dim")
         if hq % hkv:
             raise ValueError("q heads must be a multiple of kv heads")
-        out = torch.empty((b, hq, s, d), dtype=torch.float32,
-                          device=q.device)
+        out = torch.empty((b, hq, s, d), dtype=q.dtype, device=q.device)
         if b * hq * s > 0:
-            _fusedtok.attention_prefill_launch(
+            _att_launch_fn(q, "attention_prefill_launch")(
                 q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
                 b, hq, hkv, s, d, bool(causal), _cuda_stream())
         return out
