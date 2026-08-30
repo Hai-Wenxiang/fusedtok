@@ -4,6 +4,102 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] - 2026-08-30
+
+First stable release. The public surface (30 operators and helpers in
+`fusedtok.__all__`) is now frozen: additions land in minor releases,
+signature changes require a major version and a deprecation window.
+Typed (PEP 561 `py.typed` + stubs), bilingual docs, a text-hygiene CI
+gate, and a seven-way release wheel matrix (Linux cp310-cp313, Windows
+cp311-cp313).
+
+### Added
+- API freeze infrastructure for 1.0: `python/fusedtok/__init__.pyi`
+  type stubs (full signatures for the whole frozen surface) plus the
+  PEP 561 `py.typed` marker - IDEs and type checkers now see every
+  operator signature. `tests/test_api.py` pins the frozen surface
+  (an accidental addition to or removal from `__all__` fails), keeps
+  every public callable documented, pins `__version__` as semver,
+  guards against undocumented public leaks, and asserts the stub
+  tracks `__all__`. The error contract is now written down completely:
+  ValueError for shape/value problems, TypeError for dtype/device/
+  mixed-input problems, RuntimeError for CUDA execution failures, and
+  the 1.0 stability policy (additions in minor releases; signature
+  changes need a major + a deprecation window) is documented in
+  CONTRIBUTING and both READMEs.
+- scripts/check_utf8.py: a repository-wide text hygiene gate - every
+  tracked text file must be strict UTF-8, BOM-free, without U+FFFD
+  replacement characters or the double-encoded (UTF-8-as-CP1252)
+  mojibake shape that bit the 0.1.1/0.1.2 PyPI pages. CI runs it on
+  every push before anything compiles.
+- qgemm_perchannel(a_q, a_scale, b_q, b_scales): per-output-channel
+  weight scales - the W8A8 layout real INT8 inference uses (activations
+  per-tensor, weights one scale per output row). The per-channel scale
+  multiply is fused into the pipelined kernel's epilogue (and the M==1
+  decode GEMV) at zero kernel cost: measured dead even with per-tensor
+  qgemm (38.7 vs 38.7 TOPS on a 3060; 66.5 vs 66.1 on a 5060 Ti) while
+  the composite torch reference (cuBLASLt + separate scale broadcast)
+  pays for the epilogue separately. Exactness contract unchanged and
+  pinned: f32(sa * sb[j]) composes with ONE rounding, the product
+  applies once, CPU / staged / zero-copy are bit-identical; with all
+  b_scales equal the output is bit-equal to per-tensor qgemm. New
+  end-to-end test quantizes spiky weight rows per channel and asserts
+  the 5x+ error reduction over per-tensor scales on non-outlier rows.
+- sample_topk(logits, k, temperature=1.0, seed=0): fused top-k sampling
+  - softmax of the temperature-scaled logits, top-k truncation,
+  renormalization WITHIN the k survivors, and a seeded inverse-CDF
+  draw, one call with one readback. The k window is covered by
+  construction, so unlike the nucleus sampler there is no global-mass
+  threshold and no widening loop; the serial draw reuses the identical
+  splitmix RNG and accumulation order as sample_topp (deterministic per
+  seed; same caveat: exact-exp on CPU vs __expf on GPU can move draws
+  sitting exactly on an exp-rounding boundary). Measured vs the
+  composite an inference loop would write (torch.topk + softmax +
+  multinomial): 2.13x on a 3060 and 1.91x on a 5060 Ti at
+  k=50 @131072 - the timing is the fair part, the composite's draw is
+  not seed-reproducible while fusedtok's is. 16 new tests pin set
+  membership, k=1-is-greedy, full-vocab clamping, cold-temperature
+  collapse to argmax, mass concentration, per-seed determinism and
+  cross-path parity.
+
+### Changed
+- qgemm (INT8 matmul) rewritten as a cp.async double-buffered pipelined
+  IMMA kernel: K streams through two shared-memory slabs - the DMA for
+  slab s+1 overlaps the tensor-core work of slab s (the v0.4 kernel
+  round-tripped every byte through registers and stalled the whole block
+  on a barrier per 64-element slab); boundary tiles are padded by
+  pre-zeroed shared memory instead of per-load predicates; and the tile
+  size is a runtime-tuned choice between 64x64 (256 threads; slab 64 or
+  128) and a 128x128 DRAM-intensity tile (512 threads, 96 KB opt-in
+  dynamic shared memory). Integer accumulation is untouched - CPU /
+  staged / zero-copy stay bit-identical. Measured on RTX 3060 (3-round
+  averages, 4096^3): 17 TOPS (v0.4) -> 39 TOPS, 0.15x -> 0.46x vs
+  cuBLASLt (torch._int_mm); the honest gap to cuBLASLt (~83 TOPS, about
+  82% of the sm_86 dense-INT8 peak) is analyzed in the README
+  performance section.
+- top-k selection retuned for the mid-k range (v0.4's documented weak
+  spot): the early-exit compaction threshold and the per-block sort
+  chunk BOTH drop from 2048 to 1024. The entire regression window was a
+  single block bitonic-sorting 2048 keys - every SM but one idle - and
+  for k > 1024 the parallel chunk+merge tail does the same work spread
+  across the device. Measured on the canonical 3-round protocol at
+  n=131072, k=4096: RTX 3060 143 -> 113 us (0.87-0.93x -> 1.12x vs
+  torch.topk), RTX 5060 Ti 0.79-0.84x -> 1.09x; large k improves too
+  (k=16384 on the 3060: 1.59x -> 2.12x), small k unchanged. The first
+  fused-kernel attempt (chunk sort + merge ladder + decode in ONE
+  launch behind arrival-ticket barriers) measured SLOWER - inside the
+  cached graph the per-kernel savings are ~1-2us while the 16-block
+  co-residency cap cuts the ladder's natural parallelism - and was
+  reverted; the one measurement that mattered was the sort's serial
+  span.
+
+### Fixed
+- qgemm with K == 0 zero-fills the output on every path (the v0.4
+  launcher skipped the GPU write and returned torch.empty garbage; the
+  CPU reference always produced zeros). Pinned by a new cross-path test.
+- quantize.cu: removed a dead index variable (nvcc 13.x warning #177-D
+  on every build; leftover from an old 4x-unroll iteration).
+
 ## [0.5.1] - 2026-08-30
 
 ### Fixed

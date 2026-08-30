@@ -139,4 +139,61 @@ long long sample_topp_cpu(const std::vector<float>& logits,
     return (long long)order[nucleus - 1];   // float rounding fallback
 }
 
+// ---------------------------------------------------------------------------
+// fused top-k sampling - CPU reference
+// ---------------------------------------------------------------------------
+
+// Same algorithm as sample_topk_launch (order, renormalization, RNG
+// hash) so results agree up to floating-point rounding: sort logits/T
+// descending with earliest-index ties (the packed-key order), sum
+// exp(v - row_max) over the FIRST k entries in float32 in that order,
+// and inverse-CDF the splitmix-hash uniform scaled to the k-window
+// mass. CPU uses exact exp vs the device __expf, so draws landing
+// exactly on a boundary may pick a neighbor token - both are valid
+// samplers of the renormalized top-k distribution.
+long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
+                          unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (k <= 0)
+        throw std::invalid_argument("k must be >= 1");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    const size_t n = logits.size();
+    if ((size_t)k > n) k = (int)n;   // full-vocab sampling
+
+    // order indices by (logit/T desc, index asc) - the packed-key order
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+
+    float window_mass = 0.0f;
+    for (int i = 0; i < k; ++i) window_mass += mass_at((size_t)i);
+
+    // splitmix64-finalized uniform, identical to the device side
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27) ) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+
+    const float target = u * window_mass;
+    float cum = 0.0f;
+    for (int i = 0; i < k; ++i) {
+        cum += mass_at((size_t)i);
+        if (cum >= target) return (long long)order[(size_t)i];
+    }
+    return (long long)order[(size_t)k - 1];   // float rounding fallback
+}
+
 } // namespace fusedtok

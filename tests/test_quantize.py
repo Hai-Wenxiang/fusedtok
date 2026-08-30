@@ -54,7 +54,7 @@ def test_qadd_matches_explicit_pipeline():
     # explicit: dequant, add, requant
     ref, sref = fusedtok.quantize_int8(
         fusedtok.dequantize_int8(qa, sa) + fusedtok.dequantize_int8(qb, sb))
-    if fusedtok.cuda_available():
+    if HAS_TORCH and fusedtok.cuda_available():
         import torch
         tq = fusedtok.qadd_int8(torch.from_numpy(qa).cuda(), sa,
                                 torch.from_numpy(qb).cuda(), sb)

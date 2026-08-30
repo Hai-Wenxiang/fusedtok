@@ -85,12 +85,20 @@ void topk_check(const std::vector<float>& x, int k) {
 
 constexpr int kSelBlock = 256;
 constexpr int kSelWarps = kSelBlock / 32;
-// Per-block sort chunk (shared-memory bitonic): 2048 keys = 16KB shared.
-// Powers of two keep the chunk-merge arithmetic exact.
-constexpr int kSelSortChunk = 2048;
+// Per-block sort chunk (shared-memory bitonic): 1024 keys = 8KB shared.
+// Powers of two keep the chunk-merge arithmetic exact. 1024 (v1.0, was
+// 2048): the sort is the mid-k bottleneck and a 2048-key bitonic runs in
+// ONE block - halving the chunk halves its serial span and buys one
+// parallel merge level instead (the ladder costs ~2us per level inside
+// the cached graph; the single-block sort cost ~20us at k=2048).
+constexpr int kSelSortChunk = 1024;
 // Early-exit threshold: a radix boundary bin with at most this many
 // survivors is resolved by an in-block sort instead of further rounds.
-constexpr int kSelEarlyOut = 2048;
+// 1024 (v1.0, was 2048): a single block bitonic-sorting 2048 keys keeps
+// every SM but one idle, while the parallel chunk+merge tail spreads the
+// same work over the whole device - measured as the entire mid-k
+// regression window on both test GPUs.
+constexpr int kSelEarlyOut = 1024;
 // merge tile: one co-rank search + shared staging per this many outputs
 constexpr int kSelMergeTile = 256;
 // grid cap for the pipelined kernels (ticket scans stay short)
@@ -1385,6 +1393,109 @@ long long decode_step_launch(const float* x, const long long* ids,
             throw std::runtime_error("decode step nucleus not covered");
         window = std::min(n, window * 4);
     }
+}
+
+// ---------------------------------------------------------------------------
+// fused top-k sampling: softmax temperature-scale, top-k truncation,
+// renormalize WITHIN the k survivors, inverse-CDF draw - one readback
+// ---------------------------------------------------------------------------
+
+// Serial draw over the sorted top-k keys (one thread, one pass): the
+// top-k window is ALWAYS covered by construction (the distribution is
+// renormalized inside it), so - unlike the nucleus sampler - there is no
+// global-mass threshold, no coverage check and no widening loop. Same
+// arithmetic and accumulation order as the CPU reference: exp walk
+// seeded at the row max, splitmix64 hash of the seed, serial inverse
+// CDF - per-seed CPU/GPU token parity is bit-stable away from draws
+// landing exactly on an exp-rounding boundary.
+__global__ void sample_topk_serial_kernel(
+    const unsigned long long* __restrict__ keys, int* __restrict__ token_out,
+    int k, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const float row_max = unfkey((unsigned)(keys[0] >> 32));
+    float window_mass = 0.0f;
+    for (int i = 0; i < k; ++i)
+        window_mass += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+    const float target = u * window_mass;
+    float cum = 0.0f;
+    for (int i = 0; i < k; ++i) {
+        cum += __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+        if (cum >= target) {
+            *token_out = (int)(0xFFFFFFFFu -
+                               (unsigned)(keys[i] & 0xFFFFFFFFu));
+            return;
+        }
+    }
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[k - 1] & 0xFFFFFFFFu));  // rounding
+}
+
+long long sample_topk_launch(const float* x, int n, int k, float t,
+                             unsigned long long seed, std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (k <= 0)
+        throw std::invalid_argument("k must be >= 1");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if (k > n) k = n;                             // full-vocab sampling
+    cudaStream_t cs = (cudaStream_t)stream;
+    int mm = 1;
+    while (mm < k) mm <<= 1;                      // sort pad size
+    unsigned long long* ws =
+        selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)mm + 256 +
+                            sizeof(SelArgs) / sizeof(unsigned long long));
+    SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(mm));
+    int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+    int token = -1;
+    cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+    cudaMemcpyAsync(token_out, &token, sizeof(int), cudaMemcpyHostToDevice,
+                    cs);
+    ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+    const int grid = selection_grid(n);
+    const float inv_t = 1.0f / t;
+    for (int level = 7; level >= 0; --level)
+        select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+            dargs, ws, n, level, (unsigned long long)k, inv_t, kNoPen);
+    select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
+                                                       inv_t, kNoPen);
+    check_launch("sample topk round launch");
+    // the sort tail is unified for every k: emit the k survivors, sort
+    // them (one or several 1024-key chunks + the merge ladder), draw.
+    // No mass threshold anywhere - the window renormalizes by definition.
+    emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, k, inv_t, kNoPen);
+    chunk_sort_kernel<<<(int)((mm + kSelSortChunk - 1) / kSelSortChunk),
+                        kSelBlock, 0, cs>>>(ws + kWsKeys, k, mm);
+    unsigned long long* bufs[2] = {ws + kWsKeys,
+                                   ws + kWsKeys + (size_t)mm};
+    int cur = 0;
+    for (int run = kSelSortChunk; run < mm; run <<= 1) {
+        const long long ntiles = mm / kSelMergeTile;
+        const int gmerge = (int)std::max<long long>(
+            1LL, std::min<long long>(ntiles, kMaxGrid));
+        merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
+                                                         bufs[cur ^ 1],
+                                                         mm, run);
+        cur ^= 1;
+    }
+    sample_topk_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], token_out, k,
+                                                seed);
+    check_launch("sample topk tail launch");
+    cudaError_t err = cudaDeviceSynchronize();    // surface kernel faults
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("sample topk kernel failed: ") +
+                                 cudaGetErrorString(err));
+    if (cudaMemcpy(&token, token_out, sizeof(int),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("sample topk readback failed");
+    if (token < 0)
+        throw std::runtime_error("sample topk produced no token");
+    return token;
 }
 
 // ---------------------------------------------------------------------------

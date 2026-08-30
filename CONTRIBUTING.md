@@ -33,20 +33,30 @@ CUDA cases skip automatically.
    tests (multiple shapes, edge cases, error paths, GPU-vs-CPU comparison).
 2. **Determinism where promised**: selection ops (top-k / top-p / argmax)
    resolve ties toward the earliest index; keep that invariant.
-3. **Error contract**: shape problems raise `ValueError`, CUDA problems
-   raise `RuntimeError` (mapped from `std::invalid_argument` /
-   `std::runtime_error` in C++).
-4. **Comments in English**, explaining *why* (design constraints, GPU
+3. **Error contract**: shape and value problems (bad k / p / temperature,
+   mismatched shapes, out-of-range ids) raise `ValueError`; dtype,
+   device-family and mixed-input problems raise `TypeError`; CUDA
+   execution failures raise `RuntimeError` (mapped from
+   `std::runtime_error` in C++). The full surface is pinned by
+   `tests/test_api.py`.
+4. **API freeze (1.0)**: the names in `fusedtok.__all__` are frozen.
+   Additions may land in minor releases; changing a signature, renaming
+   or removing a public name requires a major release and a deprecation
+   window of at least one minor release (DeprecationWarning) before it.
+   `python/fusedtok/__init__.pyi` + `py.typed` ship the typed surface -
+   keep them in sync with `__all__` in the same change (the API test
+   fails otherwise).
+5. **Comments in English**, explaining *why* (design constraints, GPU
    micro-arch reasons), not *what*.
-5. Benchmarks use CUDA events, never wall clock (WDDM makes host timing
+6. Benchmarks use CUDA events, never wall clock (WDDM makes host timing
    on Windows meaningless).
-6. Keep the CI green: `ubuntu-latest` + CUDA container build and CPU tests
+7. Keep the CI green: `ubuntu-latest` + CUDA container build and CPU tests
    run on every push.
 
 ## New-kernel checklist
 
-Lessons baked into the v0.3/v0.4/v0.5 sprints - run through this before
-pushing any new GPU kernel:
+Lessons baked into the v0.3/v0.4/v0.5/v1.0 sprints - run through this
+before pushing any new GPU kernel:
 
 - [ ] **Sanitizer trio before review**: `compute-sanitizer --tool memcheck`
       and `--tool racecheck` on a smoke that exercises every code path
@@ -79,6 +89,21 @@ pushing any new GPU kernel:
       fields are plain `char` (unsigned on MSVC - cast through
       `(signed char)`); single-thread serial volatile loads are latency
       poison (stage cooperatively through shared memory).
+- [ ] **cp.async beats register staging for GEMM-style slabs** (v1.0
+      qgemm): staging global tiles in per-thread register arrays keeps
+      them live across the compute phase - the first pipelined qgemm
+      measured 156 registers (1 block/SM, slab128: 255 + spills) and ran
+      SLOWER than the v0.4 single-buffered kernel. `__pipeline_memcpy_async`
+      moves the same bytes global->shared with no register detour
+      (111-128 registers, 2 blocks/SM). Check `nvcc --ptxas-options=-v`
+      before believing a pipeline.
+- [ ] **Tuned kernel configs need a capture-safe default** (v1.0 qgemm):
+      if first-call micro-benchmarks pick a tile/slab config, captures
+      must skip the tuning (events + syncs are illegal mid-capture) and
+      launch a default config instead - and a config needing
+      `cudaFuncSetAttribute` opt-in (> 48 KB dynamic smem) must raise the
+      attribute inside the tuner, never during a capture. Pin both with a
+      capture-after-tuning test.
 
 ## Pull requests
 

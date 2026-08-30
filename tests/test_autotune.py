@@ -30,7 +30,8 @@ except ImportError:
 WIDTHS = [128, 1024, 4096, 8192, 16384]
 
 
-@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
+@pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
+                    reason="no torch/GPU")
 class TestAutotuneCorrectness:
     @pytest.mark.parametrize("cols", WIDTHS)
     def test_rmsnorm_across_tuned_blocks(self, cols):

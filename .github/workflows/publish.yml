@@ -5,18 +5,22 @@ name: Publish to PyPI
 #   project=fusedtok  owner=Hai-Wenxiang  repo=fusedtok
 #   workflow=publish.yml  environment=(none)
 #
-# Three jobs:
-#   build          - Linux sdist + manylinux wheel (CUDA container; the
-#                    Docker publish action cannot run inside container
-#                    jobs, so artifacts pass through the workflow
-#                    artifact store to a plain ubuntu publisher).
-#   build-windows  - cp312 Windows wheel. CUDA installs via the
+# Jobs (1.0: per-python wheel matrix; the sdist is built exactly once):
+#   build (matrix 3.10-3.13)
+#                    - manylinux wheel per python, sdist from the 3.10
+#                    entry only (duplicate sdists would fail the PyPI
+#                    upload). CUDA container; the Docker publish action
+#                    cannot run inside container jobs, so artifacts pass
+#                    through the workflow artifact store to a plain
+#                    ubuntu publisher.
+#   build-windows (matrix 3.11-3.13)
+#                    - cp3xx Windows wheels. CUDA installs via the
 #                    network installer's documented silent mode
 #                    (curl + "-s cudatoolkit"); the Jimver/cuda-toolkit
 #                    action's cache validation was broken on
 #                    windows-2022 runners (see windows-wheel.yml
 #                    history), the manual route is the known bypass.
-#   publish        - Trusted-Publisher upload of everything in dist/.
+#   publish          - Trusted-Publisher upload of everything in dist/.
 
 on:
   workflow_dispatch:
@@ -26,28 +30,57 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
     container:
       image: nvidia/cuda:12.4.1-devel-ubuntu22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      # actions/setup-python does not reliably work inside container jobs
+      # and the deadsnakes PPA is rate-limited from Azure - install the
+      # matrix python via uv (python-build-standalone over the GitHub
+      # CDN), isolated per venv (seeded so pip exists for auditwheel's
+      # patchelf and the build frontends)
+      - name: Install Python ${{ matrix.python }}
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends python3-dev python3-pip python3.10-venv
+          apt-get install -y --no-install-recommends curl ca-certificates
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv python install ${{ matrix.python }}
+          uv venv --seed --python ${{ matrix.python }} /tmp/venv
+          echo "/tmp/venv/bin" >> $GITHUB_PATH
+        env:
+          UV_PYTHON_INSTALL_DIR: /tmp/uv-python
+
+      - name: Install build dependencies
+        run: |
+          apt-get install -y --no-install-recommends patchelf
           # patchelf via pip: ubuntu22.04's apt copy (0.14.3) is older than
           # auditwheel's required >= 0.14.5
-          pip3 install --no-cache-dir build auditwheel patchelf
+          pip install --no-cache-dir build auditwheel "patchelf>=0.14.5"
 
-      - name: Build sdist and wheel
-        run: python3 -m build --outdir dist
+      - name: Build sdist (once, from the 3.10 entry) and wheel
+        run: |
+          export PATH="$pythonLocation/bin:$PATH"
+          if [ "${{ matrix.python }}" = "3.10" ]; then
+            python -m build --sdist --outdir dist
+          fi
+          python -m build --wheel --outdir dist .
 
       - name: Repair wheel to manylinux (PyPI rejects bare linux tags)
         run: |
-          auditwheel show dist/*.whl
-          auditwheel repair dist/*.whl -w wheelhouse/
-          rm -f dist/*.whl
-          mv wheelhouse/*.whl dist/
+          # container jobs append GITHUB_PATH instead of prepending, so
+          # the venv's newer patchelf must be promoted by hand
+          export PATH="/tmp/venv/bin:$PATH"
+          patchelf --version
+          auditwheel show dist/fusedtok-*.whl
+          auditwheel repair dist/fusedtok-*.whl -w wheelhouse/
+          rm -f dist/fusedtok-*.whl
+          mv wheelhouse/fusedtok-*.whl dist/
 
       - name: List artifacts
         run: ls -lh dist/
@@ -55,7 +88,7 @@ jobs:
       - name: Store artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-linux-${{ matrix.python }}
           path: dist/
           if-no-files-found: error
           retention-days: 5
@@ -63,12 +96,16 @@ jobs:
   build-windows:
     runs-on: windows-2022
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
       # put cl.exe on PATH for Ninja (the runner image ships VS2022 but
       # does not export the dev environment)
@@ -121,7 +158,7 @@ jobs:
       - name: Store artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dist-windows
+          name: dist-windows-${{ matrix.python }}
           path: dist/*.whl
           if-no-files-found: error
           retention-days: 5
@@ -137,14 +174,9 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
           path: dist/
-
-      - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dist-windows
-          path: dist/
+          merge-multiple: true
 
       - name: List everything being published
         run: ls -lh dist/

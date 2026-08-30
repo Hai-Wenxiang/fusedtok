@@ -1,4 +1,4 @@
-# Windows wheel builder (dispatch dry-run harness).
+# Wheel dry-run harness (dispatch-only, NEVER publishes).
 #
 # HISTORY: v0.4.1 experiment - three configurations tried on 2026-08-29
 # (network + sub-packages, network, local installer); all died at the
@@ -7,11 +7,15 @@
 #
 # SINCE v0.5 the maintained Windows wheel path lives in publish.yml
 # (build-windows job: manual curl + silent network install, the
-# documented enterprise route that bypasses the broken action). This
-# workflow stays as a standalone dispatch target to dry-run the Windows
-# build WITHOUT publishing, using the same manual-install method.
+# documented enterprise route that bypasses the broken action).
+#
+# SINCE 1.0 this workflow mirrors the publish.yml wheel MATRIX as a
+# dispatchable dry run: Linux manylinux wheels (cp310-cp313, inside the
+# same CUDA container publish.yml uses) and Windows wheels (cp311-313,
+# same manual silent CUDA install). Dispatching it on a dev ref
+# validates the full release build matrix WITHOUT publishing anything.
 
-name: windows-wheel
+name: wheel-dryrun
 
 on:
   workflow_dispatch:
@@ -20,15 +24,80 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/setup-python does not reliably work inside container jobs
+      # and the deadsnakes PPA is rate-limited from Azure - install the
+      # matrix python via uv (python-build-standalone over the GitHub
+      # CDN), isolated per venv (seeded so pip exists)
+      - name: Install Python ${{ matrix.python }}
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv python install ${{ matrix.python }}
+          uv venv --seed --python ${{ matrix.python }} /tmp/venv
+          echo "/tmp/venv/bin" >> $GITHUB_PATH
+        env:
+          UV_PYTHON_INSTALL_DIR: /tmp/uv-python
+
+      - name: Install build dependencies
+        run: |
+          pip install --no-cache-dir build auditwheel "patchelf>=0.14.5"
+
+      - name: Build the wheel
+        run: |
+          export PATH="$pythonLocation/bin:$PATH"
+          python -m build --wheel --outdir dist .
+
+      - name: Repair wheel to manylinux
+        run: |
+          # container jobs append GITHUB_PATH instead of prepending, so
+          # the venv's newer patchelf must be promoted by hand
+          export PATH="/tmp/venv/bin:$PATH"
+          patchelf --version
+          auditwheel show dist/fusedtok-*.whl
+          auditwheel repair dist/fusedtok-*.whl -w wheelhouse/
+          rm -f dist/fusedtok-*.whl
+          mv wheelhouse/fusedtok-*.whl dist/
+
+      - name: Smoke-test the wheel (import + CPU op)
+        run: |
+          export PATH="$pythonLocation/bin:$PATH"
+          pip install dist/fusedtok-*.whl pytest numpy
+          python -c "import fusedtok; print(fusedtok.__version__); print(fusedtok.rmsnorm([[1.0, 2.0]], [1.0, 1.0]))"
+          python -m pytest tests -q
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dryrun-linux-${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows:
     runs-on: windows-2022
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -63,9 +132,15 @@ jobs:
           python -m build --wheel --outdir dist .
           Get-ChildItem dist
 
+      - name: Smoke-test the wheel (import + CPU op)
+        shell: pwsh
+        run: |
+          pip install (Get-ChildItem dist/fusedtok-*.whl)
+          python -c "import fusedtok; print(fusedtok.__version__); print(fusedtok.rmsnorm([[1.0, 2.0]], [1.0, 1.0]))"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-wheel
+          name: dryrun-windows-${{ matrix.python }}
           path: dist/*.whl
           if-no-files-found: error

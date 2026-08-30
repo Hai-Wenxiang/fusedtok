@@ -29,13 +29,15 @@ traffic and launch overhead.
 | ✅ | Softmax (row-wise) | numerically stable |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | elementwise |
 | ✅ | add / mul | elementwise binary (fused add+residual pattern) |
-| ✅ | top-k / top-p (nucleus) | arrival-ticket radix + early-exit compaction, replayed from a cached CUDA graph; deterministic ties (1.5x vs torch/CUB @131k on a 36-SM RTX 5060 Ti) |
+| ✅ | top-k / top-p (nucleus) | arrival-ticket radix + early-exit compaction, replayed from a cached CUDA graph; deterministic ties (1.5x vs torch/CUB @131k k=50, parity-to-winning across the whole k range on both test GPUs) |
 | ✅ | argmax / temperature | greedy decoding helpers |
 | ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, global-mass threshold |
+| ✅ | sample_topk | fused top-k sampling: softmax -> top-k -> renormalize within the window -> seeded draw (2.1x / 1.9x vs the topk+multinomial composite @131k) |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
 | ✅ | decode_step | the whole decode step fused: penalty -> temperature -> nucleus sample, one call, one readback |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
-| ✅ | qgemm | INT8 matmul, int32-exact: tensor-core IMMA GEMM + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
+| ✅ | qgemm | INT8 matmul, int32-exact: cp.async double-buffered pipelined IMMA GEMM with runtime tile tuning (64x64 / 128x128) + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
+| ✅ | qgemm_perchannel | the W8A8 layout real INT8 inference uses: per-output-channel weight scales fused into the same kernel's epilogue at zero cost |
 | ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths |
 | ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional); convenience path - heavyweight prefill stays SDPA/flash territory (honest ~0.45x) |
 
@@ -45,9 +47,9 @@ traffic and launch overhead.
 pip install fusedtok
 ```
 
-Prebuilt wheels on PyPI (built with CUDA 12.4): **Linux x86_64** (manylinux,
-cp310) and **Windows x86_64** (cp312). On other platforms or Python versions
-pip builds from source automatically:
+Prebuilt wheels on PyPI (built with CUDA 12.4): **Linux x86_64**
+(manylinux, cp310-cp313) and **Windows x86_64** (cp311-cp313). On other
+platforms or Python versions pip builds from source automatically:
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
@@ -127,6 +129,8 @@ token = fusedtok.decode_step(logits, sampled_ids, penalty=1.1,
 # or step by step:
 logits = fusedtok.repetition_penalty(logits, sampled_ids, penalty=1.1)
 token = fusedtok.sample_topp(logits, p=0.9, temperature=0.8, seed=step)
+# top-k sampling variant (renormalizes within the k survivors)
+token = fusedtok.sample_topk(logits, k=50, temperature=0.8, seed=step)
 ```
 
 A minimal per-token sampling loop:
@@ -161,6 +165,15 @@ See `examples/demo.py` for a runnable tour of every operator.
 Every kernel ships with a CPU reference implementation and element-wise parity tests
 (pytest). Tests run on machines without a GPU (CUDA cases skip automatically).
 
+## API stability
+
+1.0 freezes the public surface: the names in `fusedtok.__all__` (30
+operators + helpers) keep their signatures across the 1.x series.
+Type stubs (`__init__.pyi`, PEP 561 `py.typed`) ship with the package.
+New operators arrive in minor releases; breaking changes require a new
+major version and a deprecation window. Determinism promises: selection
+ties resolve to the earliest index; sampling is deterministic per seed.
+
 ## Benchmarks
 
 RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing over
@@ -176,11 +189,15 @@ timed region). Largest shape per op; full data:
 | RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
 | RMSNorm (+residual) | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
 | SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
-| top-k (k=50) | [131072] | 80 µs | 127 µs | **1.59x** |
+| top-k (k=50) | [131072] | 79 µs | 137 µs | **1.75x** |
+| top-k (k=4096, mid-k) | [131072] | 113 µs | 127 µs | 1.12x |
 | LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
+| sample_topk k=50 | [131072] | 133 µs | 282 µs (topk+multinomial) | **2.13x** |
 | argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) |
+| int8 qgemm (IMMA) | [4096×4096×4096] | 3554 µs (38.7 TOPS) | 1634 µs (cuBLASLt) | 0.46x (honest) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 3553 µs (38.7 TOPS) | 2046 µs (cuBLASLt + broadcast) | 0.58x (honest) |
 | attention_prefill (causal) | S=1024, D=128 | 5732 µs | 2560 µs (SDPA flash) | 0.45x (honest) |
 
 Row-wise kernels (norms, softmax) autotune their thread-block size per
@@ -198,8 +215,12 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 | RMSNorm (+residual) | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |
+| top-k (k=4096, mid-k) | [131072] | 50 µs | 54 µs (CUB) | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
+| sample_topk k=50 | [131072] | 49 µs | 93 µs (topk+multinomial) | **1.91x** |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x (incl. host readback) |
+| int8 qgemm (IMMA) | [4096×4096×4096] | 2063 µs (66.6 TOPS) | 800 µs (cuBLASLt) | 0.39x (honest) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 2079 µs (66.1 TOPS) | 1142 µs (cuBLASLt + broadcast) | 0.55x (honest) |
 | attention_prefill (causal) | S=1024, D=128 | 3291 µs | 1421 µs (SDPA flash) | 0.43x (honest) |
 
 On smaller shapes the Blackwell card shows bigger wins (softmax 2.5x,
@@ -216,16 +237,27 @@ Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
 intermediate tensors through global memory. The v0.4 selection pipeline
 (arrival-ticket radix rounds + early-exit compaction, replayed from a
 cached CUDA graph) beats torch's CUB radix select at small k on both
-GPUs; mid-range k (2048..n) stays at or below parity — honest numbers,
-a pipelined tensor-core sort stays future work. attention_decode wins
+GPUs; the v1.0 retune (in-block-sort threshold and sort chunk both
+dropped 2048 -> 1024 - a single block bitonic-sorting 2048 keys was the
+whole mid-k regression) brings the mid-k window to parity-or-winning as
+well (k=4096 @131k: 1.12x / 1.09x). attention_decode wins
 big at decode (one launch streams the GQA cache once at up to ~157 GB/s
 effective while SDPA pays head expansion or small-query inefficiency);
 attention_prefill is the honest convenience path at ~0.45x of SDPA's
 flash backend — no tensor cores by design, so heavyweight prefill stays
 with SDPA/FlashAttention. The INT8 decode GEMV moves half the bytes of
-an fp16 projection and runs at full memory bandwidth (2x); the IMMA
-GEMM path (~17 TOPS) is correctness-first — cuBLASLt (`torch._int_mm`)
-remains faster for large prefill matmuls.
+an fp16 projection and runs at full memory bandwidth (2x); the pipelined
+IMMA GEMM (v1.0 rework: cp.async double-buffered slabs, runtime-tuned
+64x64 / 128x128 tiles) reaches ~39 TOPS on a 3060 and ~67 TOPS on a
+5060 Ti — 2x-4x the v0.4 kernel — but cuBLASLt (`torch._int_mm`) still
+holds a ~2.2-2.6x lead: its tiles pipeline deeper and its epilogue is
+tuned per-arch. For now qgemm is the exact / graph-capturable /
+zero-copy INT8 path, not the fastest one; honest numbers, a
+CUTLASS-class schedule stays future work. The per-channel variant
+(`qgemm_perchannel`, the W8A8 layout INT8 inference actually uses)
+fuses the per-output-channel scale multiply into the same epilogue at
+zero kernel cost — the composite torch reference pays for that
+broadcast separately, which is where its 0.55-0.58x comes from.
 
 ## Development
 
@@ -263,8 +295,11 @@ suite on every push.
   and a tiled prefill path (honest ~0.45x of SDPA flash - the
   convenience path); single-chart-per-GPU benchmarks; Windows wheels in
   the PyPI publish pipeline
-- future: pipelined tensor-core INT8 GEMM; top-k mid-range parity;
-  API freeze for 1.0
+- 1.0 (in development): pipelined tensor-core INT8 GEMM (cp.async
+  double-buffering, runtime tile tuning; 17 -> 39 TOPS on a 3060) with
+  per-channel weight scales (W8A8), fused top-k sampling (2.1x vs the
+  topk+multinomial composite), top-k mid-range-k parity, text hygiene
+  gate, wheel matrix expansion, API freeze
 
 ## Community
 

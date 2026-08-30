@@ -63,7 +63,7 @@ def bench(fn, iters, warmup=10, rounds=3):
     return sum(times) / len(times), times
 
 
-def record(op, shape, ft_fn, torch_fn, iters, bytes_moved=None):
+def record(op, shape, ft_fn, torch_fn, iters, bytes_moved=None, ops=None):
     t_ft, ft_rounds = bench(ft_fn, iters)
     t_tr, tr_rounds = bench(torch_fn, iters)
     row = {
@@ -77,9 +77,16 @@ def record(op, shape, ft_fn, torch_fn, iters, bytes_moved=None):
     }
     if bytes_moved:
         row["bandwidth_gbs"] = round(bytes_moved / (t_ft * 1e-6) / 1e9, 1)
+    if ops:
+        # dense MACs*2/s - the honest metric for compute-bound ops (int8
+        # GEMM); fusedtok value only, the torch reference tops ride in
+        # the round data
+        row["fusedtok_tops"] = round(ops / (t_ft * 1e-6) / 1e12, 1)
     RESULTS.append(row)
     spread = (max(ft_rounds) - min(ft_rounds)) / t_ft * 100.0
     extra = f"  {row['bandwidth_gbs']:6.1f} GB/s" if bytes_moved else ""
+    if ops:
+        extra += f"  {row['fusedtok_tops']:5.1f} TOPS"
     print(f"{op:<16} {shape:<18} fusedtok {t_ft:9.1f} us | torch {t_tr:9.1f} us"
           f" | {t_tr / t_ft:5.2f}x | round spread {spread:4.1f}%{extra}")
     return row
@@ -178,10 +185,63 @@ def main():
                lambda: fusedtok.topk(logits, 50),
                lambda: torch.topk(logits, 50),
                max(20, iters // 4))
+        # the mid-k window: k large enough that the selection leaves the
+        # in-block-sort path, small enough that torch's CUB select is
+        # still in its fast regime - the honest comparison point for the
+        # chunk/merge tail
+        record("topk k=4096", f"[{vocab}]",
+               lambda: fusedtok.topk(logits, 4096),
+               lambda: torch.topk(logits, 4096),
+               max(20, iters // 4))
+        # fused top-k sampling vs the composite an inference loop would
+        # write (topk + softmax + multinomial). SEMANTICS NOTE: the torch
+        # side draws from its own global RNG - the timing is the fair
+        # part, not the seed determinism (fusedtok is seed-reproducible,
+        # the composite is not).
+        def torch_sample_topk():
+            v, i = torch.topk(logits, 50)
+            return i[torch.multinomial(torch.softmax(v, -1), 1)]
+        record("sample_topk k=50", f"[{vocab}]",
+               lambda: fusedtok.sample_topk(logits, 50),
+               torch_sample_topk,
+               max(20, iters // 4))
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),
                lambda: int(logits.argmax()),
                max(20, iters // 2))
+
+    # --- INT8 compute: qgemm vs cuBLASLt (torch._int_mm) -----------------------
+    # The tensor-core path; TOPS is the metric, bandwidth is reported for
+    # context. torch._int_mm is cuBLASLt's int8 GEMM - the hardest
+    # possible comparison on this dtype.
+    if hasattr(torch, "_int_mm"):
+        for m, n, k in [(512, 4096, 4096), (4096, 4096, 4096),
+                        (4096, 11008, 4096)]:
+            a = torch.randint(-127, 128, (m, k), device="cuda",
+                              dtype=torch.int8)
+            b = torch.randint(-127, 128, (n, k), device="cuda",
+                              dtype=torch.int8)
+            record("int8 qgemm", f"[{m}x{n}x{k}]",
+                   lambda: fusedtok.qgemm(a, 0.02, b, 0.01),
+                   lambda: torch._int_mm(a, b.t()),
+                   max(20, iters // 4),
+                   bytes_moved=a.numel() + b.numel() + m * n * 4,
+                   ops=2 * m * n * k)
+        # per-channel weight scales (W8A8): the torch reference is what
+        # real code writes - cuBLASLt _int_mm plus the scale broadcast
+        # (that epilogue runs inside the fusedtok kernel for free)
+        for m, n, k in [(512, 4096, 4096), (4096, 4096, 4096)]:
+            a = torch.randint(-127, 128, (m, k), device="cuda",
+                              dtype=torch.int8)
+            b = torch.randint(-127, 128, (n, k), device="cuda",
+                              dtype=torch.int8)
+            sb = (torch.rand(n, device="cuda") + 0.5) * 0.1
+            record("int8 qgemm pc", f"[{m}x{n}x{k}]",
+                   lambda: fusedtok.qgemm_perchannel(a, 0.02, b, sb),
+                   lambda: torch._int_mm(a, b.t()) * (0.02 * sb),
+                   max(20, iters // 4),
+                   bytes_moved=a.numel() + b.numel() + m * n * 4,
+                   ops=2 * m * n * k)
 
     # --- attention (decode step over a kv-cache; fresh-sequence prefill) ------
     # references use PRE-EXPANDED heads (repeat_interleave outside the
