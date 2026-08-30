@@ -87,6 +87,11 @@ std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
 long long sample_topp_cpu(const std::vector<float>& logits,
                           float p, float t, unsigned long long seed);
 
+// Top-k variant: renormalize over the first k entries of the descending
+// order (earliest-index ties) and draw with the same seeded hash.
+long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
+                          unsigned long long seed);
+
 // ---------------------------------------------------------------------------
 // INT8 symmetric per-tensor quantization (storage path; GEMM is v0.4+):
 //   scale = max(|x|) / 127; q = clamp(round(x / scale), -127, 127)
@@ -107,5 +112,12 @@ std::vector<float> dequantize_int8_cpu(const std::vector<signed char>& q,
 std::vector<float> qgemm_cpu(const std::vector<signed char>& aq,
                              const std::vector<signed char>& bq,
                              int m, int n, int k, float sa, float sb);
+
+// Per-channel variant: sb holds n scales (one per output row of B_q);
+// y[i,j] = (A_q . B_q^T) * f32(sa * sb[j]).
+std::vector<float> qgemm_perchannel_cpu(const std::vector<signed char>& aq,
+                                        const std::vector<signed char>& bq,
+                                        const std::vector<float>& sb,
+                                        int m, int n, int k, float sa);
 
 } // namespace fusedtok

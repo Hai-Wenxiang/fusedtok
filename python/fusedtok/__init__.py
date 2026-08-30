@@ -30,7 +30,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "0.5.1"
+__version__ = "1.0.0"
 
 __all__ = [
     "cuda_available",
@@ -54,10 +54,12 @@ __all__ = [
     "topk",
     "topp",
     "sample_topp",
+    "sample_topk",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
     "qgemm",
+    "qgemm_perchannel",
     "decode_step",
     "attention_decode",
     "attention_prefill",
@@ -784,7 +786,8 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
         if k != k2:
             raise ValueError("inner dimensions must match")
         y = torch.empty((m, n), dtype=torch.float32, device=a_q.device)
-        if m > 0 and n > 0 and k > 0:
+        # the launcher no-ops empty operands and zero-fills K == 0
+        if m > 0 and n > 0:
             _fusedtok.qgemm_launch(a_q.data_ptr(), b_q.data_ptr(),
                                    y.data_ptr(), m, n, k,
                                    float(a_scale), float(b_scale),
@@ -800,6 +803,69 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
         raise ValueError("inner dimensions must match")
     call = (_fusedtok.qgemm if cuda else _fusedtok.qgemm_cpu)
     res = call(a, b, m, n, k, float(a_scale), float(b_scale))
+    return _numpy_to_torch_like(res, a_q) if _is_torch(a_q) else res
+
+
+def qgemm_perchannel(a_q, a_scale, b_q, b_scales, *, cuda=False):
+    """INT8 matmul with per-output-channel weight scales (W8A8):
+
+    ``y[M, N] = (A_q[M, K] int8 @ B_q[N, K] int8^T) * (a_scale * b_scales[j])``
+
+    ``b_scales`` is a float32 vector of length N - one scale per output
+    row of B_q (per output channel of the layer), the SmoothQuant /
+    TensorRT-LLM INT8 inference layout. Per-channel weight scales absorb
+    the outlier structure of real weights that a single per-tensor scale
+    cannot, at the same INT8 storage cost.
+
+    Exactness contract (identical to :func:`qgemm`): the integer
+    accumulation is exact, the output scale is composed as
+    ``float32(a_scale * b_scales[j])`` with a single rounding, and the
+    product applies once - CPU, staged and zero-copy results are
+    BIT-IDENTICAL. ``M == 1`` dispatches to the warp-per-row GEMV.
+    """
+    if _device_path(a_q, cuda=False) == "torch-cuda":
+        if not (_is_torch(b_q) and b_q.is_cuda):
+            raise TypeError("both operands must be CUDA int8 tensors")
+        if a_q.dtype is not torch.int8 or b_q.dtype is not torch.int8:
+            raise TypeError("operands must be int8")
+        if a_q.ndim != 2 or b_q.ndim != 2:
+            raise ValueError("operands must be 2-D [rows, K]")
+        m, k = a_q.shape
+        n, k2 = b_q.shape
+        if k != k2:
+            raise ValueError("inner dimensions must match")
+        if not _is_torch(b_scales):
+            b_scales = torch.as_tensor(b_scales, dtype=torch.float32,
+                                       device=a_q.device)
+        if b_scales.ndim != 1 or b_scales.numel() != n:
+            raise ValueError("b_scales must be 1-D with n entries")
+        if b_scales.dtype is not torch.float32:
+            b_scales = b_scales.to(torch.float32)
+        if not b_scales.is_contiguous():
+            b_scales = b_scales.contiguous()
+        if not b_scales.is_cuda:
+            b_scales = b_scales.to(a_q.device)
+        y = torch.empty((m, n), dtype=torch.float32, device=a_q.device)
+        # the launcher no-ops empty operands and zero-fills K == 0
+        if m > 0 and n > 0:
+            _fusedtok.qgemm_perchannel_launch(
+                a_q.data_ptr(), b_q.data_ptr(), b_scales.data_ptr(),
+                y.data_ptr(), m, n, k, float(a_scale), _cuda_stream())
+        return y
+    a = np.ascontiguousarray(a_q, dtype=np.int8)
+    b = np.ascontiguousarray(b_q, dtype=np.int8)
+    sb = np.ascontiguousarray(b_scales, dtype=np.float32)
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("operands must be 2-D [rows, K]")
+    m, k = a.shape
+    n, k2 = b.shape
+    if k != k2:
+        raise ValueError("inner dimensions must match")
+    if sb.ndim != 1 or sb.shape[0] != n:
+        raise ValueError("b_scales must be 1-D with n entries")
+    call = (_fusedtok.qgemm_perchannel if cuda
+            else _fusedtok.qgemm_perchannel_cpu)
+    res = call(a, b, sb, m, n, k, float(a_scale))
     return _numpy_to_torch_like(res, a_q) if _is_torch(a_q) else res
 
 
@@ -832,6 +898,39 @@ def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
         raise ValueError("logits must be 1-D")
     call = _fusedtok.sample_topp if path == "staged" else _fusedtok.sample_topp_cpu
     return int(call(arr, p, temperature, seed))
+
+
+def sample_topk(logits, k, *, temperature=1.0, seed=0, cuda=False):
+    """Fused top-k sampling: one GPU round trip from raw logits to a token.
+
+    Pipeline: softmax of ``logits / temperature`` -> keep the k
+    highest-probability tokens -> renormalize WITHIN the k survivors ->
+    inverse-CDF draw using a hash-uniform of ``seed``. Deterministic per
+    seed; the RNG is a splitmix-style hash (reproducible, NOT
+    cryptographically secure).
+
+    Returns the sampled token id (int). ``k`` in ``[1, vocab]``
+    (``k = 1`` is greedy; ``k >= vocab`` samples the whole distribution).
+    temperature > 0.
+    """
+    if k <= 0:
+        raise ValueError("k must be >= 1")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_topk_launch(logits.data_ptr(),
+                                                logits.numel(), k,
+                                                temperature, seed,
+                                                _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = _fusedtok.sample_topk if path == "staged" else _fusedtok.sample_topk_cpu
+    return int(call(arr, k, temperature, seed))
 
 
 def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,

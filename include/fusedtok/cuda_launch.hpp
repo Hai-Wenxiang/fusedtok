@@ -70,6 +70,13 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
 // hash-uniform of `seed`. Returns the token.
 long long sample_topp_launch(const float* x, int n, float p, float t,
                               unsigned long long seed, std::uintptr_t stream = 0);
+
+// Fused top-k sampling: temperature, top-k truncation, renormalize
+// WITHIN the k survivors, inverse-CDF draw - one call, one readback.
+// Deterministic per seed (same RNG as sample_topp_launch).
+long long sample_topk_launch(const float* x, int n, int k, float t,
+                             unsigned long long seed,
+                             std::uintptr_t stream = 0);
 // Fused decode step: repetition penalty over the sampled ids (vocab
 // bitmap), temperature, then nucleus sampling - one call, one readback.
 // Returns the sampled token id.
@@ -96,6 +103,15 @@ void qadd_int8_launch(const signed char* qa, const signed char* qb,
 void qgemm_launch(const signed char* aq, const signed char* bq,
                   float* y, int m, int n, int k, float sa, float sb,
                   std::uintptr_t stream = 0);
+
+// Per-output-channel weight scales (SmoothQuant-style W8A8):
+// y[i,j] = (A_q . B_q^T) int32-exact * f32(sa * sb_vec[j]). sb_vec has
+// n entries (one per output row of B_q). Same exactness contract as
+// qgemm_launch: the f32 scale composes once, the product applies once.
+void qgemm_perchannel_launch(const signed char* aq, const signed char* bq,
+                             const float* sb_vec, float* y,
+                             int m, int n, int k, float sa,
+                             std::uintptr_t stream = 0);
 
 // Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream = 0);
