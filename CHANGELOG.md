@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- README roadmap: 1.0 marked as released; install-facing metadata moved
+  to the stable classifier (Development Status 5 - Production/Stable).
+- quantize.cu: the file header still claimed "INT8 GEMM is out of scope
+  (v0.4+)" - the compute half shipped in v0.4 and gained per-channel
+  scales in 1.0; the header now points at qgemm.cu.
+- topk.cu: merged a duplicated (and partly contradictory) doc block over
+  select_round_kernel into one accurate description - the rounds only
+  ever run stage 0; compaction belongs to select_finalize_kernel.
+
 ## [1.0.0] - 2026-08-30
 
 First stable release. The public surface (30 operators and helpers in

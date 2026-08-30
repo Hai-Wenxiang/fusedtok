@@ -306,22 +306,11 @@ __device__ __forceinline__ void bitonic_desc_shared(unsigned long long* sk,
 //                       arriving block scans the global histogram and
 //                       tightens the prefix. level == -1 refines nothing:
 //                       the prefix is already the full k-th key.
-//   stage 1 (compact) - gather every key matching the full prefix into
-//                       the candidate buffer; the last block sorts it in
-//                       shared memory and publishes k_min / tie_take = 1.
-//   stage 2 (done)    - return immediately (post-early-exit no-op).
-// `remaining0` carries k for the first round (the head memset left the
-// remaining slot at zero). `inv_t` scales logits in sampling mode; any
-// positive scale preserves the key order.
-// One launch per byte level (7..0). Behavior is driven by the stage word
-// so the host can issue the full fixed sequence unconditionally
-// (CUDA-graph friendly):
-//   stage 0 (refine)  - histogram byte `level` of the candidates whose
-//                       bytes above this level match the prefix; the last
-//                       arriving block scans the global histogram and
-//                       tightens the prefix.
-//   stage 1/2         - return immediately (the finalize launch handles
-//                       compaction; post-settled rounds are no-ops).
+//   stage 1/2         - return immediately: compaction and the k_min
+//                       publish belong to select_finalize_kernel (kept
+//                       out of this kernel so the rounds run with 2KB of
+//                       shared memory and only the finalize pays for the
+//                       candidate buffer); post-settled rounds are no-ops.
 // `remaining0` carries k for the first round (the head memset left the
 // remaining slot at zero). `inv_t` scales logits in sampling mode; any
 // positive scale preserves the key order.

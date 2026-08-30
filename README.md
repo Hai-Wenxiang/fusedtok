@@ -295,11 +295,12 @@ suite on every push.
   and a tiled prefill path (honest ~0.45x of SDPA flash - the
   convenience path); single-chart-per-GPU benchmarks; Windows wheels in
   the PyPI publish pipeline
-- 1.0 (in development): pipelined tensor-core INT8 GEMM (cp.async
+- 1.0 (released): pipelined tensor-core INT8 GEMM (cp.async
   double-buffering, runtime tile tuning; 17 -> 39 TOPS on a 3060) with
   per-channel weight scales (W8A8), fused top-k sampling (2.1x vs the
   topk+multinomial composite), top-k mid-range-k parity, text hygiene
-  gate, wheel matrix expansion, API freeze
+  gate, wheel matrix expansion (Linux cp310-313, Windows cp311-313),
+  API freeze
 
 ## Community
 
