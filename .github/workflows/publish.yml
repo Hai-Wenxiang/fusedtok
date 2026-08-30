@@ -39,17 +39,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # python-build-standalone ships its own headers; the container's
-      # apt python is no longer part of the build
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
+      # actions/setup-python does not reliably work inside container jobs
+      # (its toolcache PATH handoff never lands) - install the matrix
+      # python from deadsnakes and give every version its own venv
+      - name: Install Python ${{ matrix.python }}
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends software-properties-common \
+              gpg-agent gnupg patchelf
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install -y --no-install-recommends \
+              python${{ matrix.python }} python${{ matrix.python }}-venv
+          python${{ matrix.python }} -m venv /tmp/venv
+          echo "/tmp/venv/bin" >> $GITHUB_PATH
 
       - name: Install build dependencies
         run: |
-          # container jobs do not inherit setup-python's PATH entry
-          export PATH="$pythonLocation/bin:$PATH"
-          apt-get update
           apt-get install -y --no-install-recommends patchelf
           # patchelf via pip: ubuntu22.04's apt copy (0.14.3) is older than
           # auditwheel's required >= 0.14.5
