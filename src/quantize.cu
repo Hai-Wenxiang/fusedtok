@@ -30,9 +30,8 @@ namespace {
 __global__ void absmax_kernel(const float* __restrict__ x,
                               float* __restrict__ out_max, long long n) {
     __shared__ float shared[kBlock / 32];
-    const long long i0 = (long long)blockIdx.x * blockDim.x * 4 + threadIdx.x;
     float m = 0.0f;
-    // grid-stride with 4x unroll for coalescing bandwidth
+    // grid-stride loop: consecutive threads read consecutive addresses
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (long long)gridDim.x * blockDim.x) {
         m = fmaxf(m, fabsf(x[i]));

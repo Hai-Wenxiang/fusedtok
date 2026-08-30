@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Text hygiene gate (strict UTF-8, no BOM, no mojibake)
+        run: python3 scripts/check_utf8.py
+
       - name: Install build dependencies
         run: |
           apt-get update

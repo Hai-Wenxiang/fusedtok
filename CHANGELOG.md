@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- scripts/check_utf8.py: a repository-wide text hygiene gate - every
+  tracked text file must be strict UTF-8, BOM-free, without U+FFFD
+  replacement characters or the double-encoded (UTF-8-as-CP1252)
+  mojibake shape that bit the 0.1.1/0.1.2 PyPI pages. CI runs it on
+  every push before anything compiles.
+
+### Fixed
+- quantize.cu: removed a dead index variable (nvcc 13.x warning #177-D
+  on every build; leftover from an old 4x-unroll iteration).
+
 ## [0.5.1] - 2026-08-30
 
 ### Fixed
