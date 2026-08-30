@@ -38,8 +38,8 @@ traffic and launch overhead.
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
 | ✅ | qgemm | INT8 matmul, int32-exact: cp.async double-buffered pipelined IMMA GEMM with runtime tile tuning (64x64 / 128x128) + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
 | ✅ | qgemm_perchannel | the W8A8 layout real INT8 inference uses: per-output-channel weight scales fused into the same kernel's epilogue at zero cost |
-| ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths |
-| ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional); convenience path - heavyweight prefill stays SDPA/flash territory (honest ~0.45x) |
+| ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths; **float32 / bfloat16 / float16 storage** (half-precision cache = half the decode bytes, softmax stays float32) |
+| ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional), float32 / bf16 / fp16 storage; convenience path - heavyweight prefill stays SDPA/flash territory (honest ~0.45x f32) |
 
 ## Install
 
@@ -185,7 +185,8 @@ timed region). Largest shape per op; full data:
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| attention_decode (GQA) | T=16384, D=128 | 853 µs | 7614 µs (SDPA) | **8.92x** |
+| attention_decode (GQA) | T=16384, D=128 | 866 µs | 7626 µs (SDPA) | **8.81x** |
+| attention_decode bf16 | T=16384, D=128 | 851 µs | 1795 µs (SDPA bf16) | **2.11x** |
 | RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
 | RMSNorm (+residual) | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
 | SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
@@ -212,7 +213,8 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
 | RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8368 µs | **6.04x** |
-| attention_decode (GQA) | T=16384, D=128 | 575 µs | 2682 µs (SDPA) | **4.67x** |
+| attention_decode (GQA) | T=16384, D=128 | 573 µs | 2682 µs (SDPA) | **4.68x** |
+| attention_decode bf16 | T=16384, D=128 | 548 µs | 640 µs (SDPA bf16) | **1.17x** |
 | RMSNorm (+residual) | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |

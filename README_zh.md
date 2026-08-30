@@ -174,7 +174,8 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
-| attention_decode（GQA） | T=16384, D=128 | 853 µs | 7614 µs（SDPA） | **8.92x** |
+| attention_decode（GQA） | T=16384, D=128 | 866 µs | 7626 µs（SDPA） | **8.81x** |
+| attention_decode bf16 | T=16384, D=128 | 851 µs | 1795 µs（SDPA bf16） | **2.11x** |
 | RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
 | RMSNorm（含残差） | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
 | SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
@@ -202,7 +203,8 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
 | RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8368 µs | **6.04x** |
-| attention_decode（GQA） | T=16384, D=128 | 575 µs | 2682 µs（SDPA） | **4.67x** |
+| attention_decode（GQA） | T=16384, D=128 | 573 µs | 2682 µs（SDPA） | **4.68x** |
+| attention_decode bf16 | T=16384, D=128 | 548 µs | 640 µs（SDPA bf16） | **1.17x** |
 | RMSNorm（含残差） | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.50x** |
@@ -230,7 +232,10 @@ Blackwell（sm_120）驱动上验证 JIT 运行正确。
 回放）在两张卡上小 k 场景均超过 torch 的 CUB radix select；v1.0 重调
 （块内排序阈值与排序 chunk 双双从 2048 降到 1024 —— 单 block 位排序
 2048 个 key 正是中段 k 退步的全部来源）让中段 k 窗口也持平到领先
-（k=4096 @131k：1.12x / 1.09x）。融合采样器在真实解码形态的 logits 上
+（k=4096 @131k：1.12x / 1.09x）。attention_decode 自 v1.1 起接受 bfloat16 / float16 cache：kv-cache 字节减半，
+同 dtype 对比仍保持领先（bf16 @T=16384：3060 上 2.11x、5060 Ti 上 1.17x）——
+batch=1 时 kernel 受延迟限制，相对自身 f32 路径的绝对提升有限，batch 越大收益越大。
+融合采样器在真实解码形态的 logits 上
 胜过 eager 组合式（sample_topp 峰值：3.11x / 2.49x；sample_topk：
 2.16x / 1.98x）；平坦分布下 sample_topp 诚实为 0.01-0.02x —— 此时核
 覆盖大半个词表，扩窗循环要在越来越大的窗口上重跑整条管线（1.0.1 起步
