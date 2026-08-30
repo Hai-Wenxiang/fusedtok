@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] - 2026-08-30
+
+First feature release on the frozen 1.x API: half-precision attention (bf16/fp16 storage, float32 compute) for decode and prefill, a parallel exp precompute that halves the flat-distribution sampling worst case with bit-identical tokens, and the dim<32 prefill fallback retired in favor of the tiled path. 350 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
 
 ### Added
 - attention_decode / attention_prefill accept **bfloat16 and float16**
