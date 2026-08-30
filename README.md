@@ -47,9 +47,9 @@ traffic and launch overhead.
 pip install fusedtok
 ```
 
-Prebuilt wheels on PyPI (built with CUDA 12.4): **Linux x86_64** (manylinux,
-cp310) and **Windows x86_64** (cp312). On other platforms or Python versions
-pip builds from source automatically:
+Prebuilt wheels on PyPI (built with CUDA 12.4): **Linux x86_64**
+(manylinux, cp310-cp313) and **Windows x86_64** (cp311-cp313). On other
+platforms or Python versions pip builds from source automatically:
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git

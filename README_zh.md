@@ -47,8 +47,8 @@ pip install fusedtok
 ```
 
 PyPI 提供预编译 wheel（CUDA 12.4 构建）：**Linux x86_64**（manylinux，
-cp310）与 **Windows x86_64**（cp312）。其他平台或 Python 版本 pip 会自动
-从源码构建：
+cp310-cp313）与 **Windows x86_64**（cp311-cp313）。其他平台或 Python 版本
+pip 会自动从源码构建：
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/fusedtok.git
