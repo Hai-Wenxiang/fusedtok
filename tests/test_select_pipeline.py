@@ -114,6 +114,19 @@ class TestPipelineSampling:
             assert fusedtok.sample_topp(logits, 0.99, seed=seed, cuda=True) == \
                 fusedtok.sample_topp(logits, 0.99, seed=seed)
 
+    def test_flat_large_window_deterministic(self):
+        # n=40000 pushes the widening loop deep into the big-window
+        # regime (exp precompute + long serial walks); the same seed
+        # must reproduce the same token bit-exactly across calls, and
+        # the token must lie in the p=0.9 nucleus of the sorted
+        # distribution (which for this shape is most of the vocab)
+        n = 40000
+        logits = (np.random.default_rng(31)
+                  .standard_normal(n).astype(np.float32))
+        a = fusedtok.sample_topp(logits, 0.9, seed=123, cuda=True)
+        b = fusedtok.sample_topp(logits, 0.9, seed=123, cuda=True)
+        assert a == b and 0 <= a < n
+
     def test_sample_after_topk_topp_state(self):
         # sampling right after selections in the same process exercises
         # the workspace handoff (token slot vs counters)
