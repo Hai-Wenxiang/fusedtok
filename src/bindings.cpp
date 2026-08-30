@@ -800,7 +800,8 @@ PYBIND11_MODULE(_fusedtok, m) {
         h2d(da.get(), a.data(), a.size());
         h2d(db.get(), b.data(), b.size());
         DevBuf dy((size_t)m * n * 4);
-        if (m > 0 && n > 0 && k > 0)
+        // the launcher no-ops empty operands and zero-fills K == 0
+        if (m > 0 && n > 0)
             ft::qgemm_launch(reinterpret_cast<const signed char*>(da.fget()),
                              reinterpret_cast<const signed char*>(db.fget()),
                              dy.fget(), m, n, k, sa, sb, 0);

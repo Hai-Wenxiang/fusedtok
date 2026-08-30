@@ -59,6 +59,26 @@ def test_qgemm_extreme_values():
     np.testing.assert_array_equal(y, ref_qgemm(a, b, 1.0, 1.0))
 
 
+def test_qgemm_k0_zero_fill():
+    # K == 0: every dot product is empty -> the output is all zeros on
+    # every path. The v0.4 launcher skipped the GPU write entirely and
+    # left torch.empty garbage here; the zero-fill contract is now fixed
+    # and pinned (the CPU reference always produced zeros).
+    a = np.zeros((4, 0), dtype=np.int8)
+    b = np.zeros((3, 0), dtype=np.int8)
+    y_cpu = fusedtok.qgemm(a, 0.5, b, 0.25)
+    assert y_cpu.shape == (4, 3)
+    np.testing.assert_array_equal(y_cpu, np.zeros((4, 3), np.float32))
+    if fusedtok.cuda_available():
+        y_staged = fusedtok.qgemm(a, 0.5, b, 0.25, cuda=True)
+        np.testing.assert_array_equal(y_staged, y_cpu)
+        if HAS_TORCH:
+            at = torch.zeros((4, 0), dtype=torch.int8, device="cuda")
+            bt = torch.zeros((3, 0), dtype=torch.int8, device="cuda")
+            y_zc = fusedtok.qgemm(at, 0.5, bt, 0.25)
+            np.testing.assert_array_equal(y_zc.cpu().numpy(), y_cpu)
+
+
 def test_qgemm_errors():
     a = np.zeros((4, 8), dtype=np.int8)
     b = np.zeros((2, 8), dtype=np.int8)
@@ -115,6 +135,34 @@ class TestCuda:
             np.testing.assert_array_equal(
                 fusedtok.qgemm(a, 0.1, b, 0.2, cuda=True), first)
 
+    def test_wide_slab_shapes_bitexact(self):
+        # The launcher micro-benchmarks SLAB 64 vs SLAB 128 per shape and
+        # caches the winner; whichever config wins on this GPU, integer
+        # accumulation must stay exact. Drive shapes that stress both
+        # slabs, multi-slab K streams, boundary tiles and scalar tails.
+        for m, n, k in [(65, 63, 2000), (300, 500, 1024),
+                        (128, 128, 4096), (17, 4096, 8192)]:
+            rng = np.random.default_rng(m + n + k)
+            a = rand_q(rng, m, k)
+            b = rand_q(rng, n, k)
+            y = fusedtok.qgemm(a, 0.05, b, 0.04, cuda=True)
+            ycpu = fusedtok.qgemm(a, 0.05, b, 0.04)
+            np.testing.assert_array_equal(y, ycpu)
+
+    def test_tuned_repeats_bitidentical(self):
+        # First call tunes (11+ launches of the real kernel into the
+        # same output); the tuning must be invisible to the caller:
+        # the post-tune answer equals the CPU path AND every repeat.
+        rng = np.random.default_rng(21)
+        a = rand_q(rng, 96, 512)
+        b = rand_q(rng, 77, 512)
+        y = fusedtok.qgemm(a, 0.03, b, 0.02, cuda=True)
+        ycpu = fusedtok.qgemm(a, 0.03, b, 0.02)
+        np.testing.assert_array_equal(y, ycpu)
+        for _ in range(3):
+            np.testing.assert_array_equal(
+                fusedtok.qgemm(a, 0.03, b, 0.02, cuda=True), ycpu)
+
 
 @pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
                     reason="no torch/GPU")
@@ -166,6 +214,39 @@ class TestTorchZeroCopy:
         g.replay()
         torch.cuda.synchronize()
         # torch has no CUDA int matmul; the numpy CPU path is exact
+        ref = torch.from_numpy(fusedtok.qgemm(
+            a.cpu().numpy(), 0.05, b.cpu().numpy(), 0.02)).cuda()
+        assert torch.allclose(y, ref, rtol=1e-6)
+
+    def test_graph_capture_after_tuning(self):
+        # A big GEMM first call tunes the slab config on the live stream;
+        # capturing the SAME shape afterwards must replay the tuned (or
+        # default) config and recompute on mutation. Pins the interplay
+        # between the config cache and the capture path (captures skip
+        # tuning, but a pre-tuned shape must still be capturable).
+        m = n = k = 256
+        a = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
+        b = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+        y = torch.empty((m, n), device="cuda", dtype=torch.float32)
+
+        def run():
+            from fusedtok import _fusedtok
+            _fusedtok.qgemm_launch(a.data_ptr(), b.data_ptr(), y.data_ptr(),
+                                   m, n, k, 0.05, 0.02,
+                                   torch.cuda.current_stream().cuda_stream)
+        run()                            # tunes outside any capture
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run()
+        a.mul_(-1)
+        g.replay()
+        torch.cuda.synchronize()
         ref = torch.from_numpy(fusedtok.qgemm(
             a.cpu().numpy(), 0.05, b.cpu().numpy(), 0.02)).cuda()
         assert torch.allclose(y, ref, rtol=1e-6)

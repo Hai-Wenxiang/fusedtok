@@ -784,7 +784,8 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
         if k != k2:
             raise ValueError("inner dimensions must match")
         y = torch.empty((m, n), dtype=torch.float32, device=a_q.device)
-        if m > 0 and n > 0 and k > 0:
+        # the launcher no-ops empty operands and zero-fills K == 0
+        if m > 0 and n > 0:
             _fusedtok.qgemm_launch(a_q.data_ptr(), b_q.data_ptr(),
                                    y.data_ptr(), m, n, k,
                                    float(a_scale), float(b_scale),

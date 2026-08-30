@@ -13,7 +13,26 @@ adheres to [Semantic Versioning](https://semver.org/).
   mojibake shape that bit the 0.1.1/0.1.2 PyPI pages. CI runs it on
   every push before anything compiles.
 
+### Changed
+- qgemm (INT8 matmul) rewritten as a cp.async double-buffered pipelined
+  IMMA kernel: K streams through two shared-memory slabs - the DMA for
+  slab s+1 overlaps the tensor-core work of slab s (the v0.4 kernel
+  round-tripped every byte through registers and stalled the whole block
+  on a barrier per 64-element slab); boundary tiles are padded by
+  pre-zeroed shared memory instead of per-load predicates; and the tile
+  size is a runtime-tuned choice between 64x64 (256 threads; slab 64 or
+  128) and a 128x128 DRAM-intensity tile (512 threads, 96 KB opt-in
+  dynamic shared memory). Integer accumulation is untouched - CPU /
+  staged / zero-copy stay bit-identical. Measured on RTX 3060 (3-round
+  averages, 4096^3): 17 TOPS (v0.4) -> 39 TOPS, 0.15x -> 0.46x vs
+  cuBLASLt (torch._int_mm); the honest gap to cuBLASLt (~83 TOPS, about
+  82% of the sm_86 dense-INT8 peak) is analyzed in the README
+  performance section.
+
 ### Fixed
+- qgemm with K == 0 zero-fills the output on every path (the v0.4
+  launcher skipped the GPU write and returned torch.empty garbage; the
+  CPU reference always produced zeros). Pinned by a new cross-path test.
 - quantize.cu: removed a dead index variable (nvcc 13.x warning #177-D
   on every build; leftover from an old 4x-unroll iteration).
 
