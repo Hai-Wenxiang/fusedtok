@@ -193,6 +193,18 @@ def main():
                lambda: fusedtok.topk(logits, 4096),
                lambda: torch.topk(logits, 4096),
                max(20, iters // 4))
+        # fused top-k sampling vs the composite an inference loop would
+        # write (topk + softmax + multinomial). SEMANTICS NOTE: the torch
+        # side draws from its own global RNG - the timing is the fair
+        # part, not the seed determinism (fusedtok is seed-reproducible,
+        # the composite is not).
+        def torch_sample_topk():
+            v, i = torch.topk(logits, 50)
+            return i[torch.multinomial(torch.softmax(v, -1), 1)]
+        record("sample_topk k=50", f"[{vocab}]",
+               lambda: fusedtok.sample_topk(logits, 50),
+               torch_sample_topk,
+               max(20, iters // 4))
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),
                lambda: int(logits.argmax()),

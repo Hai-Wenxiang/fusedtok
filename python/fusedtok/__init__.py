@@ -54,6 +54,7 @@ __all__ = [
     "topk",
     "topp",
     "sample_topp",
+    "sample_topk",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -897,6 +898,39 @@ def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
         raise ValueError("logits must be 1-D")
     call = _fusedtok.sample_topp if path == "staged" else _fusedtok.sample_topp_cpu
     return int(call(arr, p, temperature, seed))
+
+
+def sample_topk(logits, k, *, temperature=1.0, seed=0, cuda=False):
+    """Fused top-k sampling: one GPU round trip from raw logits to a token.
+
+    Pipeline: softmax of ``logits / temperature`` -> keep the k
+    highest-probability tokens -> renormalize WITHIN the k survivors ->
+    inverse-CDF draw using a hash-uniform of ``seed``. Deterministic per
+    seed; the RNG is a splitmix-style hash (reproducible, NOT
+    cryptographically secure).
+
+    Returns the sampled token id (int). ``k`` in ``[1, vocab]``
+    (``k = 1`` is greedy; ``k >= vocab`` samples the whole distribution).
+    temperature > 0.
+    """
+    if k <= 0:
+        raise ValueError("k must be >= 1")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_topk_launch(logits.data_ptr(),
+                                                logits.numel(), k,
+                                                temperature, seed,
+                                                _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = _fusedtok.sample_topk if path == "staged" else _fusedtok.sample_topk_cpu
+    return int(call(arr, k, temperature, seed))
 
 
 def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,

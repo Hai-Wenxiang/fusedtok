@@ -70,6 +70,13 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
 // hash-uniform of `seed`. Returns the token.
 long long sample_topp_launch(const float* x, int n, float p, float t,
                               unsigned long long seed, std::uintptr_t stream = 0);
+
+// Fused top-k sampling: temperature, top-k truncation, renormalize
+// WITHIN the k survivors, inverse-CDF draw - one call, one readback.
+// Deterministic per seed (same RNG as sample_topp_launch).
+long long sample_topk_launch(const float* x, int n, int k, float t,
+                             unsigned long long seed,
+                             std::uintptr_t stream = 0);
 // Fused decode step: repetition penalty over the sampled ids (vocab
 // bitmap), temperature, then nucleus sampling - one call, one readback.
 // Returns the sampled token id.

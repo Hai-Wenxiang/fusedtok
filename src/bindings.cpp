@@ -702,6 +702,47 @@ PYBIND11_MODULE(_fusedtok, m) {
         return ft::sample_topp_cpu(to_vec(logits), (float)p, (float)t, seed);
     }, py::arg("logits"), py::arg("p"), py::arg("t") = 1.0, py::arg("seed") = 0);
 
+    m.def("sample_topk_cpu", [](FArray logits, int k, double t,
+                                unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_topk_cpu(to_vec(logits), k, (float)t, seed);
+    }, py::arg("logits"), py::arg("k"), py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_topk", [](FArray logits, int k, double t,
+                            unsigned long long seed) -> long long {
+        // staged: copy logits up, run, read the token back
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (k <= 0)
+            throw std::invalid_argument("k must be >= 1");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_topk_launch(dx.fget(), n, k,
+                                                       (float)t, seed);
+        sync_device("sample topk kernel");
+        return token;
+    }, py::arg("logits"), py::arg("k"), py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_topk_launch", [](py::int_ x, int n, int k, double t,
+                                   unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (k <= 0)
+            throw std::invalid_argument("k must be >= 1");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_topk_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                      n, k, (float)t, seed, stream);
+    }, py::arg("x"), py::arg("n"), py::arg("k"), py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
     m.def("sample_topp", [](FArray logits, double p, double t,
                             unsigned long long seed) -> long long {
         if (logits.ndim() != 1)
