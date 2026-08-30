@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-08-30
+
+Maintenance release: honest sampling benchmarks, an x8 sampling-window retry jump, documentation and metadata corrections. No API changes; all 338 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Added
+- benchmarks/bench.py: sample_topp rows in TWO honestly labeled
+  regimes - "peaked" (a dominant token, the decode-time case that the
+  first sampling window covers) and "flat (worst case)" (randn logits,
+  where the nucleus spans most of the vocab and the widening loop
+  reruns the pipeline on ever-larger windows). The peaked case is a
+  real win (3.11x on a 3060 / 2.49x on a 5060 Ti vs the softmax+sort+
+  mask+multinomial composite); the flat case is honestly 0.01-0.02x and
+  now both the number and the reason sit in the README tables and
+  prose instead of being invisible.
+- examples/demo.py: tours for the two 1.0 operators the demo never
+  covered - qgemm_perchannel (bit-exact W8A8 parity vs numpy) and
+  sample_topk (top-k set membership, k=1-is-greedy, per-seed
+  CUDA-vs-CPU parity).
+
+### Changed
+- sampling window widening jumps x8 instead of x4 (sample_topp and
+  decode_step): flat distributions need windows 50-100x the vocab tail
+  and x4 needed up to five full pipeline attempts on n=131072, each
+  re-histogramming every key. The sampled token is unaffected by the
+  jump size (a covered nucleus samples identically - the threshold is
+  the global mass, the renormalization the nucleus mass), only the
+  retry count drops (5 -> 4 attempts worst case at n=131072).
+- README roadmap: 1.0 marked as released; install-facing metadata moved
+  to the stable classifier (Development Status 5 - Production/Stable).
+- quantize.cu: the file header still claimed "INT8 GEMM is out of scope
+  (v0.4+)" - the compute half shipped in v0.4 and gained per-channel
+  scales in 1.0; the header now points at qgemm.cu.
+- topk.cu: merged a duplicated (and partly contradictory) doc block over
+  select_round_kernel into one accurate description - the rounds only
+  ever run stage 0; compaction belongs to select_finalize_kernel.
+
 ## [1.0.0] - 2026-08-30
 
 First stable release. The public surface (30 operators and helpers in

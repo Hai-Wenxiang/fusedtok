@@ -105,7 +105,7 @@ class TestPipelineRoundCoverage:
 class TestPipelineSampling:
     def test_flat_logits_force_widening(self):
         # near-identical logits spread the nucleus over the whole vocab:
-        # the sampling window must widen past the 2048 in-block size and
+        # the sampling window must widen past the 1024 in-block size and
         # the big-path serial scan must still match the CPU reference
         n = 9000
         logits = (np.zeros(n, dtype=np.float32) +

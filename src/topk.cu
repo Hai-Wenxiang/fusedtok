@@ -306,22 +306,11 @@ __device__ __forceinline__ void bitonic_desc_shared(unsigned long long* sk,
 //                       arriving block scans the global histogram and
 //                       tightens the prefix. level == -1 refines nothing:
 //                       the prefix is already the full k-th key.
-//   stage 1 (compact) - gather every key matching the full prefix into
-//                       the candidate buffer; the last block sorts it in
-//                       shared memory and publishes k_min / tie_take = 1.
-//   stage 2 (done)    - return immediately (post-early-exit no-op).
-// `remaining0` carries k for the first round (the head memset left the
-// remaining slot at zero). `inv_t` scales logits in sampling mode; any
-// positive scale preserves the key order.
-// One launch per byte level (7..0). Behavior is driven by the stage word
-// so the host can issue the full fixed sequence unconditionally
-// (CUDA-graph friendly):
-//   stage 0 (refine)  - histogram byte `level` of the candidates whose
-//                       bytes above this level match the prefix; the last
-//                       arriving block scans the global histogram and
-//                       tightens the prefix.
-//   stage 1/2         - return immediately (the finalize launch handles
-//                       compaction; post-settled rounds are no-ops).
+//   stage 1/2         - return immediately: compaction and the k_min
+//                       publish belong to select_finalize_kernel (kept
+//                       out of this kernel so the rounds run with 2KB of
+//                       shared memory and only the finalize pays for the
+//                       candidate buffer); post-settled rounds are no-ops.
 // `remaining0` carries k for the first round (the head memset left the
 // remaining slot at zero). `inv_t` scales logits in sampling mode; any
 // positive scale preserves the key order.
@@ -1285,7 +1274,13 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
             return token;                  // nucleus covered, token sampled
         if (window == n)
             throw std::runtime_error("sample nucleus not covered");
-        window = std::min(n, window * 4);  // widen and retry
+        // x8: flat distributions need windows 50-100x the vocab tail;
+        // x4 needed up to five full pipeline attempts on n=131072, each
+        // re-histogramming every key. The sampled token is unaffected by
+        // the jump size (a covered nucleus samples identically - the
+        // threshold is the global mass, the renormalization the nucleus
+        // mass), only the number of retries changes.
+        window = std::min(n, window * 8);  // widen and retry
     }
 }
 
@@ -1391,7 +1386,7 @@ long long decode_step_launch(const float* x, const long long* ids,
             return token;
         if (window == n)
             throw std::runtime_error("decode step nucleus not covered");
-        window = std::min(n, window * 4);
+        window = std::min(n, window * 8);  // same jump-size rationale
     }
 }
 
