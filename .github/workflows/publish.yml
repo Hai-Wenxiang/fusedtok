@@ -71,7 +71,10 @@ jobs:
 
       - name: Repair wheel to manylinux (PyPI rejects bare linux tags)
         run: |
-          export PATH="$pythonLocation/bin:$PATH"
+          # container jobs append GITHUB_PATH instead of prepending, so
+          # the venv's newer patchelf must be promoted by hand
+          export PATH="/tmp/venv/bin:$PATH"
+          patchelf --version
           auditwheel show dist/fusedtok-*.whl
           auditwheel repair dist/fusedtok-*.whl -w wheelhouse/
           rm -f dist/fusedtok-*.whl
