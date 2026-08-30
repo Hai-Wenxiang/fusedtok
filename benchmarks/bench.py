@@ -185,6 +185,14 @@ def main():
                lambda: fusedtok.topk(logits, 50),
                lambda: torch.topk(logits, 50),
                max(20, iters // 4))
+        # the mid-k window: k large enough that the selection leaves the
+        # in-block-sort path, small enough that torch's CUB select is
+        # still in its fast regime - the honest comparison point for the
+        # chunk/merge tail
+        record("topk k=4096", f"[{vocab}]",
+               lambda: fusedtok.topk(logits, 4096),
+               lambda: torch.topk(logits, 4096),
+               max(20, iters // 4))
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),
                lambda: int(logits.argmax()),
