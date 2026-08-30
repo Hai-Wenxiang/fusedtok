@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.1] - 2026-08-30
 
 ### Fixed
 - docs: README headline speedup refreshed to the 0.5.0 attention numbers
@@ -14,6 +14,23 @@ adheres to [Semantic Versioning](https://semver.org/).
 - CONTRIBUTING new-kernel checklist: two v0.5 lessons added (runtime
   loop bounds demote register arrays to local memory - a measured 7x;
   full-warp-mask shuffles deadlock under warp divergence).
+
+### Changed
+- benchmarks/bench.py: every configuration is now timed over THREE
+  independent rounds (each with its own warmup) and reported as the
+  mean; the per-round values ride along in the JSON and the console
+  shows the round spread, so jitter stays auditable. The chart's x-axis
+  ticks always include 1 - matplotlib's default step-2 ticks at x_max
+  ~ 9.5 (the RTX 3060 chart) read 0/2/4/6/8 and lost the parity anchor
+  (the 5060 Ti chart happened to stay under 10 and kept it).
+- attention kernels: the per-lane chunk index had two names (nc at
+  load, j at use) across the three online-softmax kernels - unified so
+  the load-to-store mapping reads as one invariant (no behavior
+  change; 287 tests green, perf unchanged, re-verified on both GPUs
+  under the 3-round protocol).
+- README benchmark tables regenerated from the 3-round JSONs on both
+  GPUs (headlines: attn decode 8.92x @ 3060 / 4.67x @ 5060 Ti; argmax
+  honestly at 0.69x including the host readback).
 
 ## [0.5.0] - 2026-08-30
 
