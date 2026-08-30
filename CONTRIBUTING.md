@@ -45,8 +45,8 @@ CUDA cases skip automatically.
 
 ## New-kernel checklist
 
-Lessons baked into the v0.3/v0.4/v0.5 sprints - run through this before
-pushing any new GPU kernel:
+Lessons baked into the v0.3/v0.4/v0.5/v1.0 sprints - run through this
+before pushing any new GPU kernel:
 
 - [ ] **Sanitizer trio before review**: `compute-sanitizer --tool memcheck`
       and `--tool racecheck` on a smoke that exercises every code path
@@ -79,6 +79,21 @@ pushing any new GPU kernel:
       fields are plain `char` (unsigned on MSVC - cast through
       `(signed char)`); single-thread serial volatile loads are latency
       poison (stage cooperatively through shared memory).
+- [ ] **cp.async beats register staging for GEMM-style slabs** (v1.0
+      qgemm): staging global tiles in per-thread register arrays keeps
+      them live across the compute phase - the first pipelined qgemm
+      measured 156 registers (1 block/SM, slab128: 255 + spills) and ran
+      SLOWER than the v0.4 single-buffered kernel. `__pipeline_memcpy_async`
+      moves the same bytes global->shared with no register detour
+      (111-128 registers, 2 blocks/SM). Check `nvcc --ptxas-options=-v`
+      before believing a pipeline.
+- [ ] **Tuned kernel configs need a capture-safe default** (v1.0 qgemm):
+      if first-call micro-benchmarks pick a tile/slab config, captures
+      must skip the tuning (events + syncs are illegal mid-capture) and
+      launch a default config instead - and a config needing
+      `cudaFuncSetAttribute` opt-in (> 48 KB dynamic smem) must raise the
+      attribute inside the tuner, never during a capture. Pin both with a
+      capture-after-tuning test.
 
 ## Pull requests
 

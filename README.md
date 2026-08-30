@@ -35,7 +35,7 @@ traffic and launch overhead.
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
 | ✅ | decode_step | the whole decode step fused: penalty -> temperature -> nucleus sample, one call, one readback |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
-| ✅ | qgemm | INT8 matmul, int32-exact: tensor-core IMMA GEMM + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
+| ✅ | qgemm | INT8 matmul, int32-exact: cp.async double-buffered pipelined IMMA GEMM with runtime tile tuning (64x64 / 128x128) + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
 | ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths |
 | ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional); convenience path - heavyweight prefill stays SDPA/flash territory (honest ~0.45x) |
 
@@ -181,6 +181,7 @@ timed region). Largest shape per op; full data:
 | Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
 | argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) |
+| int8 qgemm (IMMA) | [4096×4096×4096] | 3554 µs (38.7 TOPS) | 1634 µs (cuBLASLt) | 0.46x (honest) |
 | attention_prefill (causal) | S=1024, D=128 | 5732 µs | 2560 µs (SDPA flash) | 0.45x (honest) |
 
 Row-wise kernels (norms, softmax) autotune their thread-block size per
@@ -200,6 +201,7 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x (incl. host readback) |
+| int8 qgemm (IMMA) | [4096×4096×4096] | 2063 µs (66.6 TOPS) | 800 µs (cuBLASLt) | 0.39x (honest) |
 | attention_prefill (causal) | S=1024, D=128 | 3291 µs | 1421 µs (SDPA flash) | 0.43x (honest) |
 
 On smaller shapes the Blackwell card shows bigger wins (softmax 2.5x,
@@ -223,9 +225,14 @@ effective while SDPA pays head expansion or small-query inefficiency);
 attention_prefill is the honest convenience path at ~0.45x of SDPA's
 flash backend — no tensor cores by design, so heavyweight prefill stays
 with SDPA/FlashAttention. The INT8 decode GEMV moves half the bytes of
-an fp16 projection and runs at full memory bandwidth (2x); the IMMA
-GEMM path (~17 TOPS) is correctness-first — cuBLASLt (`torch._int_mm`)
-remains faster for large prefill matmuls.
+an fp16 projection and runs at full memory bandwidth (2x); the pipelined
+IMMA GEMM (v1.0 rework: cp.async double-buffered slabs, runtime-tuned
+64x64 / 128x128 tiles) reaches ~39 TOPS on a 3060 and ~67 TOPS on a
+5060 Ti — 2x-4x the v0.4 kernel — but cuBLASLt (`torch._int_mm`) still
+holds a ~2.2-2.6x lead: its tiles pipeline deeper and its epilogue is
+tuned per-arch. For now qgemm is the exact / graph-capturable /
+zero-copy INT8 path, not the fastest one; honest numbers, a
+CUTLASS-class schedule stays future work.
 
 ## Development
 
@@ -263,8 +270,11 @@ suite on every push.
   and a tiled prefill path (honest ~0.45x of SDPA flash - the
   convenience path); single-chart-per-GPU benchmarks; Windows wheels in
   the PyPI publish pipeline
-- future: pipelined tensor-core INT8 GEMM; top-k mid-range parity;
-  API freeze for 1.0
+- 1.0 (in development): pipelined tensor-core INT8 GEMM (cp.async
+  double-buffering, runtime tile tuning; 17 -> 39 TOPS on a 3060),
+  per-channel weight scales for qgemm (SmoothQuant-style W8A8), fused
+  top-k sampling, top-k mid-range-k parity, text hygiene gate, wheel
+  matrix expansion, API freeze
 
 ## Community
 
