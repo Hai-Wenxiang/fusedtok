@@ -548,6 +548,16 @@ class TestTorchZeroCopy:
         np.testing.assert_allclose(y.cpu().numpy(), ref, rtol=1e-5,
                                    atol=1e-6)
 
+if HAS_TORCH:
+    HALF_DTYPES = [pytest.param(torch.bfloat16, 2e-2, 2e-2, id="bf16"),
+                   pytest.param(torch.float16, 2e-3, 2e-3, id="fp16")]
+    HALF_DTYPE_OBJECTS = [torch.bfloat16, torch.float16]
+else:
+    # empty lists keep the class importable on torch-less machines
+    HALF_DTYPES = []
+    HALF_DTYPE_OBJECTS = []
+
+
 @pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
                     reason="no torch/GPU")
 class TestHalfStorage:
@@ -560,10 +570,9 @@ class TestHalfStorage:
     store rounding - bf16 keeps ~3 significant digits, fp16 ~3.5.
     """
 
-    DT = pytest.param(torch.bfloat16, 2e-2, 2e-2, id="bf16")
-    DT16 = pytest.param(torch.float16, 2e-3, 2e-3, id="fp16")
 
-    @pytest.mark.parametrize("dt,rtol,atol", [DT, DT16])
+
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
     def test_decode_matches_f32reference(self, dt, rtol, atol):
         rng = np.random.default_rng(101)
         b, hq, hkv, t, d = 2, 8, 2, 512, 128
@@ -578,7 +587,7 @@ class TestHalfStorage:
         np.testing.assert_allclose(out.float().cpu().numpy(), ref,
                                    rtol=rtol, atol=atol)
 
-    @pytest.mark.parametrize("dt,rtol,atol", [DT, DT16])
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
     def test_decode_gqa_mapping_and_lens(self, dt, rtol, atol):
         # constant-V probe: V is IDENTICAL across the rows of each kv
         # head, so every output row of a GQA group must equal that
@@ -597,7 +606,7 @@ class TestHalfStorage:
                                        v0[h // 4].float().cpu().numpy(),
                                        rtol=rtol, atol=atol)
 
-    @pytest.mark.parametrize("dt,rtol,atol", [DT, DT16])
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
     def test_decode_padding_and_zero_len(self, dt, rtol, atol):
         # rows past lens[b] must be ignored even when poisoned with huge
         # values, and lens[b] == 0 must yield a zero output row in the
@@ -618,7 +627,7 @@ class TestHalfStorage:
         np.testing.assert_array_equal(out[1].float().cpu().numpy(),
                                       np.zeros((hq, d), np.float32))
 
-    @pytest.mark.parametrize("dt,rtol,atol", [DT, DT16])
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
     def test_prefill_causal_and_bidirectional(self, dt, rtol, atol):
         b, hq, hkv, s, d = 1, 4, 2, 96, 128
         q = torch.randn(b, hq, s, d, device="cuda").to(dt)
@@ -651,7 +660,7 @@ class TestHalfStorage:
             ref(q.float().cpu().numpy(), k.float().cpu().numpy(),
                 v.float().cpu().numpy(), False), rtol=rtol, atol=atol)
 
-    @pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("dt", HALF_DTYPE_OBJECTS)
     def test_split_and_single_paths_match(self, dt):
         # the same shape across the split threshold: both kernel paths
         # must agree within half-precision tolerance
