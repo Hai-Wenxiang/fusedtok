@@ -155,42 +155,43 @@ for step in range(256):
 
 ## 性能基准
 
-RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时，对比等价的
-PyTorch 参考实现（组合 eager 表达式；attention 参考使用**预展开**头 ——
-`repeat_interleave` 在计时区之外）。每算子取最大形状；完整数据：
-`docs/benchmark_rtx3060.json`，可用 `python benchmarks/bench.py` 复现：
+RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**独立 3 轮
+取平均**，逐轮数值在 JSON 中），对比等价的 PyTorch 参考实现（组合 eager
+表达式；attention 参考使用**预展开**头 —— `repeat_interleave` 在计时区
+之外）。每算子取最大形状；完整数据：`docs/benchmark_rtx3060.json`，可用
+`python benchmarks/bench.py` 复现：
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
-| attention_decode（GQA） | T=16384, D=128 | 857 µs | 7667 µs（SDPA） | **8.9x** |
-| RoPE NeoX (q+k) | [8192×4096] | 1654 µs | 10092 µs | **6.1x** |
-| RMSNorm（含残差） | [4096×4096] | 613 µs | 2058 µs | **3.4x** |
-| SwiGLU | [4096×4096] | 610 µs | 1031 µs | **1.7x** |
-| top-k (k=50) | [131072] | 78 µs | 125 µs | **1.6x** |
-| LayerNorm | [4096×4096] | 441 µs | 615 µs | **1.4x** |
-| Softmax | [4096×4096] | 415 µs | 427 µs | 1.0x |
-| SiLU / GeLU / add | [4096×4096] | ~414 µs | ~411 µs | ~1.0x |
-| argmax | [131072] | 39 µs | 35 µs | 0.9x（含主机回读） |
-| attention_prefill（因果） | S=1024, D=128 | 5764 µs | 2607 µs（SDPA flash） | 0.45x（诚实） |
+| attention_decode（GQA） | T=16384, D=128 | 853 µs | 7614 µs（SDPA） | **8.92x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
+| RMSNorm（含残差） | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
+| SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
+| top-k (k=50) | [131072] | 80 µs | 127 µs | **1.59x** |
+| LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
+| Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
+| SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
+| argmax | [131072] | 65 µs | 45 µs | 0.69x（含主机回读） |
+| attention_prefill（因果） | S=1024, D=128 | 5732 µs | 2560 µs（SDPA flash） | 0.45x（诚实） |
 
 按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
 线程块大小；上表为调优后的数字。
 
 ![fusedtok 对比 PyTorch 参考](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx3060.png)
 
-**RTX 5060 Ti（Blackwell，sm_120）** —— 同套测试，每算子最大形状
-（完整数据：`docs/benchmark_rtx5060ti.json`）：
+**RTX 5060 Ti（Blackwell，sm_120）** —— 同套测试，每算子最大形状（完整
+数据：`docs/benchmark_rtx5060ti.json`）：
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [8192×4096] | 1385 µs | 8372 µs | **6.0x** |
-| RMSNorm（含残差） | [4096×4096] | 505 µs | 1658 µs | **3.3x** |
-| attention_decode（GQA） | T=16384, D=128 | 572 µs | 2669 µs（SDPA） | **4.7x** |
-| SwiGLU | [4096×4096] | 505 µs | 858 µs | **1.7x** |
-| top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.5x** |
-| LayerNorm / Softmax | [4096×4096] | ~344 µs | ~347 µs | 1.0x |
-| argmax | [131072] | 17 µs | 14 µs | 0.8x（含主机回读） |
-| attention_prefill（因果） | S=1024, D=128 | 3299 µs | 1420 µs（SDPA flash） | 0.43x（诚实） |
+| RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8368 µs | **6.04x** |
+| attention_decode（GQA） | T=16384, D=128 | 575 µs | 2682 µs（SDPA） | **4.67x** |
+| RMSNorm（含残差） | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
+| SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
+| top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.50x** |
+| LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
+| argmax | [131072] | 17 µs | 14 µs | 0.83x（含主机回读） |
+| attention_prefill（因果） | S=1024, D=128 | 3291 µs | 1421 µs（SDPA flash） | 0.43x（诚实） |
 
 小形状下 Blackwell 的优势更大（softmax 2.5x、RMSNorm 3.2x @256 行、
 attention decode 3.8x @T=4096 跑出 235 GB/s）——形状越大启动开销占比
