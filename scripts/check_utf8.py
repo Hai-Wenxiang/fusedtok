@@ -40,11 +40,26 @@ MOJIBAKE_RUN = re.compile(r"[\u00c0-\u00ff][\u0080-\u00bf]{1,}")
 MAX_EXAMPLES = 5
 
 
+SKIP_DIRS = {".git", "build", "build2", "__pycache__", ".pytest_cache", "node_modules"}
+
+
 def tracked_files():
-    """All non-deleted paths known to git (empty tree safe)."""
-    out = subprocess.run(
-        ["git", "ls-files", "-z"], capture_output=True, check=True)
-    return [p for p in out.stdout.decode("utf-8", "replace").split("\0") if p]
+    """All text-candidate files: git-tracked when git is available (dev
+    machines), otherwise the whole checked-out tree minus VCS/build dirs
+    (CI containers may not have git on PATH - actions/checkout at least
+    leaves a clean tree, so both views agree there)."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z"], capture_output=True, check=True)
+        return [p for p in out.stdout.decode("utf-8", "replace").split("\0")
+                if p]
+    except (OSError, subprocess.CalledProcessError):
+        found = []
+        for root, dirs, files in os.walk("."):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for name in files:
+                found.append(os.path.normpath(os.path.join(root, name)))
+        return found
 
 
 def is_text(path):
