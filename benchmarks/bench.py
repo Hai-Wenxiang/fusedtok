@@ -205,6 +205,29 @@ def main():
                lambda: fusedtok.sample_topk(logits, 50),
                torch_sample_topk,
                max(20, iters // 4))
+
+        def torch_sample_topp_flat(src):
+            probs = torch.softmax(src, -1)
+            sp, si = torch.sort(probs, descending=True)
+            cum = sp.cumsum(-1)
+            sel = si[cum - sp < 0.9]
+            return sel[torch.multinomial(probs[sel], 1)]
+
+        # TWO regimes, honestly labeled: PEAKED logits (a dominant token -
+        # the decode-time case, covered by the first sampling window) and
+        # FLAT logits (worst case: the nucleus spans most of the vocab and
+        # the widening loop reruns the pipeline on ever-larger windows)
+        peaked = torch.randn(vocab, device="cuda")
+        peaked[peaked.argmax()] += 10.0
+        record("sample_topp peaked", f"[{vocab}]",
+               lambda: fusedtok.sample_topp(peaked, 0.9),
+               lambda: torch_sample_topp_flat(peaked),
+               max(20, iters // 4))
+        record("sample_topp flat (worst)", f"[{vocab}]",
+               lambda: fusedtok.sample_topp(logits, 0.9),
+               lambda: torch_sample_topp_flat(logits),
+               max(10, iters // 6))
+
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),
                lambda: int(logits.argmax()),

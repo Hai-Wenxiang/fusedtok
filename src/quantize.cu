@@ -9,7 +9,9 @@
 // via a two-pass trick: pass 1 reduces the elementwise |a*sa + b*sb| max,
 // pass 2 writes the requantized int8) - one round trip instead of three.
 //
-// This is the storage/dtype path only; INT8 GEMM is out of scope (v0.4+).
+// The storage/dtype half of the INT8 path; the compute half (IMMA
+// qgemm / decode GEMV, per-tensor and per-channel scales) lives in
+// qgemm.cu.
 
 #include "fusedtok/activations.hpp"
 #include "fusedtok/cuda_launch.hpp"

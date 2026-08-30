@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "fusedtok"
-version = "1.0.0"
+version = "1.0.1"
 description = "Fused CUDA kernels for LLM inference: RMSNorm, RoPE, SwiGLU, sampling ops, with zero-copy torch support"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -13,7 +13,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 keywords = ["cuda", "llm", "inference", "kernels", "deep-learning", "pytorch"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
