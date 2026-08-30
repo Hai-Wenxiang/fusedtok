@@ -35,6 +35,7 @@ LLM 推理框架中，每个 token 都要触发大量小而受内存带宽限制
 | ✅ | decode_step | 整个解码步融合：惩罚 -> 温度 -> 核采样，一次调用一次回读 |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称 per-tensor INT8，融合反量化-加-重量化 |
 | ✅ | qgemm | INT8 矩阵乘，int32 精确：cp.async 双缓冲流水线 IMMA GEMM + 运行时 tile 调优（64x64 / 128x128）+ 每 warp 一行的 GEMV（M=1 解码；比 fp16 投影快 2 倍） |
+| ✅ | qgemm_perchannel | 真实 INT8 推理所用的 W8A8 布局：逐输出通道权重 scale 融合进同一 kernel 的 epilogue，零开销 |
 | ✅ | attention_decode | 解码步因果注意力：GQA + 连续 kv-cache，在线 softmax、长 cache 自动 flash-decoding 切分、支持每序列长度 |
 | ✅ | attention_prefill | 新序列 S 行注意力（因果 / 双向）；便捷路径——重度 prefill 仍属 SDPA/flash 领地（诚实约 0.45x） |
 
@@ -173,6 +174,7 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
 | argmax | [131072] | 65 µs | 45 µs | 0.69x（含主机回读） |
 | int8 qgemm（IMMA） | [4096×4096×4096] | 3554 µs（38.7 TOPS） | 1634 µs（cuBLASLt） | 0.46x（诚实） |
+| int8 qgemm pc（W8A8） | [4096×4096×4096] | 3553 µs（38.7 TOPS） | 2046 µs（cuBLASLt + 广播） | 0.58x（诚实） |
 | attention_prefill（因果） | S=1024, D=128 | 5732 µs | 2560 µs（SDPA flash） | 0.45x（诚实） |
 
 按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
@@ -193,6 +195,7 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
 | argmax | [131072] | 17 µs | 14 µs | 0.83x（含主机回读） |
 | int8 qgemm（IMMA） | [4096×4096×4096] | 2063 µs（66.6 TOPS） | 800 µs（cuBLASLt） | 0.39x（诚实） |
+| int8 qgemm pc（W8A8） | [4096×4096×4096] | 2079 µs（66.1 TOPS） | 1142 µs（cuBLASLt + 广播） | 0.55x（诚实） |
 | attention_prefill（因果） | S=1024, D=128 | 3291 µs | 1421 µs（SDPA flash） | 0.43x（诚实） |
 
 小形状下 Blackwell 的优势更大（softmax 2.5x、RMSNorm 3.2x @256 行、
@@ -218,7 +221,10 @@ INT8 解码 GEMV 只搬运 fp16 投影一半的字节并跑满内存带宽（2 �
 v0.4 kernel 的 2-4 倍 —— 但 cuBLASLt（torch._int_mm）仍保持约 2.2-2.6 倍
 领先：它的 tile 流水线更深、epilogue 按架构精调。目前 qgemm 的定位是
 精确 / 可图捕获 / 零拷贝的 INT8 路径，而非最快的路径 —— 数字诚实，
-CUTLASS 级调度留作后续工作。
+CUTLASS 级调度留作后续工作。逐通道变体（qgemm_perchannel，真实 INT8
+推理所用的 W8A8 布局）把每输出通道的 scale 乘法融合进同一 epilogue，
+kernel 侧零开销 —— 组合式 torch 参考要单独付广播乘法的钱，这正是它
+0.55-0.58x 的来源。
 
 ## 开发
 
@@ -248,7 +254,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - v0.4.1（已完成）：按行 kernel（归一化/softmax）运行时线程块自动调优
 - v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
 - v0.5（已完成）：attention —— GQA 解码注意力（连续 kv-cache、长 cache 自动 flash-decoding 切分、每序列长度）+ 分块 prefill 路径（诚实约 0.45x vs SDPA flash，定位便捷路径）；每 GPU 单图 benchmark；Windows wheel 进入 PyPI 发布管线
-- 1.0（开发中）：流水线化 tensor-core INT8 GEMM（cp.async 双缓冲、运行时 tile 调优；3060 上 17 -> 39 TOPS）、qgemm 逐通道权重 scale（SmoothQuant 风格 W8A8）、融合 top-k 采样、top-k 中段 k 补平、文本卫生门禁、wheel 矩阵扩容、API 冻结
+- 1.0（开发中）：流水线化 tensor-core INT8 GEMM（cp.async 双缓冲、运行时 tile 调优；3060 上 17 -> 39 TOPS）与逐通道权重 scale（W8A8）、融合 top-k 采样、top-k 中段 k 补平、文本卫生门禁、wheel 矩阵扩容、API 冻结
 
 ## 社区
 

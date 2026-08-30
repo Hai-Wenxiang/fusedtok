@@ -12,6 +12,19 @@ adheres to [Semantic Versioning](https://semver.org/).
   replacement characters or the double-encoded (UTF-8-as-CP1252)
   mojibake shape that bit the 0.1.1/0.1.2 PyPI pages. CI runs it on
   every push before anything compiles.
+- qgemm_perchannel(a_q, a_scale, b_q, b_scales): per-output-channel
+  weight scales - the W8A8 layout real INT8 inference uses (activations
+  per-tensor, weights one scale per output row). The per-channel scale
+  multiply is fused into the pipelined kernel's epilogue (and the M==1
+  decode GEMV) at zero kernel cost: measured dead even with per-tensor
+  qgemm (38.7 vs 38.7 TOPS on a 3060; 66.5 vs 66.1 on a 5060 Ti) while
+  the composite torch reference (cuBLASLt + separate scale broadcast)
+  pays for the epilogue separately. Exactness contract unchanged and
+  pinned: f32(sa * sb[j]) composes with ONE rounding, the product
+  applies once, CPU / staged / zero-copy are bit-identical; with all
+  b_scales equal the output is bit-equal to per-tensor qgemm. New
+  end-to-end test quantizes spiky weight rows per channel and asserts
+  the 5x+ error reduction over per-tensor scales on non-outlier rows.
 
 ### Changed
 - qgemm (INT8 matmul) rewritten as a cp.async double-buffered pipelined
