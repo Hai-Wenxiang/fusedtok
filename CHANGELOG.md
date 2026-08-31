@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] - 2026-09-01
+
+Documentation-only patch over 1.1.1 (kernels, benchmarks and tests are
+byte-identical): the usage-guide links in both READMEs were relative,
+which rendered as dead links on the PyPI project page (GitHub rendered
+them fine). They now point at the canonical blob URLs like every other
+cross-document link in the READMEs.
+
 ## [1.1.1] - 2026-09-01
 
 Maintenance release: the multilingual usage guides (docs/en + docs/zh), an

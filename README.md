@@ -161,10 +161,10 @@ sampling/selection ops stay float32).
 CUDA torch tensors select the zero-copy path automatically.
 
 See `examples/demo.py` for a runnable tour of every operator, and the
-[usage guide](docs/en/usage.md) for the topic-structured manual (data
+[usage guide](https://github.com/Hai-Wenxiang/fusedtok/blob/main/docs/en/usage.md) for the topic-structured manual (data
 flow, attention, INT8 workflow, sampling contract, CUDA graphs, error
 contract) — also available in
-[中文](docs/zh/usage.md).
+[中文](https://github.com/Hai-Wenxiang/fusedtok/blob/main/docs/zh/usage.md).
 
 ## Correctness
 

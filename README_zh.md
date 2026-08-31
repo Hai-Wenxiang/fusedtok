@@ -153,8 +153,8 @@ for step in range(256):
 float32）。
 
 完整可运行的算子巡览见 `examples/demo.py`；主题式使用手册见
-[中文使用指南](docs/zh/usage.md)（数据流、attention、INT8 工作流、采样契约、
-CUDA graph、错误契约）——英文版在[这里](docs/en/usage.md)。
+[中文使用指南](https://github.com/Hai-Wenxiang/fusedtok/blob/main/docs/zh/usage.md)（数据流、attention、INT8 工作流、采样契约、
+CUDA graph、错误契约）——英文版在[这里](https://github.com/Hai-Wenxiang/fusedtok/blob/main/docs/en/usage.md)。
 
 ## 正确性
 
