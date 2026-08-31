@@ -91,6 +91,18 @@ template <> struct AttChunk<float> {
     __device__ __forceinline__ static void st(float* p, float4 v) {
         *reinterpret_cast<float4*>(p) = v;
     }
+    // chunk-indexed accessors: identical addresses to ld/st, but the
+    // pointer math stays in chunk units exactly like the pre-template
+    // code did (float4* subscripts). Kept for the prefill staging loop:
+    // the element-scaled form (`ld(p + i * 4)`) compiled measurably
+    // worse on sm_120 (71% slower prefill, same registers) - see the
+    // v1.1.1 CHANGELOG entry.
+    __device__ __forceinline__ static float4 ldc(const float* p, size_t i) {
+        return reinterpret_cast<const float4*>(p)[i];
+    }
+    __device__ __forceinline__ static void stc(float* p, size_t i, float4 v) {
+        reinterpret_cast<float4*>(p)[i] = v;
+    }
 };
 
 template <> struct AttChunk<__nv_bfloat16> {
@@ -111,6 +123,24 @@ template <> struct AttChunk<__nv_bfloat16> {
         u.y = *reinterpret_cast<const unsigned*>(&hi);
         *reinterpret_cast<uint2*>(p) = u;
     }
+    __device__ __forceinline__ static float4 ldc(const __nv_bfloat16* p,
+                                                 size_t i) {
+        const uint2 u = reinterpret_cast<const uint2*>(p)[i];
+        const float2 lo = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        const float2 hi = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(&u.y));
+        return make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+    __device__ __forceinline__ static void stc(__nv_bfloat16* p, size_t i,
+                                               float4 v) {
+        const __nv_bfloat162 lo = __float22bfloat162_rn(make_float2(v.x, v.y));
+        const __nv_bfloat162 hi = __float22bfloat162_rn(make_float2(v.z, v.w));
+        uint2 u;
+        u.x = *reinterpret_cast<const unsigned*>(&lo);
+        u.y = *reinterpret_cast<const unsigned*>(&hi);
+        reinterpret_cast<uint2*>(p)[i] = u;
+    }
 };
 
 template <> struct AttChunk<__half> {
@@ -130,6 +160,23 @@ template <> struct AttChunk<__half> {
         u.x = *reinterpret_cast<const unsigned*>(&lo);
         u.y = *reinterpret_cast<const unsigned*>(&hi);
         *reinterpret_cast<uint2*>(p) = u;
+    }
+    __device__ __forceinline__ static float4 ldc(const __half* p, size_t i) {
+        const uint2 u = reinterpret_cast<const uint2*>(p)[i];
+        const float2 lo = __half22float2(
+            *reinterpret_cast<const __half2*>(&u.x));
+        const float2 hi = __half22float2(
+            *reinterpret_cast<const __half2*>(&u.y));
+        return make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+    __device__ __forceinline__ static void stc(__half* p, size_t i,
+                                               float4 v) {
+        const __half2 lo = __float22half2_rn(make_float2(v.x, v.y));
+        const __half2 hi = __float22half2_rn(make_float2(v.z, v.w));
+        uint2 u;
+        u.x = *reinterpret_cast<const unsigned*>(&lo);
+        u.y = *reinterpret_cast<const unsigned*>(&hi);
+        reinterpret_cast<uint2*>(p)[i] = u;
     }
 };
 
@@ -554,8 +601,7 @@ __global__ void attn_prefill_kernel(const T* __restrict__ q,
         const int row = row0 + r;
         const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         *reinterpret_cast<float4*>(&q_s[r * dim + c * 4]) =
-            (row < seq) ? C::ld(qp + ((size_t)row * chunks + c) * 4)
-                        : zero;
+            (row < seq) ? C::ldc(qp, (size_t)row * chunks + c) : zero;
     }
     __syncthreads();
 
@@ -600,9 +646,9 @@ __global__ void attn_prefill_kernel(const T* __restrict__ q,
             const int row = t0 + r;
             const bool klive = row < seq;
             *reinterpret_cast<float4*>(&k_s[r * dim + c * 4]) =
-                klive ? C::ld(kp + ((size_t)row * chunks + c) * 4) : zero;
+                klive ? C::ldc(kp, (size_t)row * chunks + c) : zero;
             *reinterpret_cast<float4*>(&v_s[r * dim + c * 4]) =
-                klive ? C::ld(vp + ((size_t)row * chunks + c) * 4) : zero;
+                klive ? C::ldc(vp, (size_t)row * chunks + c) : zero;
         }
         __syncthreads();
 
@@ -671,12 +717,12 @@ __global__ void attn_prefill_kernel(const T* __restrict__ q,
             if (j >= lane_chunks) break;
             const int c = i_in_row + j * LPR;
             if (c < chunks)
-                C::st(orow + c * 4, make_float4(acc[j].x / l, acc[j].y / l,
-                                                acc[j].z / l, acc[j].w / l));
+                C::stc(orow, c,
+                       make_float4(acc[j].x / l, acc[j].y / l,
+                                   acc[j].z / l, acc[j].w / l));
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // per-shape workspace cache for the split path (process lifetime, like
@@ -975,10 +1021,12 @@ std::vector<float> attention_prefill_cpu(const std::vector<float>& q,
 }
 
 // ---------------------------------------------------------------------------
-// prefill launcher: one block per (batch, q head, 16-row tile);
-// stream-ordered, no workspace, CUDA-graph capturable as-is. float32 /
-// bfloat16 / float16 entry points share the tile heuristics and differ
-// only in the kernel instantiation (staging shared memory stays float32).
+// prefill launcher: one block per (batch, q head, query-row tile) with the
+// tile shape picked by head dimension (64/32/16 rows - see the kernel
+// comment); stream-ordered, no workspace, CUDA-graph capturable as-is.
+// float32 / bfloat16 / float16 entry points share the tile heuristics and
+// differ only in the kernel instantiation (staging shared memory stays
+// float32).
 // ---------------------------------------------------------------------------
 
 template <typename T>

@@ -300,6 +300,17 @@ def main():
         yt = fusedtok.attention_decode(qt, kt, vt, lt)
         torch.cuda.synchronize()
         check("torch cuda zero-copy", yt.cpu().numpy(), ref, tol=1e-4)
+        # v1.1: half-precision caches - same kernels computing in float32,
+        # loads/stores narrow at the boundary (half the decode bytes)
+        for half_dt, tol in ((torch.bfloat16, 2e-2), (torch.float16, 5e-3)):
+            yh = fusedtok.attention_decode(qt.to(half_dt), kt.to(half_dt),
+                                           vt.to(half_dt), lt)
+            torch.cuda.synchronize()
+            ok = yh.dtype is half_dt and torch.allclose(
+                yh.float(), yt, rtol=tol, atol=tol)
+            label = f"decode {str(half_dt).split('.')[-1]} vs f32"
+            print(f"  {label:<26} {'PASS' if ok else 'FAIL'}")
+            ALL_OK &= ok
 
     print(SEP)
     print("attention prefill: fresh-sequence causal attention (S query rows)")
@@ -320,6 +331,14 @@ def main():
         qt, kt, vt = (torch.from_numpy(x).cuda() for x in (q, k, v))
         yt = fusedtok.attention_prefill(qt, kt, vt, causal=False)
         torch.cuda.synchronize()
+        qh = qt.to(torch.bfloat16)
+        yh = fusedtok.attention_prefill(qh, kt.to(torch.bfloat16),
+                                        vt.to(torch.bfloat16), causal=False)
+        torch.cuda.synchronize()
+        ok = yh.dtype is torch.bfloat16 and torch.allclose(
+            yh.float(), yt, rtol=2e-2, atol=2e-2)
+        print(f"  {'prefill bf16 vs f32':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
         ref_bi = np.zeros_like(ref)
         for h in range(8):
             kvh = h // 4

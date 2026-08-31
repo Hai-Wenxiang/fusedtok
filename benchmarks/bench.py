@@ -108,6 +108,11 @@ def main():
     print(f"fusedtok {fusedtok.__version__} | torch {torch.__version__} | {dev_name}\n")
 
     rng = np.random.default_rng(0)
+    # torch's global RNG drives the sampling logits; seeding it keeps the
+    # DRAWS identical across runs/machines so JSON numbers stay comparable
+    # (unseeded, the peaked-row nucleus width varies per run and swings
+    # the sample_topp timing 2-3x with the same code)
+    torch.manual_seed(0)
 
     # --- norms / softmax / activations over [batch, hidden] -------------------
     for batch, hidden in [(256, 4096), (1024, 4096), (4096, 4096)]:
@@ -382,7 +387,7 @@ def main():
     ax.set_xlim(0, x_max)
     ax.set_ylim(-0.9, n - 0.1 + 0.55)
     ax.set_title(f"fusedtok vs PyTorch reference - {dev_name} "
-                 f"(float32; largest shape per op; value = fusedtok vs ref)",
+                 "(largest shape per op; dtype as noted per row)",
                  fontsize=11)
     ax.grid(axis="x", alpha=0.3, zorder=1)
     ax.spines["top"].set_visible(False)
