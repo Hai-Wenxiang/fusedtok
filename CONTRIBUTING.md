@@ -55,7 +55,7 @@ CUDA cases skip automatically.
 
 ## New-kernel checklist
 
-Lessons baked into the v0.3/v0.4/v0.5/v1.0 sprints - run through this
+Lessons baked into the v0.3/v0.4/v0.5/v1.0/v1.1 sprints - run through this
 before pushing any new GPU kernel:
 
 - [ ] **Sanitizer trio before review**: `compute-sanitizer --tool memcheck`
@@ -104,6 +104,23 @@ before pushing any new GPU kernel:
       `cudaFuncSetAttribute` opt-in (> 48 KB dynamic smem) must raise the
       attribute inside the tuner, never during a capture. Pin both with a
       capture-after-tuning test.
+- [ ] **One code path, even under dtype templates** (v1.1 attention):
+      templating a kernel on the storage dtype recompiles EVERYTHING -
+      including the float32 instantiation you did not touch - and nvcc
+      does not guarantee textually-equivalent specializations produce
+      equivalent code (the dim<32 prefill fallback miscompiled for f32
+      after templating; deleting it and routing small heads through the
+      tiled kernel's zero-padded, bounds-guarded band was the fix). Prefer
+      deleting a fallback over keeping a second path alive through a
+      template rework, and re-run the FULL parity suite on every dtype
+      after any template change.
+- [ ] **Address math is codegen input** (v1.1.1 prefill): `ld(p + i * 4)`
+      and `float4*[i]` compute the same address, but the sm_120 backend
+      scheduled the element-scaled form 71% slower in the prefill staging
+      loop (Ampere identical, register counts identical - only the
+      instruction mix changed). Keep vector loads/stores in chunk-unit
+      subscripts, and when a refactor is "textually equivalent", A/B the
+      perf on every GPU generation you ship to before believing it.
 
 ## Pull requests
 

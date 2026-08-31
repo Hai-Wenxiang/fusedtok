@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-09-01
+
+Maintenance release: the multilingual usage guides (docs/en + docs/zh), an
+honest benchmark regeneration (seeded sampling rows, corrected metadata,
+table-policy fixes), and a Blackwell-only `attention_prefill` regression
+fix. 351 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2); sanitizers clean.
+
+### Added
+- docs/en/usage.md + docs/zh/usage.md: topic-structured user guides (data
+  flow and dtype matrix, attention, INT8 workflow, sampling determinism
+  contract, CUDA graph capture, error contract, benchmarking) distilled
+  from the operator docstrings, the demo tour and the release notes;
+  both READMEs link to them.
+- examples/demo.py: half-precision attention tour (bf16/fp16 decode,
+  bf16 prefill) checking dtype preservation and parity against the
+  float32 path.
+
+### Changed
+- benchmarks/bench.py seeds torch's global RNG (`torch.manual_seed(0)`)
+  alongside the numpy generator: the sampling rows draw identical logits
+  on every run and machine now (unseeded, the peaked-row nucleus width
+  followed the random draw and swung `sample_topp` timings up to 3x
+  between runs of identical code).
+- Both benchmark JSONs/charts and the README perf tables (both languages)
+  regenerated on the 1.1.1 build: metadata now reports the actual
+  version (it said 1.0.1), the sampling rows reflect the seeded protocol
+  and the 1.1.0 exp-precompute numbers (flat worst case 25.9 -> 13.9ms
+  @131k on a 3060 had never reached the table), and the int8 qgemm rows
+  follow the documented "largest shape per op" policy.
+
+### Fixed
+- README.md benchmark table: the RTX 3060 argmax and int8 qgemm rows were
+  accidentally merged into one broken table row.
+- README (both languages): the headline speedup and the dtype-support
+  paragraph were stale after 1.1.0 (9.3x -> 8.9x per the current suite;
+  float16 attention support was missing from the dtype note); the roadmap
+  lacked the 1.1 entry.
+- **Regression (introduced in 1.1.0, Blackwell only)**: `attention_prefill`
+  ran ~71% slower on sm_120 (RTX 5060 Ti: 3.3ms -> 5.6ms at S=1024 D=128
+  f32; Ampere unaffected, launch configs and register counts identical).
+  Root cause: the v1.1 dtype templating rewrote the prefill staging
+  loads/stores from chunk-subscripted pointers (`float4*[i]`) to
+  element-scaled arithmetic (`ld(p + i * 4)`) - same addresses, but the
+  sm_120 backend scheduled the element-scaled form far worse. Fixed by
+  restoring chunk-unit indexing through new `AttChunk<T>::ldc/stc`
+  accessors; the 5060 Ti is back at the 1.0 baseline (3289us, 3-round
+  mean, vs 3282us for v1.0.0) and bf16/fp16 prefill run 3230/3225us.
+- src/attention.cu: stale prefill-launcher comment still described a
+  fixed 16-row tile; benchmarks/bench.py chart title claimed "float32"
+  for a suite that now contains bf16 rows.
+
 ## [1.1.0] - 2026-08-30
 
 First feature release on the frozen 1.x API: half-precision attention (bf16/fp16 storage, float32 compute) for decode and prefill, a parallel exp precompute that halves the flat-distribution sampling worst case with bit-identical tokens, and the dim<32 prefill fallback retired in favor of the tiled path. 350 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).

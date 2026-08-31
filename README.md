@@ -7,7 +7,7 @@
 
 **Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU / attention
 decode and friends, with **zero-copy torch tensor support**: up to
-**9.3x faster than PyTorch SDPA** (attention decode, RTX 3060, see
+**8.9x faster than PyTorch SDPA** (attention decode, RTX 3060, see
 [Benchmarks](#benchmarks)).
 
 **中文文档请看 [README_zh.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README_zh.md)** | English below.
@@ -153,12 +153,18 @@ for step in range(256):
 
 Every function accepts float32 numpy arrays or torch tensors (other dtypes
 are converted with a copy) and returns float32 outputs of the same family.
-CUDA torch tensors may also be **bfloat16** - the kernels compute in float32
-and convert at the load/store boundary (norm weights are upcast to float32
-automatically; sampling/selection ops stay float32).
+CUDA torch tensors may be **bfloat16** on every operator that moves tensor
+data (elementwise / norms / RoPE / attention), and the attention operators
+additionally take **float16** — kernels compute in float32 and convert at
+the load/store boundary (norm weights are upcast to float32 automatically;
+sampling/selection ops stay float32).
 CUDA torch tensors select the zero-copy path automatically.
 
-See `examples/demo.py` for a runnable tour of every operator.
+See `examples/demo.py` for a runnable tour of every operator, and the
+[usage guide](docs/en/usage.md) for the topic-structured manual (data
+flow, attention, INT8 workflow, sampling contract, CUDA graphs, error
+contract) — also available in
+[中文](docs/zh/usage.md).
 
 ## Correctness
 
@@ -185,22 +191,23 @@ timed region). Largest shape per op; full data:
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| attention_decode (GQA) | T=16384, D=128 | 866 µs | 7626 µs (SDPA) | **8.81x** |
-| attention_decode bf16 | T=16384, D=128 | 851 µs | 1795 µs (SDPA bf16) | **2.11x** |
-| RoPE NeoX (q+k) | [8192×4096] | 1641 µs | 10061 µs | **6.13x** |
-| RMSNorm (+residual) | [4096×4096] | 614 µs | 2061 µs | **3.36x** |
-| SwiGLU | [4096×4096] | 614 µs | 1025 µs | **1.67x** |
-| top-k (k=50) | [131072] | 79 µs | 137 µs | **1.75x** |
-| top-k (k=4096, mid-k) | [131072] | 113 µs | 127 µs | 1.12x |
-| LayerNorm | [4096×4096] | 446 µs | 616 µs | **1.38x** |
-| Softmax | [4096×4096] | 414 µs | 432 µs | 1.04x |
-| SiLU / GeLU / add | [4096×4096] | ~412 µs | ~411 µs | ~1.0x |
-| sample_topk k=50 | [131072] | 135 µs | 292 µs (topk+multinomial) | **2.16x** |
-| sample_topp p=0.9 (peaked) | [131072] | 160 µs | 496 µs (sort+mask+multinomial) | **3.11x** |
-| sample_topp p=0.9 (flat worst case) | [131072] | 25388 µs | 391 µs | 0.02x (honest, see below) |
-| argmax | [131072] | 65 µs | 45 µs | 0.69x (incl. host readback) || int8 qgemm (IMMA) | [4096×4096×4096] | 3554 µs (38.7 TOPS) | 1634 µs (cuBLASLt) | 0.46x (honest) |
-| int8 qgemm pc (W8A8) | [4096×4096×4096] | 3553 µs (38.7 TOPS) | 2046 µs (cuBLASLt + broadcast) | 0.58x (honest) |
-| attention_prefill (causal) | S=1024, D=128 | 5732 µs | 2560 µs (SDPA flash) | 0.45x (honest) |
+| attention_decode (GQA) | T=16384, D=128 | 860 µs | 7627 µs (SDPA) | **8.87x** |
+| attention_decode bf16 | T=16384, D=128 | 859 µs | 1801 µs (SDPA bf16) | **2.10x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1640 µs | 10044 µs | **6.12x** |
+| RMSNorm (+residual) | [4096×4096] | 612 µs | 2060 µs | **3.36x** |
+| SwiGLU | [4096×4096] | 608 µs | 1021 µs | **1.68x** |
+| top-k (k=50) | [131072] | 80 µs | 132 µs | **1.66x** |
+| top-k (k=4096, mid-k) | [131072] | 112 µs | 193 µs | **1.72x** |
+| LayerNorm | [4096×4096] | 442 µs | 611 µs | **1.38x** |
+| Softmax | [4096×4096] | 411 µs | 433 µs | 1.05x |
+| SiLU / GeLU / add | [4096×4096] | ~410-610 µs | ~410-607 µs | ~1.0x |
+| sample_topk k=50 | [131072] | 159 µs | 309 µs (topk+multinomial) | **1.94x** |
+| sample_topp p=0.9 (peaked) | [131072] | 145 µs | 406 µs (sort+mask+multinomial) | **2.81x** |
+| sample_topp p=0.9 (flat worst case) | [131072] | 13858 µs | 379 µs | 0.03x (honest, see below) |
+| argmax | [131072] | 45 µs | 45 µs | 1.00x (incl. host readback) |
+| int8 qgemm (IMMA) | [4096×11008×4096] | 9522 µs (38.8 TOPS) | 4521 µs (cuBLASLt) | 0.47x (honest) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 3519 µs (39.1 TOPS) | 2056 µs (cuBLASLt + broadcast) | 0.58x (honest) |
+| attention_prefill (causal) | S=1024, D=128 | 5775 µs | 2602 µs (SDPA flash) | 0.45x (honest) |
 
 Row-wise kernels (norms, softmax) autotune their thread-block size per
 shape at first call (v0.4.1); the table reflects the tuned choices.
@@ -212,25 +219,25 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8368 µs | **6.04x** |
-| attention_decode (GQA) | T=16384, D=128 | 573 µs | 2682 µs (SDPA) | **4.68x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8371 µs | **6.05x** |
+| attention_decode (GQA) | T=16384, D=128 | 574 µs | 2681 µs (SDPA) | **4.67x** |
 | attention_decode bf16 | T=16384, D=128 | 548 µs | 640 µs (SDPA bf16) | **1.17x** |
 | RMSNorm (+residual) | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
-| top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.50x** |
-| top-k (k=4096, mid-k) | [131072] | 50 µs | 54 µs (CUB) | 1.09x |
+| top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.53x** |
+| top-k (k=4096, mid-k) | [131072] | 49 µs | 54 µs (CUB) | 1.11x |
 | LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
-| sample_topk k=50 | [131072] | 47 µs | 93 µs (topk+multinomial) | **1.98x** |
-| sample_topp p=0.9 (peaked) | [131072] | 62 µs | 155 µs (sort+mask+multinomial) | **2.49x** |
-| sample_topp p=0.9 (flat worst case) | [131072] | 17635 µs | 159 µs | 0.01x (honest, see below) |
-| argmax | [131072] | 17 µs | 14 µs | 0.83x (incl. host readback) |
-| int8 qgemm (IMMA) | [4096×4096×4096] | 2063 µs (66.6 TOPS) | 800 µs (cuBLASLt) | 0.39x (honest) |
-| int8 qgemm pc (W8A8) | [4096×4096×4096] | 2079 µs (66.1 TOPS) | 1142 µs (cuBLASLt + broadcast) | 0.55x (honest) |
-| attention_prefill (causal) | S=1024, D=128 | 3291 µs | 1421 µs (SDPA flash) | 0.43x (honest) |
+| sample_topk k=50 | [131072] | 46 µs | 94 µs (topk+multinomial) | **2.04x** |
+| sample_topp p=0.9 (peaked) | [131072] | 63 µs | 155 µs (sort+mask+multinomial) | **2.48x** |
+| sample_topp p=0.9 (flat worst case) | [131072] | 9944 µs | 158 µs | 0.02x (honest, see below) |
+| argmax | [131072] | 17 µs | 14 µs | 0.84x (incl. host readback) |
+| int8 qgemm (IMMA) | [4096×11008×4096] | 5483 µs (67.4 TOPS) | 2201 µs (cuBLASLt) | 0.40x (honest) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 2078 µs (66.1 TOPS) | 1142 µs (cuBLASLt + broadcast) | 0.55x (honest) |
+| attention_prefill (causal) | S=1024, D=128 | 3294 µs | 1425 µs (SDPA flash) | 0.43x (honest) |
 
 On smaller shapes the Blackwell card shows bigger wins (softmax 2.5x,
-RMSNorm 3.2x at 256 rows, attention decode 3.8x at T=4096 running
-235 GB/s) - the launch-overhead share shrinks as shapes grow; full
+RMSNorm 3.2x at 256 rows, attention decode 3.78x at T=4096 running
+187 GB/s) - the launch-overhead share shrinks as shapes grow; full
 sweep in the JSON.
 
 ![fusedtok vs PyTorch reference (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx5060ti.png)
@@ -245,16 +252,16 @@ cached CUDA graph) beats torch's CUB radix select at small k on both
 GPUs; the v1.0 retune (in-block-sort threshold and sort chunk both
 dropped 2048 -> 1024 - a single block bitonic-sorting 2048 keys was the
 whole mid-k regression) brings the mid-k window to parity-or-winning as
-well (k=4096 @131k: 1.12x / 1.09x). The fused samplers win against the
+well (k=4096 @131k: 1.72x / 1.11x). The fused samplers win against the
 eager composites when the logits look like real decode output
-(sample_topp peaked: 3.11x / 2.49x; sample_topk: 2.16x / 1.98x); on a
-FLAT distribution sample_topp is honestly 0.01-0.02x - the nucleus then
+(sample_topp peaked: 2.81x / 2.48x; sample_topk: 1.94x / 2.04x); on a
+FLAT distribution sample_topp is honestly 0.02-0.03x - the nucleus then
 spans most of the vocab, the widening loop reruns the pipeline on
 ever-larger windows (x8 jumps since 1.0.1), and the final serial scan
 is single-threaded by design (documented since v0.4; torch's fully
 parallel sort handles that regime natively).
 attention_decode wins
-big at decode (one launch streams the GQA cache once at up to ~157 GB/s
+big at decode (one launch streams the GQA cache once at up to ~156 GB/s
 effective while SDPA pays head expansion or small-query inefficiency);
 attention_prefill is the honest convenience path at ~0.45x of SDPA's
 flash backend — no tensor cores by design, so heavyweight prefill stays
@@ -271,6 +278,10 @@ CUTLASS-class schedule stays future work. The per-channel variant
 fuses the per-output-channel scale multiply into the same epilogue at
 zero kernel cost — the composite torch reference pays for that
 broadcast separately, which is where its 0.55-0.58x comes from.
+
+All sampling rows above measure FIXED logits since 1.1.1 (the bench
+seeds torch's RNG): run-to-run comparison of the JSONs is exact, where
+earlier runs sampled fresh draws each time.
 
 ## Development
 
@@ -314,6 +325,10 @@ suite on every push.
   topk+multinomial composite), top-k mid-range-k parity, text hygiene
   gate, wheel matrix expansion (Linux cp310-313, Windows cp311-313),
   API freeze
+- 1.1 (released): half-precision attention — `attention_decode` /
+  `attention_prefill` accept bfloat16 and float16 caches (float32
+  compute, half the decode bytes); parallel exp precompute halves the
+  flat-distribution sampling worst case with bit-identical tokens
 
 ## Community
 
