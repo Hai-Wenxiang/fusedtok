@@ -127,6 +127,72 @@ class TestPipelineSampling:
         b = fusedtok.sample_topp(logits, 0.9, seed=123, cuda=True)
         assert a == b and 0 <= a < n
 
+
+@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
+class TestAdaptiveWidening:
+    """v1.2: the widening ladder jumps adaptively using the p*total mass
+    bound instead of a fixed x8 schedule. The token is independent of
+    the jump schedule by contract (global-mass threshold + nucleus
+    renormalization), so every case is a CPU-parity / determinism pin."""
+
+    def test_full_vocab_flat_stable(self):
+        # the probe worst case: n=131072, logits within ~1e-3 of each
+        # other -> the nucleus is ~p*n wide and the first retry now
+        # jumps straight to (nearly) the full vocabulary. Per-seed
+        # GPU determinism must hold exactly across repeated calls (the
+        # jump schedule reads the workspace total each retry; nothing
+        # may drift). CPU bit-parity is NOT asserted here: at this
+        # scale near-uniform logits sit on the exp-rounding boundary
+        # (GPU __expf vs CPU libm) - documented caveat in the usage
+        # guide; the GPU<->GPU token is path-independent (verified
+        # A/B against the pre-v1.2 x8 schedule during development)
+        n = 131072
+        logits = (np.random.default_rng(51)
+                  .standard_normal(n).astype(np.float32) * 0.001)
+        toks = {fusedtok.sample_topp(logits, 0.9, seed=0, cuda=True)
+                for _ in range(4)}
+        assert len(toks) == 1
+        tok = toks.pop()
+        assert 0 <= tok < n
+
+    def test_midtail_geometric_parity(self):
+        # a geometric tail between the extremes: exps ~ q^i with
+        # q = 0.999 put the p=0.9 nucleus around index 2300, so the
+        # first 1024 window genuinely fails (mass ~0.64) and the retry
+        # lands mid-ladder; the x8 floor must keep covering it
+        n = 40000
+        logits = (np.log(0.999) * np.arange(n, dtype=np.float64)) \
+            .astype(np.float32)
+        for seed in (0, 3, 11):
+            assert fusedtok.sample_topp(logits, 0.9, seed=seed, cuda=True) == \
+                fusedtok.sample_topp(logits, 0.9, seed=seed), f"seed={seed}"
+
+    def test_decode_step_flat_stable(self):
+        # decode_step shares the widening loop; flat logits + a real
+        # penalty context must stay per-seed deterministic on the GPU
+        # across repeated calls (same exp-rounding caveat as above for
+        # the CPU comparison at this scale)
+        n = 65536
+        logits = (np.random.default_rng(52)
+                  .standard_normal(n).astype(np.float32) * 0.002)
+        ids = [3, 11, 4096, 65535]
+        toks = {fusedtok.decode_step(logits, ids, penalty=1.3, p=0.95,
+                                     temperature=0.8, seed=1, cuda=True)
+                for _ in range(3)}
+        assert len(toks) == 1
+        assert 0 <= toks.pop() < n
+
+    def test_widening_repeats_stable(self):
+        # repeated calls on the same flat input: the adaptive jump reads
+        # the workspace total every retry; nothing may drift across
+        # back-to-back calls (self-consistency of the readback path)
+        n = 30000
+        logits = (np.random.default_rng(53)
+                  .standard_normal(n).astype(np.float32) * 0.001)
+        toks = {fusedtok.sample_topp(logits, 0.95, seed=5, cuda=True)
+                for _ in range(4)}
+        assert len(toks) == 1
+
     def test_sample_after_topk_topp_state(self):
         # sampling right after selections in the same process exercises
         # the workspace handoff (token slot vs counters)
@@ -137,6 +203,45 @@ class TestPipelineSampling:
         fusedtok.topp(p / p.sum(), 0.9, cuda=True)
         tok = fusedtok.sample_topp(logits, 0.9, seed=42, cuda=True)
         assert tok == fusedtok.sample_topp(logits, 0.9, seed=42)
+
+
+@pytest.mark.skipif(not fusedtok.cuda_available(), reason="no GPU")
+class TestArgmaxSelfReset:
+    """The argmax kernel relies on a self-reset contract: its finalize
+    re-zeros the dedicated workspace slots so no per-call memset launch
+    is needed (v1.2). These cases pin the invariant from every direction
+    that could break it."""
+
+    def test_descending_maxima_repeated(self):
+        # a stale packed key from an earlier call would win the atomicMax
+        # and leak the EARLIER answer: big keys first, then much smaller
+        # values at a different length, then tiny values again
+        rng = np.random.default_rng(77)
+        x = (rng.standard_normal(200000) + 50.0).astype(np.float32)
+        assert fusedtok.argmax(x, cuda=True) == int(np.argmax(x))
+        y = rng.standard_normal(1111).astype(np.float32)
+        assert fusedtok.argmax(y, cuda=True) == int(np.argmax(y))
+        z = (rng.standard_normal(999) * 0.001).astype(np.float32)
+        assert fusedtok.argmax(z, cuda=True) == int(np.argmax(z))
+
+    def test_after_selection_counters_dirty(self):
+        # a big-k selection call leaves its ticket/emit counters non-zero;
+        # argmax uses dedicated head slots and must never see them
+        rng = np.random.default_rng(78)
+        x = rng.standard_normal(50000).astype(np.float32)
+        fusedtok.topk(x, 40000, cuda=True)
+        y = rng.standard_normal(50000).astype(np.float32)
+        assert fusedtok.argmax(y, cuda=True) == int(np.argmax(y))
+
+    def test_after_workspace_growth(self):
+        # a selection call with an unusually large tail forces a workspace
+        # (re)alloc; the fresh buffer is zeroed once at alloc and the very
+        # next argmax must be correct
+        rng = np.random.default_rng(79)
+        big = rng.standard_normal(2_000_000).astype(np.float32)
+        fusedtok.topk(big, 1_900_000, cuda=True)
+        y = rng.standard_normal(4096).astype(np.float32)
+        assert fusedtok.argmax(y, cuda=True) == int(np.argmax(y))
 
 
 @pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),

@@ -142,6 +142,45 @@ GQA 映射是**连续分组**：q 头 `h` 使用 kv 头 `h // (Hq // Hkv)`。
 f32 大致跑到有效带宽对比 SDPA；bf16/fp16 cache 把字节减半。batch 为 1 时
 kernel 受延迟约束，半精度省的绝对时间有限——字节节省随 batch 放大。
 
+### attention_decode_paged——vLLM 式块池 cache（v1.2）
+
+```python
+out = fusedtok.attention_decode_paged(q, k_pool, v_pool, block_table, lens)
+```
+
+- `k_pool`、`v_pool`：`[Nb, Hkv, P, D]`——**定长 token 块组成的池**
+  （`P` = 每块 token 数，取自 pool 形状），不再是为每个序列预分配的
+  连续空间：序列增长、收缩、驱逐时 cache 都不产生碎片化的布局。
+- `block_table`：`[B, S]` int32——序列 `b` 的第 `t` 个 token 存在池
+  块 `block_table[b, t // P]` 的偏移 `t % P`。任何合法表都行（乱序、
+  共享、有洞）——kernel 走间接寻址。
+- `lens`：可选 `[B]`——每个序列的有效长度（`None` = 全部序列用满表宽
+  `S * P`）。
+
+数学、GQA 映射、零行约定、dtype 矩阵与连续版完全一致；切分管线与
+workspace 共用。GQA 组大小支持 1/2/4/8/16（其他倍数请用连续版算子）。
+块表**数值**在 CPU/暂存路径校验（`ValueError`），零拷贝路径信任设备
+上的值——设备上的表不回读主机就没法校验，与裸指针同一信任边界。
+CUDA graph 捕获前需在捕获外先热身一次该形状（切分 workspace 必须先
+存在）。
+
+间接寻址的开销（v1.2，3060，b=1 GQA 32/8 D=128 T=16384 P=16）：
+连续版的 **1.06x**，且切片调度一致时输出逐位相同。
+
+### kv_append_paged——往池里写 token（v1.2）
+
+```python
+fusedtok.kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens)
+```
+
+分页解码循环的 cache 写入侧：序列 `b` 的新行 `k_new[b]` / `v_new[b]`
+（各 `[Hkv, D]`）落到池块 `block_table[b, lens[b] // P]` 的偏移
+`lens[b] % P`。**原地写**（返回 `None`）；块表本身归调度器管——本算子只
+往已映射的块里写数据、绝不改表项。主机路径要求 float32 连续池（类型转换
+会静默丢写入——直接 `TypeError` 拒绝）；torch 路径支持 f32/bf16/fp16 全
+存储矩阵。单个微型 kernel、流序、可图捕获。典型循环：在 `lens[b]` 处
+append，再以 `lens + 1` 解码。
+
 ### attention_prefill——新序列
 
 ```python
@@ -223,10 +262,18 @@ tok = fusedtok.decode_step(logits, history, penalty=1.1,
 
 同 token 保证：固定种子下 CPU / 暂存 / 零拷贝三条路径抽出同一个 token
 （已文档化的舍入边界：CPU 用精确 `exp`、GPU 用 `__expf`；parity 测试钉住
-了可能出差异的位置——CDF 边界上的抽取可能差一个元素）。
+了可能出差异的位置——CDF 边界上的抽取可能差一个元素）。特别地，超词表 +
+接均匀的 logits 下每次抽取在宏观上都落在该边界上，CPU 与 GPU 可能对同一种
+子抽出相邻（同样有效）的 token；GPU 自身对同一种子恒定位一致，扩窗调度
+（v1.2 起自适应）不改变抽出的 token。
 
 平坦分布注意：当核覆盖几乎整个词表（接均匀的 logits）时，`sample_topp`
-会反复扩窗，比 torch 的全并行排序慢——基准里如实记录。真实解码 logits
+实际上要给整个词表排序，仍比 torch 的全并行排序慢——基准里如实记录。
+v1.2 用三个不破坏确定性契约的改动把该最坏情况砍了约 8 倍（3060 上
+n=131072 实测 18.2ms -> 2.2ms）：扩窗直接按 p*total 质量下界跳窗（不再沿
+阶梯逐级重跑）、全词表尝试跳过 radix 选择（所有 key 都存活时选择是无效
+功）、串行采样走查批量预取载入（严格顺序的浮点加法——CPU parity 契约
+本身——分毫未动，token 逐位不变）。真实解码 logits
 是尖峰状的；平坦情形是最坏情况，不是常态。
 
 ## INT8 路径

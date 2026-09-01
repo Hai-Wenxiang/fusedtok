@@ -57,7 +57,9 @@ __all__ = [
     "qgemm_perchannel",
     "decode_step",
     "attention_decode",
+    "attention_decode_paged",
     "attention_prefill",
+    "kv_append_paged",
 ]
 
 def cuda_available() -> bool: ...
@@ -105,5 +107,12 @@ def decode_step(logits: Array, sampled_ids: Array, penalty: float = 1.0, *,
 def attention_decode(q: Array, k_cache: Array, v_cache: Array,
                      lens: Optional[Array] = None,
                      *, cuda: bool = False) -> Array: ...
+def attention_decode_paged(q: Array, k_pool: Array, v_pool: Array,
+                           block_table: Array,
+                           lens: Optional[Array] = None,
+                           *, cuda: bool = False) -> Array: ...
+def kv_append_paged(k_pool: Array, v_pool: Array, block_table: Array,
+                    k_new: Array, v_new: Array, lens: Array,
+                    *, cuda: bool = False) -> None: ...
 def attention_prefill(q: Array, k: Array, v: Array, causal: bool = True,
                       *, cuda: bool = False) -> Array: ...

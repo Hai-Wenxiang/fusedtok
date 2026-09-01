@@ -1,680 +1,680 @@
 {
   "device": "NVIDIA GeForce RTX 5060 Ti",
   "torch": "2.11.0+cu128",
-  "fusedtok": "1.1.1",
-  "timestamp": "2026-08-31 16:42:09",
+  "fusedtok": "1.2.0",
+  "timestamp": "2026-09-01 17:53:57",
   "timing": "mean over 3 independent timed rounds; per-round values in each row",
   "results": [
     {
       "op": "rmsnorm+res",
       "shape": "[256x4096]",
-      "fusedtok_us": 9.43,
-      "torch_us": 30.23,
-      "speedup": 3.2,
+      "fusedtok_us": 9.49,
+      "torch_us": 30.22,
+      "speedup": 3.18,
       "fusedtok_rounds_us": [
-        9.57,
-        9.37,
+        9.45,
+        9.66,
         9.36
       ],
       "torch_rounds_us": [
-        30.26,
+        30.25,
         30.21,
-        30.21
+        30.2
       ],
-      "bandwidth_gbs": 1333.7
+      "bandwidth_gbs": 1325.6
     },
     {
       "op": "layernorm",
       "shape": "[256x4096]",
-      "fusedtok_us": 8.92,
-      "torch_us": 8.99,
-      "speedup": 1.01,
+      "fusedtok_us": 9.03,
+      "torch_us": 9.02,
+      "speedup": 1.0,
       "fusedtok_rounds_us": [
-        8.94,
-        8.92,
-        8.9
+        9.05,
+        9.09,
+        8.97
       ],
       "torch_rounds_us": [
-        8.99,
-        8.98,
-        9.01
+        9.01,
+        9.02,
+        9.03
       ],
-      "bandwidth_gbs": 1410.7
+      "bandwidth_gbs": 1392.8
     },
     {
       "op": "softmax",
       "shape": "[256x4096]",
-      "fusedtok_us": 8.14,
+      "fusedtok_us": 8.11,
       "torch_us": 14.41,
-      "speedup": 1.77,
+      "speedup": 1.78,
       "fusedtok_rounds_us": [
-        8.18,
-        8.18,
-        8.06
+        8.12,
+        8.09,
+        8.13
       ],
       "torch_rounds_us": [
-        14.42,
+        14.43,
         14.4,
-        14.4
+        14.41
       ],
-      "bandwidth_gbs": 1546.2
+      "bandwidth_gbs": 1551.1
     },
     {
       "op": "silu",
       "shape": "[256x4096]",
-      "fusedtok_us": 7.83,
+      "fusedtok_us": 7.84,
       "torch_us": 4.73,
       "speedup": 0.6,
       "fusedtok_rounds_us": [
-        7.93,
-        7.77,
-        7.8
+        7.85,
+        7.83,
+        7.85
       ],
       "torch_rounds_us": [
         4.75,
         4.71,
-        4.73
+        4.72
       ],
-      "bandwidth_gbs": 1606.2
+      "bandwidth_gbs": 1604.5
     },
     {
       "op": "gelu(erf)",
       "shape": "[256x4096]",
-      "fusedtok_us": 7.78,
-      "torch_us": 4.91,
-      "speedup": 0.63,
+      "fusedtok_us": 7.88,
+      "torch_us": 4.9,
+      "speedup": 0.62,
       "fusedtok_rounds_us": [
-        7.77,
-        7.8,
-        7.76
+        7.94,
+        7.88,
+        7.82
       ],
       "torch_rounds_us": [
         4.92,
         4.9,
-        4.9
+        4.89
       ],
-      "bandwidth_gbs": 1617.6
+      "bandwidth_gbs": 1596.3
     },
     {
       "op": "swiglu",
       "shape": "[256x4096]",
-      "fusedtok_us": 8.4,
-      "torch_us": 10.16,
-      "speedup": 1.21,
+      "fusedtok_us": 8.51,
+      "torch_us": 10.14,
+      "speedup": 1.19,
       "fusedtok_rounds_us": [
-        8.48,
-        8.4,
-        8.33
+        8.56,
+        8.47,
+        8.5
       ],
       "torch_rounds_us": [
-        10.17,
         10.14,
-        10.15
+        10.15,
+        10.14
       ],
-      "bandwidth_gbs": 1497.6
+      "bandwidth_gbs": 1478.7
     },
     {
       "op": "add",
       "shape": "[256x4096]",
-      "fusedtok_us": 8.41,
-      "torch_us": 5.43,
-      "speedup": 0.65,
+      "fusedtok_us": 8.48,
+      "torch_us": 5.42,
+      "speedup": 0.64,
       "fusedtok_rounds_us": [
-        8.42,
-        8.44,
-        8.36
+        8.5,
+        8.48,
+        8.45
       ],
       "torch_rounds_us": [
-        5.44,
-        5.41,
-        5.43
+        5.42,
+        5.43,
+        5.41
       ],
-      "bandwidth_gbs": 1496.4
+      "bandwidth_gbs": 1484.0
     },
     {
       "op": "rmsnorm+res",
       "shape": "[1024x4096]",
-      "fusedtok_us": 100.6,
-      "torch_us": 228.48,
-      "speedup": 2.27,
+      "fusedtok_us": 100.3,
+      "torch_us": 228.84,
+      "speedup": 2.28,
       "fusedtok_rounds_us": [
-        100.85,
-        100.48,
-        100.48
+        100.43,
+        100.11,
+        100.35
       ],
       "torch_rounds_us": [
-        228.39,
-        228.49,
-        228.54
+        228.8,
+        228.62,
+        229.09
       ],
-      "bandwidth_gbs": 500.3
+      "bandwidth_gbs": 501.8
     },
     {
       "op": "layernorm",
       "shape": "[1024x4096]",
-      "fusedtok_us": 27.09,
-      "torch_us": 28.05,
-      "speedup": 1.04,
+      "fusedtok_us": 27.08,
+      "torch_us": 28.02,
+      "speedup": 1.03,
       "fusedtok_rounds_us": [
-        27.0,
-        27.14,
-        27.12
+        26.84,
+        27.18,
+        27.22
       ],
       "torch_rounds_us": [
-        28.01,
-        28.07,
-        28.06
+        28.0,
+        28.04,
+        28.03
       ],
-      "bandwidth_gbs": 1858.2
+      "bandwidth_gbs": 1858.6
     },
     {
       "op": "softmax",
       "shape": "[1024x4096]",
-      "fusedtok_us": 20.49,
-      "torch_us": 51.6,
-      "speedup": 2.52,
+      "fusedtok_us": 19.87,
+      "torch_us": 51.49,
+      "speedup": 2.59,
       "fusedtok_rounds_us": [
-        20.39,
-        20.56,
-        20.53
+        20.28,
+        19.68,
+        19.65
       ],
       "torch_rounds_us": [
-        51.52,
-        51.5,
-        51.79
+        51.27,
+        51.45,
+        51.74
       ],
-      "bandwidth_gbs": 2456.1
+      "bandwidth_gbs": 2533.0
     },
     {
       "op": "silu",
       "shape": "[1024x4096]",
-      "fusedtok_us": 19.75,
-      "torch_us": 19.48,
+      "fusedtok_us": 19.76,
+      "torch_us": 19.61,
       "speedup": 0.99,
       "fusedtok_rounds_us": [
-        19.83,
-        19.68,
-        19.74
+        19.85,
+        19.72,
+        19.72
       ],
       "torch_rounds_us": [
-        19.52,
-        19.46,
-        19.46
+        19.6,
+        19.7,
+        19.53
       ],
-      "bandwidth_gbs": 2548.1
+      "bandwidth_gbs": 2547.0
     },
     {
       "op": "gelu(erf)",
       "shape": "[1024x4096]",
-      "fusedtok_us": 19.99,
-      "torch_us": 19.38,
-      "speedup": 0.97,
+      "fusedtok_us": 20.29,
+      "torch_us": 19.39,
+      "speedup": 0.96,
       "fusedtok_rounds_us": [
-        20.03,
-        19.98,
-        19.96
+        20.34,
+        20.39,
+        20.15
       ],
       "torch_rounds_us": [
-        19.38,
-        19.38,
-        19.38
+        19.37,
+        19.41,
+        19.39
       ],
-      "bandwidth_gbs": 2517.7
+      "bandwidth_gbs": 2480.3
     },
     {
       "op": "swiglu",
       "shape": "[1024x4096]",
-      "fusedtok_us": 102.22,
-      "torch_us": 173.42,
+      "fusedtok_us": 101.93,
+      "torch_us": 173.49,
       "speedup": 1.7,
       "fusedtok_rounds_us": [
-        103.91,
-        101.43,
-        101.31
+        103.47,
+        101.4,
+        100.92
       ],
       "torch_rounds_us": [
-        173.49,
-        173.34,
-        173.44
+        173.51,
+        173.43,
+        173.53
       ],
-      "bandwidth_gbs": 492.4
+      "bandwidth_gbs": 493.8
     },
     {
       "op": "add",
       "shape": "[1024x4096]",
-      "fusedtok_us": 101.53,
-      "torch_us": 102.47,
+      "fusedtok_us": 101.25,
+      "torch_us": 102.63,
       "speedup": 1.01,
       "fusedtok_rounds_us": [
-        102.1,
-        101.3,
-        101.18
+        101.88,
+        100.98,
+        100.89
       ],
       "torch_rounds_us": [
-        102.15,
-        102.38,
-        102.88
+        102.41,
+        102.6,
+        102.9
       ],
-      "bandwidth_gbs": 495.7
+      "bandwidth_gbs": 497.1
     },
     {
       "op": "rmsnorm+res",
       "shape": "[4096x4096]",
-      "fusedtok_us": 504.19,
-      "torch_us": 1657.31,
-      "speedup": 3.29,
+      "fusedtok_us": 504.63,
+      "torch_us": 1657.29,
+      "speedup": 3.28,
       "fusedtok_rounds_us": [
-        504.17,
-        504.22,
-        504.18
+        504.77,
+        504.44,
+        504.68
       ],
       "torch_rounds_us": [
-        1657.89,
-        1657.3,
-        1656.74
+        1657.73,
+        1657.35,
+        1656.81
       ],
-      "bandwidth_gbs": 399.3
+      "bandwidth_gbs": 399.0
     },
     {
       "op": "layernorm",
       "shape": "[4096x4096]",
-      "fusedtok_us": 345.98,
-      "torch_us": 351.01,
+      "fusedtok_us": 346.11,
+      "torch_us": 350.94,
       "speedup": 1.01,
       "fusedtok_rounds_us": [
-        346.01,
-        345.84,
-        346.09
+        346.51,
+        345.88,
+        345.92
       ],
       "torch_rounds_us": [
-        350.95,
-        350.95,
-        351.13
+        351.01,
+        350.82,
+        351.0
       ],
-      "bandwidth_gbs": 581.9
+      "bandwidth_gbs": 581.7
     },
     {
       "op": "softmax",
       "shape": "[4096x4096]",
-      "fusedtok_us": 342.96,
-      "torch_us": 344.07,
+      "fusedtok_us": 342.78,
+      "torch_us": 343.95,
       "speedup": 1.0,
       "fusedtok_rounds_us": [
-        343.04,
-        342.87,
-        342.96
+        342.83,
+        342.88,
+        342.63
       ],
       "torch_rounds_us": [
-        344.15,
+        343.99,
         343.98,
-        344.1
+        343.9
       ],
-      "bandwidth_gbs": 587.0
+      "bandwidth_gbs": 587.3
     },
     {
       "op": "silu",
       "shape": "[4096x4096]",
-      "fusedtok_us": 346.72,
-      "torch_us": 349.91,
+      "fusedtok_us": 346.54,
+      "torch_us": 350.17,
       "speedup": 1.01,
       "fusedtok_rounds_us": [
-        346.7,
-        346.71,
-        346.76
-      ],
-      "torch_rounds_us": [
-        349.9,
-        349.78,
-        350.06
-      ],
-      "bandwidth_gbs": 580.7
-    },
-    {
-      "op": "gelu(erf)",
-      "shape": "[4096x4096]",
-      "fusedtok_us": 346.53,
-      "torch_us": 349.81,
-      "speedup": 1.01,
-      "fusedtok_rounds_us": [
-        346.64,
-        346.28,
+        346.61,
+        346.35,
         346.68
       ],
       "torch_rounds_us": [
-        349.76,
-        349.76,
-        349.92
+        350.12,
+        350.18,
+        350.2
       ],
       "bandwidth_gbs": 581.0
     },
     {
+      "op": "gelu(erf)",
+      "shape": "[4096x4096]",
+      "fusedtok_us": 346.56,
+      "torch_us": 349.7,
+      "speedup": 1.01,
+      "fusedtok_rounds_us": [
+        346.72,
+        346.65,
+        346.3
+      ],
+      "torch_rounds_us": [
+        349.61,
+        349.66,
+        349.82
+      ],
+      "bandwidth_gbs": 580.9
+    },
+    {
       "op": "swiglu",
       "shape": "[4096x4096]",
-      "fusedtok_us": 504.19,
-      "torch_us": 858.47,
+      "fusedtok_us": 504.28,
+      "torch_us": 858.43,
       "speedup": 1.7,
       "fusedtok_rounds_us": [
         504.1,
-        504.15,
-        504.31
+        504.43,
+        504.32
       ],
       "torch_rounds_us": [
-        858.08,
-        858.41,
-        858.92
+        858.6,
+        858.4,
+        858.28
       ],
-      "bandwidth_gbs": 399.3
+      "bandwidth_gbs": 399.2
     },
     {
       "op": "add",
       "shape": "[4096x4096]",
       "fusedtok_us": 504.29,
-      "torch_us": 506.49,
+      "torch_us": 506.58,
       "speedup": 1.0,
       "fusedtok_rounds_us": [
-        504.27,
-        504.28,
-        504.32
+        504.26,
+        504.39,
+        504.22
       ],
       "torch_rounds_us": [
-        506.44,
-        506.66,
-        506.37
+        506.53,
+        506.39,
+        506.82
       ],
       "bandwidth_gbs": 399.2
     },
     {
       "op": "rope neox q+k",
       "shape": "[512x4096]",
-      "fusedtok_us": 28.88,
-      "torch_us": 239.32,
-      "speedup": 8.29,
+      "fusedtok_us": 28.91,
+      "torch_us": 238.95,
+      "speedup": 8.26,
       "fusedtok_rounds_us": [
-        28.91,
         28.9,
-        28.83
+        28.98,
+        28.86
       ],
       "torch_rounds_us": [
-        239.13,
-        239.39,
-        239.43
+        238.86,
+        239.11,
+        238.87
       ],
-      "bandwidth_gbs": 1161.8
+      "bandwidth_gbs": 1160.6
     },
     {
       "op": "rope neox q+k",
       "shape": "[2048x4096]",
-      "fusedtok_us": 345.84,
-      "torch_us": 1889.13,
+      "fusedtok_us": 345.83,
+      "torch_us": 1889.26,
       "speedup": 5.46,
       "fusedtok_rounds_us": [
-        345.93,
-        345.94,
-        345.65
+        345.84,
+        345.91,
+        345.75
       ],
       "torch_rounds_us": [
-        1889.58,
-        1887.64,
-        1890.17
+        1889.59,
+        1889.19,
+        1889.0
       ],
       "bandwidth_gbs": 388.1
     },
     {
       "op": "rope neox q+k",
       "shape": "[8192x4096]",
-      "fusedtok_us": 1384.3,
-      "torch_us": 8371.23,
+      "fusedtok_us": 1384.38,
+      "torch_us": 8370.01,
       "speedup": 6.05,
       "fusedtok_rounds_us": [
-        1384.76,
-        1384.09,
-        1384.04
+        1384.57,
+        1384.48,
+        1384.07
       ],
       "torch_rounds_us": [
-        8371.19,
-        8371.64,
-        8370.86
+        8371.58,
+        8369.9,
+        8368.54
       ],
       "bandwidth_gbs": 387.8
     },
     {
       "op": "topk k=50",
       "shape": "[32000]",
-      "fusedtok_us": 37.27,
-      "torch_us": 39.16,
+      "fusedtok_us": 37.28,
+      "torch_us": 39.04,
       "speedup": 1.05,
       "fusedtok_rounds_us": [
         37.33,
-        37.27,
-        37.22
+        37.24,
+        37.28
       ],
       "torch_rounds_us": [
-        39.55,
-        39.01,
-        38.92
+        39.23,
+        39.02,
+        38.87
       ]
     },
     {
       "op": "topk k=4096",
       "shape": "[32000]",
-      "fusedtok_us": 49.32,
-      "torch_us": 47.65,
-      "speedup": 0.97,
+      "fusedtok_us": 49.54,
+      "torch_us": 47.61,
+      "speedup": 0.96,
       "fusedtok_rounds_us": [
-        49.2,
-        49.29,
-        49.46
+        49.59,
+        49.56,
+        49.49
       ],
       "torch_rounds_us": [
-        47.58,
-        47.65,
-        47.73
+        47.64,
+        47.54,
+        47.65
       ]
     },
     {
       "op": "sample_topk k=50",
       "shape": "[32000]",
-      "fusedtok_us": 56.93,
-      "torch_us": 93.16,
+      "fusedtok_us": 56.46,
+      "torch_us": 92.56,
       "speedup": 1.64,
       "fusedtok_rounds_us": [
-        57.0,
-        56.96,
-        56.82
+        56.69,
+        56.39,
+        56.31
       ],
       "torch_rounds_us": [
-        93.84,
-        92.86,
-        92.79
+        93.61,
+        92.14,
+        91.93
       ]
     },
     {
       "op": "sample_topp peaked",
       "shape": "[32000]",
-      "fusedtok_us": 57.33,
-      "torch_us": 130.06,
-      "speedup": 2.27,
+      "fusedtok_us": 57.41,
+      "torch_us": 130.98,
+      "speedup": 2.28,
       "fusedtok_rounds_us": [
-        57.4,
-        57.28,
-        57.31
+        57.54,
+        57.47,
+        57.22
       ],
       "torch_rounds_us": [
-        130.89,
-        129.68,
-        129.61
+        132.24,
+        130.59,
+        130.11
       ]
     },
     {
       "op": "sample_topp flat (worst)",
       "shape": "[32000]",
-      "fusedtok_us": 1979.51,
-      "torch_us": 131.87,
-      "speedup": 0.07,
+      "fusedtok_us": 501.76,
+      "torch_us": 132.15,
+      "speedup": 0.26,
       "fusedtok_rounds_us": [
-        1979.68,
-        1979.44,
-        1979.4
+        501.83,
+        501.59,
+        501.85
       ],
       "torch_rounds_us": [
-        131.79,
-        132.02,
-        131.81
+        133.39,
+        131.49,
+        131.57
       ]
     },
     {
       "op": "argmax",
       "shape": "[32000]",
-      "fusedtok_us": 14.65,
-      "torch_us": 21.51,
-      "speedup": 1.47,
+      "fusedtok_us": 14.67,
+      "torch_us": 21.45,
+      "speedup": 1.46,
       "fusedtok_rounds_us": [
-        14.72,
-        14.66,
-        14.57
+        14.73,
+        14.64,
+        14.65
       ],
       "torch_rounds_us": [
-        21.5,
-        21.53,
-        21.5
+        21.65,
+        21.37,
+        21.33
       ]
     },
     {
       "op": "topk k=50",
       "shape": "[131072]",
-      "fusedtok_us": 27.03,
-      "torch_us": 41.32,
-      "speedup": 1.53,
+      "fusedtok_us": 27.05,
+      "torch_us": 40.96,
+      "speedup": 1.51,
       "fusedtok_rounds_us": [
-        27.05,
+        27.09,
         27.01,
-        27.02
+        27.04
       ],
       "torch_rounds_us": [
-        41.27,
-        41.51,
-        41.18
+        41.08,
+        40.89,
+        40.92
       ]
     },
     {
       "op": "topk k=4096",
       "shape": "[131072]",
-      "fusedtok_us": 48.63,
-      "torch_us": 53.96,
-      "speedup": 1.11,
+      "fusedtok_us": 49.55,
+      "torch_us": 53.82,
+      "speedup": 1.09,
       "fusedtok_rounds_us": [
-        48.57,
-        48.68,
-        48.65
+        49.57,
+        49.54,
+        49.53
       ],
       "torch_rounds_us": [
-        53.93,
-        53.98,
-        53.98
+        53.88,
+        53.8,
+        53.76
       ]
     },
     {
       "op": "sample_topk k=50",
       "shape": "[131072]",
-      "fusedtok_us": 45.85,
-      "torch_us": 93.51,
+      "fusedtok_us": 45.5,
+      "torch_us": 92.7,
       "speedup": 2.04,
       "fusedtok_rounds_us": [
-        45.87,
-        45.98,
-        45.7
+        45.63,
+        45.5,
+        45.38
       ],
       "torch_rounds_us": [
-        93.5,
-        93.68,
-        93.36
+        93.41,
+        92.32,
+        92.38
       ]
     },
     {
       "op": "sample_topp peaked",
       "shape": "[131072]",
-      "fusedtok_us": 62.72,
-      "torch_us": 155.32,
+      "fusedtok_us": 62.9,
+      "torch_us": 155.85,
       "speedup": 2.48,
       "fusedtok_rounds_us": [
-        62.61,
-        62.79,
-        62.77
+        62.97,
+        62.83,
+        62.9
       ],
       "torch_rounds_us": [
-        156.02,
-        155.32,
-        154.62
+        156.73,
+        155.76,
+        155.05
       ]
     },
     {
       "op": "sample_topp flat (worst)",
       "shape": "[131072]",
-      "fusedtok_us": 9943.96,
-      "torch_us": 157.8,
-      "speedup": 0.02,
+      "fusedtok_us": 1618.21,
+      "torch_us": 165.96,
+      "speedup": 0.1,
       "fusedtok_rounds_us": [
-        9943.26,
-        9943.54,
-        9945.07
+        1618.44,
+        1618.23,
+        1617.95
       ],
       "torch_rounds_us": [
-        157.36,
-        158.28,
-        157.77
+        167.12,
+        165.22,
+        165.52
       ]
     },
     {
       "op": "argmax",
       "shape": "[131072]",
-      "fusedtok_us": 16.6,
-      "torch_us": 13.96,
-      "speedup": 0.84,
+      "fusedtok_us": 16.73,
+      "torch_us": 13.84,
+      "speedup": 0.83,
       "fusedtok_rounds_us": [
-        16.54,
-        16.5,
-        16.74
+        16.83,
+        16.71,
+        16.66
       ],
       "torch_rounds_us": [
-        13.92,
-        13.93,
-        14.03
+        13.73,
+        13.89,
+        13.89
       ]
     },
     {
       "op": "int8 qgemm",
       "shape": "[512x4096x4096]",
-      "fusedtok_us": 283.97,
-      "torch_us": 108.5,
+      "fusedtok_us": 283.48,
+      "torch_us": 108.83,
       "speedup": 0.38,
       "fusedtok_rounds_us": [
-        283.45,
-        283.63,
-        284.82
+        283.56,
+        283.44,
+        283.44
       ],
       "torch_rounds_us": [
-        108.57,
-        108.44,
-        108.5
+        108.94,
+        108.8,
+        108.74
       ],
-      "bandwidth_gbs": 96.0,
-      "fusedtok_tops": 60.5
+      "bandwidth_gbs": 96.2,
+      "fusedtok_tops": 60.6
     },
     {
       "op": "int8 qgemm",
       "shape": "[4096x4096x4096]",
-      "fusedtok_us": 2064.23,
-      "torch_us": 796.07,
+      "fusedtok_us": 2062.14,
+      "torch_us": 794.39,
       "speedup": 0.39,
       "fusedtok_rounds_us": [
-        2062.13,
-        2061.84,
-        2068.7
+        2062.22,
+        2062.05,
+        2062.16
       ],
       "torch_rounds_us": [
-        795.54,
-        795.98,
-        796.68
+        792.4,
+        795.44,
+        795.34
       ],
       "bandwidth_gbs": 48.8,
       "fusedtok_tops": 66.6
@@ -682,18 +682,18 @@
     {
       "op": "int8 qgemm",
       "shape": "[4096x11008x4096]",
-      "fusedtok_us": 5482.61,
-      "torch_us": 2200.97,
+      "fusedtok_us": 5476.7,
+      "torch_us": 2194.71,
       "speedup": 0.4,
       "fusedtok_rounds_us": [
-        5482.84,
-        5482.4,
-        5482.58
+        5464.12,
+        5482.89,
+        5483.08
       ],
       "torch_rounds_us": [
-        2119.76,
-        2221.91,
-        2261.24
+        2114.77,
+        2212.29,
+        2257.08
       ],
       "bandwidth_gbs": 44.2,
       "fusedtok_tops": 67.4
@@ -701,128 +701,146 @@
     {
       "op": "int8 qgemm pc",
       "shape": "[512x4096x4096]",
-      "fusedtok_us": 286.83,
-      "torch_us": 135.8,
+      "fusedtok_us": 287.38,
+      "torch_us": 135.83,
       "speedup": 0.47,
       "fusedtok_rounds_us": [
-        286.78,
-        286.87,
-        286.85
+        287.38,
+        287.36,
+        287.39
       ],
       "torch_rounds_us": [
-        136.24,
-        135.58,
-        135.57
+        136.15,
+        135.87,
+        135.47
       ],
-      "bandwidth_gbs": 95.0,
-      "fusedtok_tops": 59.9
+      "bandwidth_gbs": 94.9,
+      "fusedtok_tops": 59.8
     },
     {
       "op": "int8 qgemm pc",
       "shape": "[4096x4096x4096]",
-      "fusedtok_us": 2078.31,
-      "torch_us": 1141.82,
+      "fusedtok_us": 2077.61,
+      "torch_us": 1140.14,
       "speedup": 0.55,
       "fusedtok_rounds_us": [
-        2078.15,
-        2078.37,
-        2078.41
+        2075.61,
+        2078.56,
+        2078.65
       ],
       "torch_rounds_us": [
-        1141.73,
-        1141.94,
-        1141.8
+        1139.87,
+        1140.43,
+        1140.12
       ],
-      "bandwidth_gbs": 48.4,
-      "fusedtok_tops": 66.1
+      "bandwidth_gbs": 48.5,
+      "fusedtok_tops": 66.2
     },
     {
       "op": "attn decode",
       "shape": "T=4096",
-      "fusedtok_us": 179.19,
-      "torch_us": 676.62,
-      "speedup": 3.78,
+      "fusedtok_us": 177.64,
+      "torch_us": 676.81,
+      "speedup": 3.81,
       "fusedtok_rounds_us": [
-        179.51,
-        179.1,
-        178.97
+        177.92,
+        177.52,
+        177.47
       ],
       "torch_rounds_us": [
-        676.68,
-        676.65,
-        676.53
+        676.81,
+        676.79,
+        676.81
       ],
-      "bandwidth_gbs": 187.4
+      "bandwidth_gbs": 189.1
     },
     {
       "op": "attn decode bf16",
       "shape": "T=4096",
-      "fusedtok_us": 151.61,
-      "torch_us": 165.21,
+      "fusedtok_us": 151.3,
+      "torch_us": 165.46,
       "speedup": 1.09,
       "fusedtok_rounds_us": [
-        151.57,
-        151.63,
-        151.64
+        151.31,
+        151.32,
+        151.25
       ],
       "torch_rounds_us": [
-        165.25,
-        165.18,
-        165.2
+        165.71,
+        165.32,
+        165.36
       ],
-      "bandwidth_gbs": 110.8
+      "bandwidth_gbs": 111.0
     },
     {
       "op": "attn decode",
       "shape": "T=16384",
-      "fusedtok_us": 573.58,
-      "torch_us": 2680.83,
-      "speedup": 4.67,
+      "fusedtok_us": 573.44,
+      "torch_us": 2681.56,
+      "speedup": 4.68,
       "fusedtok_rounds_us": [
-        573.63,
-        573.55,
-        573.57
+        573.43,
+        573.38,
+        573.51
       ],
       "torch_rounds_us": [
-        2680.8,
-        2680.97,
-        2680.71
+        2681.43,
+        2681.54,
+        2681.71
       ],
       "bandwidth_gbs": 234.1
     },
     {
       "op": "attn decode bf16",
       "shape": "T=16384",
-      "fusedtok_us": 548.2,
-      "torch_us": 639.75,
+      "fusedtok_us": 548.18,
+      "torch_us": 639.9,
       "speedup": 1.17,
       "fusedtok_rounds_us": [
-        548.09,
+        548.28,
         548.32,
-        548.19
+        547.94
       ],
       "torch_rounds_us": [
-        639.37,
-        639.71,
-        640.16
+        639.73,
+        639.66,
+        640.31
       ],
-      "bandwidth_gbs": 122.4
+      "bandwidth_gbs": 122.5
+    },
+    {
+      "op": "attn decode paged",
+      "shape": "T=16384",
+      "fusedtok_us": 624.18,
+      "torch_us": 2680.82,
+      "speedup": 4.29,
+      "fusedtok_rounds_us": [
+        624.46,
+        624.01,
+        624.08
+      ],
+      "torch_rounds_us": [
+        2681.02,
+        2680.64,
+        2680.8
+      ],
+      "bandwidth_gbs": 215.1
     },
     {
       "op": "attn prefill",
       "shape": "S=1024",
-      "fusedtok_us": 3293.75,
-      "torch_us": 1425.06,
+      "fusedtok_us": 3295.23,
+      "torch_us": 1420.64,
       "speedup": 0.43,
       "fusedtok_rounds_us": [
-        3294.29,
-        3293.09,
-        3293.86
+        3299.54,
+        3301.78,
+        3284.36
       ],
       "torch_rounds_us": [
-        1425.16,
-        1424.81,
-        1425.22
+        1420.59,
+        1420.62,
+        1420.69
       ]
     }
   ]

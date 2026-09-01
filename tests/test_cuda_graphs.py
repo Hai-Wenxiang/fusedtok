@@ -133,6 +133,28 @@ class TestGraphCapture:
         assert cum[-1].item() >= 0.9 - 1e-4
         assert (vals.diff() <= 1e-6).all().item()
 
+    def test_argmax_capture_replay(self):
+        # argmax is a single self-resetting kernel (v1.2): replays must
+        # stay correct because each replay's finalize re-zeros the
+        # workspace slots (the pre-1.2 version replayed a memset node
+        # alongside the kernel instead)
+        x = torch.randn(100_000, device="cuda")
+        out = torch.empty(1, dtype=torch.int32, device="cuda")
+
+        def run():
+            from fusedtok import _fusedtok
+            _fusedtok.argmax_launch(x.data_ptr(), out.data_ptr(),
+                                    x.numel(),
+                                    torch.cuda.current_stream().cuda_stream)
+        g = _capture(run)
+        g.replay(); torch.cuda.synchronize()
+        assert int(out.item()) == int(x.argmax())
+        x[7] = 1e6                       # move the argmax to a known index
+        g.replay(); torch.cuda.synchronize()
+        assert int(out.item()) == 7
+        g.replay(); torch.cuda.synchronize()   # replay again: slots reset
+        assert int(out.item()) == 7
+
     def test_rope_capture_replay(self):
         q = torch.randn(64, 128, device="cuda")
         out = {}

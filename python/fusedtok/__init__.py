@@ -30,7 +30,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.1.3"
+__version__ = "1.2.0"
 
 __all__ = [
     "cuda_available",
@@ -62,7 +62,9 @@ __all__ = [
     "qgemm_perchannel",
     "decode_step",
     "attention_decode",
+    "attention_decode_paged",
     "attention_prefill",
+    "kv_append_paged",
 ]
 
 
@@ -619,6 +621,212 @@ def attention_prefill(q, k, v, causal=True, *, cuda=False):
             else _fusedtok.attention_prefill_cpu)
     res = call(arr_q, arr_k, arr_v, b, hq, hkv, s, d, bool(causal))
     return _numpy_to_torch_like(res, q) if _is_torch(q) else res
+
+
+def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
+                           *, cuda=False):
+    """Single-token causal attention with GQA over a PAGED kv-cache:
+
+    ``out[b, h] = softmax(q[b,h] . K[b,kv(h)]^T / sqrt(D)) . V[b,kv(h)]``
+
+    The cache is a pool of fixed-size token blocks (the vLLM-style layout
+    that keeps fragmentation out of the cache): k_pool / v_pool are
+    [Nb, Hkv, P, D] (P = tokens per block, derived from the pool shape),
+    and block_table [B, S] maps sequence b's token t to pool block
+    ``block_table[b, t // P]``, offset ``t % P``. Optional lens: [B] ints
+    with each sequence's valid length (None = every sequence uses its
+    full table width, S * P rows).
+
+    Same GQA mapping, zero-row-for-length-0 convention and dim limits as
+    :func:`attention_decode`. The paged path supports GQA group sizes
+    1/2/4/8/16 (other divisors: use the contiguous op). CUDA tensors may
+    be float32, bfloat16 or float16 (output matches the input dtype,
+    accumulators stay float32). Block-table VALUES are validated on the
+    CPU/staged paths (ValueError) and trusted on the zero-copy path - a
+    device table is not host-readable without a sync, the same trust
+    boundary as raw pointers. CUDA-graph capture requires warming the
+    shape up once outside the capture (the split workspace must
+    pre-exist).
+    """
+    if _device_path(q, cuda) == "torch-cuda":
+        for name, t in (("q", q), ("k_pool", k_pool), ("v_pool", v_pool)):
+            _check_torch_att(t, name)
+        for name, t in (("k_pool", k_pool), ("v_pool", v_pool)):
+            if t.dtype is not q.dtype:
+                raise TypeError(f"{name} must have the same dtype as q")
+        if q.ndim != 3 or k_pool.ndim != 4 or v_pool.ndim != 4:
+            raise ValueError("q must be [B, Hq, D]; pools [Nb, Hkv, P, D]")
+        b, hq, d = q.shape
+        nb, hkv, page, d2 = k_pool.shape
+        if d2 != d or v_pool.shape != k_pool.shape:
+            raise ValueError("pools must match q's dim and each other")
+        if hq % hkv:
+            raise ValueError("q heads must be a multiple of kv heads")
+        if hq // hkv not in (1, 2, 4, 8, 16):
+            raise ValueError("paged decode supports GQA group sizes "
+                             "1/2/4/8/16 (use attention_decode otherwise)")
+        if _is_torch(block_table):
+            bt = block_table
+            if not bt.is_cuda:
+                bt = bt.to(q.device)
+            if bt.dtype is not torch.int32:
+                bt = bt.to(torch.int32)
+            bt = bt.contiguous()
+        else:
+            bt = torch.as_tensor(block_table, dtype=torch.int32,
+                                 device=q.device)
+        if bt.ndim != 2 or bt.shape[0] != b:
+            raise ValueError("block_table must be [B, S] with batch rows")
+        s_width = bt.shape[1]
+        lens_ptr = None
+        if lens is not None:
+            if _is_torch(lens):
+                lt = lens
+                if not lt.is_cuda:
+                    lt = lt.to(q.device)
+                if lt.dtype is not torch.int32:
+                    lt = lt.to(torch.int32)
+                lt = lt.contiguous()
+            else:
+                lt = torch.as_tensor(lens, dtype=torch.int32,
+                                     device=q.device)
+            if lt.ndim != 1 or lt.numel() != b:
+                raise ValueError("lens must be 1-D with batch entries")
+            if lt.numel() and (int(lt.min()) < 0 or
+                               int(lt.max()) > s_width * page):
+                raise ValueError("lens entries must be in [0, S * P]")
+            lens_ptr = lt.data_ptr()
+        out = torch.empty((b, hq, d), dtype=q.dtype, device=q.device)
+        if b * hq > 0:
+            _att_launch_fn(q, "attention_decode_paged_launch")(
+                q.data_ptr(), k_pool.data_ptr(), v_pool.data_ptr(),
+                bt.data_ptr(), lens_ptr, out.data_ptr(),
+                b, hq, hkv, page, s_width, d, _cuda_stream())
+        return out
+    arr_q = _as_numpy(q, "q")
+    arr_k = _as_numpy(k_pool, "k_pool")
+    arr_v = _as_numpy(v_pool, "v_pool")
+    arr_t = np.ascontiguousarray(np.asarray(block_table, dtype=np.int32))
+    if arr_q.ndim != 3 or arr_k.ndim != 4 or arr_v.ndim != 4 \
+            or arr_t.ndim != 2:
+        raise ValueError("q must be [B, Hq, D]; pools [Nb, Hkv, P, D]; "
+                         "block_table [B, S]")
+    b, hq, d = arr_q.shape
+    nb, hkv, page, d2 = arr_k.shape
+    if d2 != d or arr_v.shape != arr_k.shape:
+        raise ValueError("pools must match q's dim and each other")
+    if hq % hkv:
+        raise ValueError("q heads must be a multiple of kv heads")
+    if arr_t.shape[0] != b:
+        raise ValueError("block_table must have one row per sequence")
+    arr_lens = None if lens is None else np.ascontiguousarray(
+        np.asarray(lens, dtype=np.int32))
+    call = (_fusedtok.attention_decode_paged
+            if _device_path(q, cuda) == "staged"
+            else _fusedtok.attention_decode_paged_cpu)
+    res = call(arr_q, arr_k, arr_v, arr_t, arr_lens, b, hq, hkv, page,
+               arr_t.shape[1], nb, d)
+    return _numpy_to_torch_like(res, q) if _is_torch(q) else res
+
+
+def kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens,
+                    *, cuda=False):
+    """Append ONE fresh token's k/v rows per sequence into the paged
+    kv-cache (in place - the write side of the paged decode loop):
+
+    sequence b's new rows ``k_new[b]``/``v_new[b]`` (each [Hkv, D]) land
+    at pool block ``block_table[b, lens[b] // P]``, offset ``lens[b] % P``.
+
+    k_pool / v_pool: [Nb, Hkv, P, D]; k_new / v_new: [B, Hkv, D]; lens
+    [B] (REQUIRED - the write position is each sequence's current
+    length). The block table itself is owned by the scheduler: this
+    writes data into already-mapped blocks and never touches table
+    entries (a position in an unmapped block is invalid input).
+
+    CUDA pools may be float32, bfloat16 or float16 (rows copied in the
+    storage dtype; k_new must match the pool dtype). Table/lens values
+    are validated on CPU/staged paths and trusted on the zero-copy path
+    (same trust boundary as attention_decode_paged). Returns None; the
+    pools are mutated in place.
+    """
+    if _device_path(k_pool, cuda) == "torch-cuda":
+        for name, t in (("k_pool", k_pool), ("v_pool", v_pool),
+                        ("k_new", k_new), ("v_new", v_new)):
+            _check_torch_att(t, name)
+        for name, t in (("v_pool", v_pool), ("k_new", k_new),
+                        ("v_new", v_new)):
+            if t.dtype is not k_pool.dtype:
+                raise TypeError(f"{name} must have the pool dtype")
+        if k_pool.ndim != 4 or v_pool.ndim != 4:
+            raise ValueError("pools must be [Nb, Hkv, P, D]")
+        if k_new.ndim != 3 or v_new.ndim != 3:
+            raise ValueError("k_new/v_new must be [B, Hkv, D]")
+        nb, hkv, page, d = k_pool.shape
+        b, hkv2, d2 = k_new.shape
+        if (hkv2, d2) != (hkv, d) or v_pool.shape != k_pool.shape \
+                or v_new.shape != k_new.shape:
+            raise ValueError("k/v operands must match the pool layout")
+        if b == 0:
+            return None
+        if _is_torch(block_table):
+            bt = block_table
+            if not bt.is_cuda:
+                bt = bt.to(k_pool.device)
+            if bt.dtype is not torch.int32:
+                bt = bt.to(torch.int32)
+            bt = bt.contiguous()
+        else:
+            bt = torch.as_tensor(block_table, dtype=torch.int32,
+                                 device=k_pool.device)
+        if bt.ndim != 2 or bt.shape[0] != b:
+            raise ValueError("block_table must be [B, S] with batch rows")
+        if _is_torch(lens):
+            lt = lens
+            if not lt.is_cuda:
+                lt = lt.to(k_pool.device)
+            if lt.dtype is not torch.int32:
+                lt = lt.to(torch.int32)
+            lt = lt.contiguous()
+        else:
+            lt = torch.as_tensor(lens, dtype=torch.int32,
+                                 device=k_pool.device)
+        if lt.ndim != 1 or lt.numel() != b:
+            raise ValueError("lens must be 1-D with batch entries")
+        _att_launch_fn(k_pool, "kv_append_paged_launch")(
+            k_new.data_ptr(), v_new.data_ptr(), bt.data_ptr(),
+            lt.data_ptr(), k_pool.data_ptr(), v_pool.data_ptr(),
+            b, hkv, d, page, bt.shape[1], _cuda_stream())
+        return None
+    # in-place op: a dtype/layout conversion would silently drop the
+    # mutation (numpy would view a converted copy), so pools must
+    # already be float32 C-contiguous on the host paths
+    for name, arr in (("k_pool", k_pool), ("v_pool", v_pool)):
+        raw = arr.numpy() if _is_torch(arr) else arr
+        if not isinstance(raw, np.ndarray) or raw.dtype != np.float32 \
+                or not raw.flags["C_CONTIGUOUS"]:
+            raise TypeError(f"{name} must be a float32 C-contiguous array "
+                            "(in-place op; conversion would drop writes)")
+    arr_kp = _as_numpy(k_pool, "k_pool")
+    arr_vp = _as_numpy(v_pool, "v_pool")
+    arr_kn = _as_numpy(k_new, "k_new")
+    arr_vn = _as_numpy(v_new, "v_new")
+    arr_t = np.ascontiguousarray(np.asarray(block_table, dtype=np.int32))
+    arr_l = np.ascontiguousarray(np.asarray(lens, dtype=np.int32))
+    if arr_kp.ndim != 4 or arr_kn.ndim != 3 or arr_t.ndim != 2:
+        raise ValueError("pools [Nb,Hkv,P,D]; k_new [B,Hkv,D]; table [B,S]")
+    nb, hkv, page, d = arr_kp.shape
+    b = arr_kn.shape[0]
+    if arr_t.shape[0] != b or arr_l.shape != (b,):
+        raise ValueError("block_table rows / lens must match the batch")
+    if _device_path(k_pool, cuda) == "staged":
+        _fusedtok.kv_append_paged(arr_kn, arr_vn, arr_t, arr_l, arr_kp,
+                                  arr_vp, b, hkv, d, page, arr_t.shape[1],
+                                  nb)
+    else:
+        _fusedtok.kv_append_paged_cpu(arr_kn, arr_vn, arr_t, arr_l,
+                                      arr_kp, arr_vp, b, hkv, d, page,
+                                      arr_t.shape[1], nb)
+    return None
 
 
 # ---------------------------------------------------------------------------

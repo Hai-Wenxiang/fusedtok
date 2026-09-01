@@ -33,6 +33,34 @@ std::vector<float> attention_decode_cpu(const std::vector<float>& q,
                                         int cache_rows, int dim);
 
 // ---------------------------------------------------------------------------
+// attention (decode step) over a PAGED kv-cache (v1.2): the cache is a
+// pool of fixed-size token blocks instead of a per-sequence contiguous
+// span - the vLLM-style layout that keeps memory fragmentation out of
+// the cache.
+//
+//   q:       [B, Hq, D]          queries of the NEW token
+//   k_pool:  [Nb, Hkv, P, D]     key pool (P = tokens per block)
+//   v_pool:  [Nb, Hkv, P, D]     value pool
+//   table:   [B, S] ints         block table: sequence b's token t lives
+//                                 in block table[b, t / P] at offset t % P
+//   lens:    [B] or null         valid length per sequence (null = S*P)
+//
+//   out:     [B, Hq, D] = softmax(q . K^T / sqrt(D)) . V
+//
+// Same GQA mapping, zero-row-for-len-0 convention and dim limits as the
+// contiguous op. The paged GPU path supports GQA group sizes 1/2/4/8/16
+// (other divisors: use the contiguous op); table VALUES are validated on
+// the CPU/staged paths (ValueError) and trusted on the zero-copy path
+// (like data_ptr: a device table is not host-readable without a sync).
+// ---------------------------------------------------------------------------
+
+std::vector<float> attention_decode_paged_cpu(
+    const std::vector<float>& q, const std::vector<float>& k_pool,
+    const std::vector<float>& v_pool, const std::vector<int>& table,
+    const std::vector<int>* lens, int batch, int q_heads, int kv_heads,
+    int page, int tbl_width, int num_blocks, int dim);
+
+// ---------------------------------------------------------------------------
 // attention (prefill): fresh-sequence self-attention over S query rows.
 //
 //   q: [B, Hq, S, D], k: [B, Hkv, S, D], v: [B, Hkv, S, D]
