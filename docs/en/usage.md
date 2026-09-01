@@ -310,7 +310,7 @@ python benchmarks/bench.py            # full suite, ~a few minutes
 
 Protocol: CUDA-event timing, 3 independent timed rounds per
 configuration (each with its own warmup), means reported and per-round
-values kept in the JSON. Output lands in `docs/`: one JSON + one
-single-panel speedup chart per GPU (file names carry the device). See
+values kept in the JSON. Output lands in `docs/benchmarks/`: one JSON +
+one single-panel speedup chart per GPU (file names carry the device). See
 the README benchmark section for the current numbers on an RTX 3060
 and an RTX 5060 Ti.

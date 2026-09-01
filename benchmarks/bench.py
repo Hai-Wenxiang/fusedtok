@@ -5,7 +5,7 @@ configuration is measured over THREE independent timed rounds (each with
 its own warmup) and averaged; the per-round values travel with the JSON
 so variance stays auditable.
 Results are printed as a table, dumped to JSON, and rendered into ONE
-single-panel chart per GPU next to this script under ../docs/.
+single-panel chart per GPU under ../docs/benchmarks/.
 
 The chart is a horizontal speedup chart sorted from best to worst: every
 bar carries the fusedtok and reference microsecond values at the bar end,
@@ -13,7 +13,7 @@ a parity line marks 1.0x, and bar colors separate wins (green), ties
 (amber) and losses (red). One figure per GPU, no panels, no log axes.
 
 Usage:
-    python benchmarks/bench.py [--iters N] [--out docs]
+    python benchmarks/bench.py [--iters N] [--out docs/benchmarks]
 
 The torch "eager" references are the composite expressions an inference
 loop would write by hand (or the closest native op); RoPE's reference
@@ -96,7 +96,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--out", default=os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "docs"))
+        os.path.dirname(os.path.abspath(__file__)), "..", "docs", "benchmarks"))
     args = parser.parse_args()
     iters = args.iters
 

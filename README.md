@@ -187,7 +187,7 @@ RTX 3060 (sm_86), float32, zero-copy torch tensors, CUDA-event timing over
 the equivalent PyTorch reference (composite eager expressions; attention
 references use **pre-expanded** heads - `repeat_interleave` outside the
 timed region). Largest shape per op; full data:
-`docs/benchmark_rtx3060.json`, reproduce with `python benchmarks/bench.py`:
+`docs/benchmarks/benchmark_rtx3060.json`, reproduce with `python benchmarks/bench.py`:
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
@@ -212,10 +212,10 @@ timed region). Largest shape per op; full data:
 Row-wise kernels (norms, softmax) autotune their thread-block size per
 shape at first call (v0.4.1); the table reflects the tuned choices.
 
-![fusedtok vs PyTorch reference](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx3060.png)
+![fusedtok vs PyTorch reference](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx3060.png)
 
 **RTX 5060 Ti (Blackwell, sm_120)** — same suite, largest shape per op
-(full data: `docs/benchmark_rtx5060ti.json`):
+(full data: `docs/benchmarks/benchmark_rtx5060ti.json`):
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
@@ -240,7 +240,7 @@ RMSNorm 3.2x at 256 rows, attention decode 3.78x at T=4096 running
 187 GB/s) - the launch-overhead share shrinks as shapes grow; full
 sweep in the JSON.
 
-![fusedtok vs PyTorch reference (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx5060ti.png)
+![fusedtok vs PyTorch reference (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx5060ti.png)
 
 The PyPI wheel ships sm_80/sm_86 cubins plus a compute_86 PTX fallback —
 verified to JIT and run correctly on Blackwell (sm_120) drivers.
