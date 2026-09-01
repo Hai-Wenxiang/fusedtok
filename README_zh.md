@@ -173,7 +173,7 @@ CUDA graph、错误契约）——英文版在[这里](https://github.com/Hai-We
 RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**独立 3 轮
 取平均**，逐轮数值在 JSON 中），对比等价的 PyTorch 参考实现（组合 eager
 表达式；attention 参考使用**预展开**头 —— `repeat_interleave` 在计时区
-之外）。每算子取最大形状；完整数据：`docs/benchmark_rtx3060.json`，可用
+之外）。每算子取最大形状；完整数据：`docs/benchmarks/benchmark_rtx3060.json`，可用
 `python benchmarks/bench.py` 复现：
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
@@ -199,10 +199,10 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
 线程块大小；上表为调优后的数字。
 
-![fusedtok 对比 PyTorch 参考](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx3060.png)
+![fusedtok 对比 PyTorch 参考](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx3060.png)
 
 **RTX 5060 Ti（Blackwell，sm_120）** —— 同套测试，每算子最大形状（完整
-数据：`docs/benchmark_rtx5060ti.json`）：
+数据：`docs/benchmarks/benchmark_rtx5060ti.json`）：
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
@@ -226,7 +226,7 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 attention decode 3.78x @T=4096 跑出 187 GB/s）——形状越大启动开销占比
 越低；完整扫描见 JSON。
 
-![fusedtok 对比 PyTorch 参考（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmark_rtx5060ti.png)
+![fusedtok 对比 PyTorch 参考（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx5060ti.png)
 
 PyPI wheel 附带 sm_80/sm_86 原生 cubin 与 compute_86 PTX 回退 —— 已在
 Blackwell（sm_120）驱动上验证 JIT 运行正确。

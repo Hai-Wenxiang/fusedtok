@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.3] - 2026-09-01
+
+Documentation-only patch over 1.1.2 (kernels, benchmark data and tests
+are byte-identical): the per-GPU benchmark JSONs and speedup charts
+moved from the `docs/` root into their own `docs/benchmarks/`
+directory, next to the language-specific usage guides (`docs/en/`,
+`docs/zh/`). `benchmarks/bench.py` writes to the new location by
+default and every cross-reference (both READMEs, both usage guides)
+was retargeted. Note: benchmark images on older PyPI release pages
+point at the previous `docs/` paths on the default branch and will
+stop rendering after this move; the current project page is correct.
+
 ## [1.1.2] - 2026-09-01
 
 Documentation-only patch over 1.1.1 (kernels, benchmarks and tests are

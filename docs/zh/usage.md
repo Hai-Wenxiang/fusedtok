@@ -278,5 +278,5 @@ python benchmarks/bench.py            # 全套，几分钟
 ```
 
 协议：CUDA event 计时，每个配置 3 轮独立计时（各带预热），报告均值、逐轮
-值保存在 JSON 里。产物落在 `docs/`：每 GPU 一份 JSON + 一张单面板加速比图
-（文件名含设备名）。当前 RTX 3060 与 RTX 5060 Ti 的数字见 README 基准节。
+值保存在 JSON 里。产物落在 `docs/benchmarks/`：每 GPU 一份 JSON + 一张单面板
+加速比图（文件名含设备名）。当前 RTX 3060 与 RTX 5060 Ti 的数字见 README 基准节。
