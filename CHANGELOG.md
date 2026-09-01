@@ -4,6 +4,101 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-09-02
+
+Feature release on the frozen 1.x API: paged kv-cache attention (the
+vLLM-style block-pool layout) with its cache-write companion, an ~8.5x
+cut of the flat-distribution sampling worst case, and an argmax launch
+diet. 380 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2); compute-sanitizer memcheck/racecheck clean on all
+new kernels (three storage dtypes + the graph-capture path).
+
+### Added
+- **`attention_decode_paged`** (the v1.2 headline): single-token GQA
+  decode attention over a PAGED kv-cache. The cache is a pool of
+  fixed-size token blocks `[Nb, Hkv, P, D]` reached through a
+  per-sequence block table `[B, S]` (token `t` lives in block
+  `table[b, t // P]` at offset `t % P`), which keeps memory
+  fragmentation out of the cache as sequences grow, shrink and get
+  evicted. Same math, GQA mapping, zero-row convention and dtype matrix
+  (f32/bf16/fp16 storage, f32 compute) as the contiguous op; the split
+  pipeline and workspace are shared, stage 2 is the same reduce kernel.
+  Any valid table is honored (non-monotonic, sharing, holes); table
+  VALUES are validated on CPU/staged paths (ValueError) and trusted on
+  the zero-copy path (same trust boundary as raw pointers). GQA group
+  sizes 1/2/4/8/16. CUDA-graph capturable after a warm-up outside the
+  capture. Measured: 1.06-1.07x the contiguous op for the indirection
+  (3060/5060 Ti, T=16384, 3-round means), bit-identical output on
+  matching slice schedules, **7.7x / 4.3x vs SDPA** on the
+  materialized reference. 13 new tests.
+- **`kv_append_paged`**: the cache-write side of the paged loop - one
+  fresh token's k/v rows per sequence scattered in place into the pool
+  at position `lens[b]`. The scheduler owns the block table; this
+  writes data into already-mapped blocks only. One tiny kernel
+  (f32/bf16/fp16 storage on the torch path), stream-ordered and
+  graph-capturable. Host paths require float32 C-contiguous pools (a
+  dtype conversion would silently drop the in-place writes - rejected
+  with TypeError). 8 new tests including an append->decode loop matched
+  against a contiguous cache built the same way.
+
+### Changed
+- **Flat-distribution `sample_topp` / `decode_step` worst case ~8.5x
+  faster** (near-uniform logits, n=131072, 3-round means: RTX 3060
+  18.2ms -> 2.2ms, RTX 5060 Ti 13.1ms -> 1.5ms; vs torch's fully
+  parallel sort 0.025x -> 0.21x / 0.014x -> 0.12x - still honestly
+  slower). Three changes, each token-preserving by construction and
+  pinned by tests (flat tokens bit-identical to the pre-change GPU
+  build, verified A/B during development):
+  - Adaptive widening jump: a failed window attempt now leaves its
+    whole cumulated mass in a new workspace slot; combined with the
+    global softmax total this gives the necessary bound
+    `w >= W * p * T / C` (every element past rank W is at most C/W),
+    so flat distributions jump straight to (nearly) the full
+    vocabulary instead of stepping the x8 ladder through intermediate
+    full pipeline attempts.
+  - Full-vocabulary fast path: when the window equals the vocabulary
+    the radix rounds and finalize are pure waste (every key survives);
+    a plain parallel pack replaces them.
+  - The contract-serial sampling walk (the strictly sequential float
+    adds ARE the CPU-parity determinism contract) now batches its
+    loads branch-free (8 x LDG.128 per group, exact-index replay of
+    the single crossing batch). The naive one-load-one-add walk was
+    pure L2 latency: 12.8ms in one kernel - 97% of the whole flat
+    case; the batched walk runs memory-throughput-bound at ~1.5ms
+    with an identical fadd sequence.
+- `argmax` (torch path) costs one CUDA submission and one allocation less
+  per call: the kernel now keeps two argmax-dedicated, self-resetting
+  workspace slots (its finalize re-zeros them; the workspace is zeroed
+  once at every (re)allocation), which retires the per-call
+  `cudaMemsetAsync`, and the Python layer reuses a per-device 4-byte
+  scratch tensor instead of a fresh `torch.empty` per call. Measured
+  n=131072, 3-round means: RTX 5060 Ti (Linux) wall 16.3 -> 14.6us vs
+  14.0us for `int(t.argmax())` (0.84x -> 0.96x) with the GPU-side
+  launch+kernel time down 6.1 -> 3.5us; RTX 3060 (Windows WDDM) wall
+  85 -> 41us vs 46us for torch (0.53x -> 1.12x), where every removed
+  submission/alloc is worth ~20-30us. Back-to-back calls, calls right
+  after big-k selections, calls right after a workspace regrowth, and
+  CUDA-graph replays are pinned by new tests.
+
+### Fixed
+- benchmarks/bench.py: the "sample_topp flat (worst)" row measured a
+  plain randn whose p=0.9 nucleus is only ~8k wide - a mid-tail, not
+  the worst case; the row now uses near-uniform logits (randn * 1e-3)
+  so the label tells the truth (v1.1 numbers in that row under-reported
+  the true worst case). The PEAKED row's spike grew +10 -> +20: at
+  n=131072/p=0.9 the +10 spike sits exactly ON the coverage boundary
+  (the max-normalized tail carries ~11% of the mass) and the row was a
+  per-seed coin flip between the fast first-window path and a
+  several-thousand-token nucleus.
+
+### Documented
+- usage guides (both languages): the CPU/GPU same-token guarantee now
+  spells out the at-scale caveat - with near-uniform logits over a very
+  large vocabulary every draw sits on the documented exp-rounding
+  boundary, so CPU and GPU may pick neighboring (equally valid) tokens
+  for the same seed; the GPU result itself stays bit-identical per seed
+  and the widening schedule never changes the token.
+
 ## [1.1.3] - 2026-09-01
 
 Documentation-only patch over 1.1.2 (kernels, benchmark data and tests

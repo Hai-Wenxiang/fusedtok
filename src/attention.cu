@@ -541,6 +541,150 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
 }
 
 // ---------------------------------------------------------------------------
+// paged decode kernel (v1.2): the split stage-1 walk over a BLOCK-POOL
+// kv-cache. Identical online-softmax/GQA mechanics to attn_split_kernel
+// (deliberately a separate kernel: the contiguous path is the shipped
+// headline performer and stays untouched); the only difference is the
+// row address of token t:
+//
+//   row(t) = pool[table[b * S + t / P] * Hkv*P + kv*P + t % P, :]
+//
+// The table is tiny and L1-resident; every warp iteration reads ONE
+// entry (all lanes share t), and consecutive tokens within a page stay
+// contiguous in memory so loads stay coalesced. Stage 2 is the same
+// attn_reduce_kernel as the contiguous op (partials in the workspace
+// are layout-agnostic).
+// ---------------------------------------------------------------------------
+
+template <int G, typename T>
+__global__ void attn_split_paged_kernel(
+    const T* __restrict__ q, const T* __restrict__ k_pool,
+    const T* __restrict__ v_pool, const int* __restrict__ table,
+    const int* __restrict__ lens, float* __restrict__ ws_ml,
+    float* __restrict__ ws_acc, int hq, int hkv, int dim, int page,
+    int tbl_stride, int slices, int slice_len) {
+    using C = AttChunk<T>;
+    const int slice = blockIdx.x % slices;
+    const int kv = (blockIdx.x / slices) % hkv;
+    const int bi = blockIdx.x / (slices * hkv);
+    const int span = tbl_stride * page;
+    const int len = lens ? lens[bi] : span;
+    const int t0 = slice * slice_len;
+    const int t1 = min(len, t0 + slice_len);
+
+    const float scale = 1.0f / sqrtf((float)dim);
+    const int chunks = dim / 4;
+    const int* rowT = table + (size_t)bi * tbl_stride;
+    const T* qp = q + ((size_t)bi * hq + (size_t)kv * G) * dim;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    float4 qv[G][kAttLaneChunks];
+    float4 acc[G][kAttLaneChunks];
+    float m[G], l[G];
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+    }
+    int nj = 0;
+    for (int c = lane; c < chunks; c += 32, ++nj)
+        #pragma unroll
+        for (int g = 0; g < G; ++g) {
+            qv[g][nj] = C::ld(qp + (size_t)g * dim + c * 4);
+            acc[g][nj] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+    for (int t = t0 + warp; t < t1; t += kAttWarps) {
+        // paged row address (one table entry per warp iteration)
+        const size_t base =
+            ((size_t)rowT[t / page] * hkv + kv) * page + (t % page);
+        const T* krow = k_pool + base * dim;
+        const T* vrow = v_pool + base * dim;
+        float4 kc[kAttLaneChunks], vc[kAttLaneChunks];
+        for (int j = 0; j < nj; ++j) {
+            kc[j] = C::ld(krow + (lane + (size_t)j * 32) * 4);
+            vc[j] = C::ld(vrow + (lane + (size_t)j * 32) * 4);
+        }
+        for (int g = 0; g < G; ++g) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < kAttLaneChunks; ++j) {
+                if (j >= nj) break;
+                dot += qv[g][j].x * kc[j].x + qv[g][j].y * kc[j].y
+                     + qv[g][j].z * kc[j].z + qv[g][j].w * kc[j].w;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_down_sync(0xffffffffu, dot, off);
+            const float s = __shfl_sync(0xffffffffu, dot, 0) * scale;
+            const float m_new = fmaxf(m[g], s);
+            const float rescale = expf(m[g] - m_new);
+            const float p = expf(s - m_new);
+            l[g] = l[g] * rescale + p;
+            #pragma unroll
+            for (int j = 0; j < kAttLaneChunks; ++j) {
+                if (j >= nj) break;
+                acc[g][j].x = acc[g][j].x * rescale + p * vc[j].x;
+                acc[g][j].y = acc[g][j].y * rescale + p * vc[j].y;
+                acc[g][j].z = acc[g][j].z * rescale + p * vc[j].z;
+                acc[g][j].w = acc[g][j].w * rescale + p * vc[j].w;
+            }
+            m[g] = m_new;
+        }
+    }
+
+    // merge warp partials per head (same shared-memory dance as the
+    // contiguous split kernel)
+    __shared__ float sm_acc[kAttWarps][kAttMaxDim];
+    __shared__ float sm_ml[kAttWarps][2];
+    for (int g = 0; g < G; ++g) {
+        if (lane == 0) {
+            sm_ml[warp][0] = m[g];
+            sm_ml[warp][1] = l[g];
+        }
+        {
+            int j = 0;
+            for (int c = lane; c < chunks; c += 32, ++j)
+                *reinterpret_cast<float4*>(&sm_acc[warp][c * 4]) = acc[g][j];
+        }
+        __syncthreads();
+        const size_t pidx =
+            (((size_t)bi * hkv + kv) * slices + slice) * G + g;
+        float m_all = -INFINITY;
+        for (int w = 0; w < kAttWarps; ++w)
+            if (sm_ml[w][1] > 0.0f)
+                m_all = fmaxf(m_all, sm_ml[w][0]);
+        float l_all = 0.0f;
+        for (int w = 0; w < kAttWarps; ++w)
+            if (sm_ml[w][1] > 0.0f)
+                l_all += sm_ml[w][1] * expf(sm_ml[w][0] - m_all);
+        if (threadIdx.x == 0) {
+            ws_ml[pidx * 2] = m_all;
+            ws_ml[pidx * 2 + 1] = l_all;
+        }
+        int j = 0;
+        for (int c = lane; c < chunks; c += 32, ++j) {
+            float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            for (int w = 0; w < kAttWarps; ++w) {
+                if (sm_ml[w][1] > 0.0f) {
+                    const float wgt = expf(sm_ml[w][0] - m_all);
+                    const float4* src =
+                        reinterpret_cast<const float4*>(&sm_acc[w][c * 4]);
+                    s.x += src->x * wgt;
+                    s.y += src->y * wgt;
+                    s.z += src->z * wgt;
+                    s.w += src->w * wgt;
+                }
+            }
+            *reinterpret_cast<float4*>(&ws_acc[pidx * dim + c * 4]) = s;
+        }
+        __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // prefill kernel: fresh-sequence attention over S query rows (the
 // lightweight v0.5 prefill - no tensor cores, bandwidth-first).
 //
@@ -839,6 +983,89 @@ std::vector<float> attention_decode_cpu(const std::vector<float>& q,
 }
 
 // ---------------------------------------------------------------------------
+// paged decode CPU reference (v1.2): the same two-pass softmax walk with
+// paged row addressing. Host-side, so the block-table VALUES are validated
+// here (the GPU paths trust them - a device table is not host-readable
+// without a sync; same trust boundary as data_ptr).
+// ---------------------------------------------------------------------------
+
+std::vector<float> attention_decode_paged_cpu(
+    const std::vector<float>& q, const std::vector<float>& k_pool,
+    const std::vector<float>& v_pool, const std::vector<int>& table,
+    const std::vector<int>* lens, int batch, int q_heads, int kv_heads,
+    int page, int tbl_width, int num_blocks, int dim) {
+    attention_check(batch, q_heads, kv_heads, tbl_width * page, dim);
+    if (page < 1)
+        throw std::invalid_argument("page size must be >= 1");
+    if (q.size() < (size_t)batch * q_heads * dim ||
+        k_pool.size() < (size_t)num_blocks * kv_heads * page * dim ||
+        v_pool.size() < (size_t)num_blocks * kv_heads * page * dim)
+        throw std::invalid_argument("attention operand size mismatch");
+    if (table.size() < (size_t)batch * tbl_width)
+        throw std::invalid_argument("block table must be [batch, tbl_width]");
+    if (lens && lens->size() < (size_t)batch)
+        throw std::invalid_argument("lens must have batch entries");
+
+    const int span = tbl_width * page;
+    if (lens)
+        for (int i = 0; i < batch; ++i)
+            if ((*lens)[i] < 0 || (*lens)[i] > span)
+                throw std::invalid_argument(
+                    "lens entries must be within [0, table width * page]");
+    for (int bi = 0; bi < batch; ++bi) {
+        const int used = (lens ? (*lens)[bi] : span);
+        const int pages = (used + page - 1) / page;
+        for (int s = 0; s < pages; ++s) {
+            const int blk = table[(size_t)bi * tbl_width + s];
+            if (blk < 0 || blk >= num_blocks)
+                throw std::invalid_argument(
+                    "block table entries must be valid pool block ids");
+        }
+    }
+
+    const int group = q_heads / kv_heads;
+    const float scale = 1.0f / sqrtf((float)dim);
+    std::vector<float> out((size_t)batch * q_heads * dim, 0.0f);
+    std::vector<float> scores(span > 0 ? span : 1);
+    for (int bi = 0; bi < batch; ++bi) {
+        const int len = lens ? (*lens)[bi] : span;
+        for (int h = 0; h < q_heads; ++h) {
+            if (len == 0)
+                continue;              // zero row convention
+            const int kv = h / group;
+            const float* qp = q.data() + ((size_t)bi * q_heads + h) * dim;
+            const int* rowT = table.data() + (size_t)bi * tbl_width;
+            float m = -INFINITY;
+            for (int t = 0; t < len; ++t) {
+                const size_t base =
+                    ((size_t)rowT[t / page] * kv_heads + kv) * page
+                    + (t % page);
+                const float* kp = k_pool.data() + base * dim;
+                float dot = 0.0f;
+                for (int d = 0; d < dim; ++d)
+                    dot += qp[d] * kp[d];
+                scores[t] = dot * scale;
+                m = fmaxf(m, scores[t]);
+            }
+            float l = 0.0f;
+            for (int t = 0; t < len; ++t)
+                l += expf(scores[t] - m);
+            float* op = out.data() + ((size_t)bi * q_heads + h) * dim;
+            for (int t = 0; t < len; ++t) {
+                const size_t base =
+                    ((size_t)rowT[t / page] * kv_heads + kv) * page
+                    + (t % page);
+                const float* vp = v_pool.data() + base * dim;
+                const float p = expf(scores[t] - m) / l;
+                for (int d = 0; d < dim; ++d)
+                    op[d] += p * vp[d];
+            }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // launcher: single-kernel path for short caches / saturated grids /
 // unusual group sizes, flash-decoding split path (stage1 partials +
 // stage2 reduce) for long caches. Stream-ordered and graph-capturable on
@@ -1092,6 +1319,268 @@ void attention_prefill_launch_fp16(const void* q, const void* k,
                                static_cast<const __half*>(v),
                                static_cast<__half*>(out),
                                batch, hq, hkv, seq, dim, causal, stream);
+}
+
+// ---------------------------------------------------------------------------
+// paged kv-cache append (v1.2): scatter ONE fresh token's k/v rows per
+// sequence into the block pool - the cache-write side of the paged
+// decode loop (the scheduler owns the block table; this writes data
+// into already-mapped blocks at position lens[b]). Grid (B, chunks):
+// every thread copies one 4-element chunk of one head's row.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void kv_append_paged_kernel(const T* __restrict__ k_new,
+                                       const T* __restrict__ v_new,
+                                       const int* __restrict__ table,
+                                       const int* __restrict__ lens,
+                                       T* __restrict__ k_pool,
+                                       T* __restrict__ v_pool,
+                                       int hkv, int dim, int page,
+                                       int tbl_stride) {
+    using C = AttChunk<T>;
+    const int bi = blockIdx.x;
+    const int chunks = hkv * (dim / 4);
+    const int idx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (idx >= chunks) return;
+    const int pos = lens[bi];
+    const int blk = table[(size_t)bi * tbl_stride + pos / page];
+    const int off = pos % page;
+    const int h = idx / (dim / 4);
+    const int c = idx % (dim / 4);
+    // pool row base of (block, head, in-page offset); source row base
+    // is the fresh token's (batch, head) row - both chunk-indexed by c
+    const size_t dst = ((size_t)blk * hkv + h) * page + off;
+    const size_t src = (size_t)bi * hkv + h;
+    C::stc(k_pool + dst * dim, c, C::ldc(k_new + src * dim, c));
+    C::stc(v_pool + dst * dim, c, C::ldc(v_new + src * dim, c));
+}
+
+// ---------------------------------------------------------------------------
+// paged decode launcher (v1.2): always the split path (stage 1 paged walk
+// + the shared stage-2 reduce). The contiguous op's single-kernel path has
+// no paged twin - short sequences simply run one slice. The workspace is
+// the same per-shape float32 cache the contiguous split path uses.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+void attention_decode_paged_launch_t(const T* q, const T* k_pool,
+                                     const T* v_pool, const int* table,
+                                     const int* lens, T* out,
+                                     int batch, int hq, int hkv, int page,
+                                     int tbl_width, int dim,
+                                     std::uintptr_t stream) {
+    attention_check(batch, hq, hkv, tbl_width * page, dim);
+    if (page < 1)
+        throw std::invalid_argument("page size must be >= 1");
+    const int group = hq / hkv;
+    if (!(group == 1 || group == 2 || group == 4 || group == 8 ||
+          group == 16))
+        throw std::invalid_argument(
+            "paged decode supports GQA group sizes 1/2/4/8/16 "
+            "(use the contiguous op for other divisors)");
+    if (batch == 0)
+        return;                        // nothing to compute
+    cudaStream_t cs = (cudaStream_t)stream;
+
+    // slice heuristics on the table capacity (host-known, like the
+    // contiguous launcher's use of the cache depth)
+    const int span = tbl_width * page;
+    const int slices = att_choose_slices(batch, hkv, span,
+                                         sm_multi_processor_count());
+
+    const AttWsKey key(batch * hkv, slices, group, dim);
+    AttWs ws{nullptr, nullptr};
+    {
+        std::lock_guard<std::mutex> lock(att_ws_mutex());
+        auto it = att_ws_cache().find(key);
+        if (it != att_ws_cache().end()) {
+            ws = it->second;
+        } else if (stream_is_capturing(cs)) {
+            // no allocation-free fallback exists for the paged path
+            throw std::runtime_error(
+                "paged decode workspace must be allocated outside a CUDA "
+                "graph capture - warm the shape up once before capturing");
+        } else {
+            const size_t npart = (size_t)batch * hkv * slices * group;
+            float* ml = nullptr;
+            float* acc = nullptr;
+            if (cudaMalloc(&ml, npart * 2 * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&acc, npart * (size_t)dim * sizeof(float))
+                    != cudaSuccess) {
+                cudaGetLastError();
+                throw std::runtime_error(
+                    "paged decode workspace allocation failed");
+            }
+            ws = AttWs{ml, acc};
+            att_ws_cache().emplace(key, ws);
+        }
+    }
+
+    const int grid1 = batch * hkv * slices;
+    const int slice_len = (span + slices - 1) / slices;
+    if (group == 1)
+        attn_split_paged_kernel<1, T><<<grid1, kAttBlock, 0, cs>>>(
+            q, k_pool, v_pool, table, lens, ws.ml, ws.acc, hq, hkv, dim,
+            page, tbl_width, slices, slice_len);
+    else if (group == 2)
+        attn_split_paged_kernel<2, T><<<grid1, kAttBlock, 0, cs>>>(
+            q, k_pool, v_pool, table, lens, ws.ml, ws.acc, hq, hkv, dim,
+            page, tbl_width, slices, slice_len);
+    else if (group == 4)
+        attn_split_paged_kernel<4, T><<<grid1, kAttBlock, 0, cs>>>(
+            q, k_pool, v_pool, table, lens, ws.ml, ws.acc, hq, hkv, dim,
+            page, tbl_width, slices, slice_len);
+    else if (group == 8)
+        attn_split_paged_kernel<8, T><<<grid1, kAttBlock, 0, cs>>>(
+            q, k_pool, v_pool, table, lens, ws.ml, ws.acc, hq, hkv, dim,
+            page, tbl_width, slices, slice_len);
+    else
+        attn_split_paged_kernel<16, T><<<grid1, kAttBlock, 0, cs>>>(
+            q, k_pool, v_pool, table, lens, ws.ml, ws.acc, hq, hkv, dim,
+            page, tbl_width, slices, slice_len);
+    check_launch("attention split paged kernel launch");
+    attn_reduce_kernel<T><<<batch * hq, kAttBlock, 0, cs>>>(
+        ws.ml, ws.acc, out, hq, hkv, dim, group, slices);
+    check_launch("attention reduce kernel launch");
+}
+
+void attention_decode_paged_launch(const float* q, const float* k_pool,
+                                   const float* v_pool, const int* table,
+                                   const int* lens, float* out,
+                                   int batch, int hq, int hkv, int page,
+                                   int tbl_width, int dim,
+                                   std::uintptr_t stream) {
+    attention_decode_paged_launch_t(q, k_pool, v_pool, table, lens, out,
+                                    batch, hq, hkv, page, tbl_width, dim,
+                                    stream);
+}
+
+void attention_decode_paged_launch_bf16(const void* q, const void* k_pool,
+                                        const void* v_pool, const int* table,
+                                        const int* lens, void* out,
+                                        int batch, int hq, int hkv, int page,
+                                        int tbl_width, int dim,
+                                        std::uintptr_t stream) {
+    attention_decode_paged_launch_t(
+        static_cast<const __nv_bfloat16*>(q),
+        static_cast<const __nv_bfloat16*>(k_pool),
+        static_cast<const __nv_bfloat16*>(v_pool), table, lens,
+        static_cast<__nv_bfloat16*>(out), batch, hq, hkv, page, tbl_width,
+        dim, stream);
+}
+
+void attention_decode_paged_launch_fp16(const void* q, const void* k_pool,
+                                        const void* v_pool, const int* table,
+                                        const int* lens, void* out,
+                                        int batch, int hq, int hkv, int page,
+                                        int tbl_width, int dim,
+                                        std::uintptr_t stream) {
+    attention_decode_paged_launch_t(
+        static_cast<const __half*>(q), static_cast<const __half*>(k_pool),
+        static_cast<const __half*>(v_pool), table, lens,
+        static_cast<__half*>(out), batch, hq, hkv, page, tbl_width, dim,
+        stream);
+}
+
+// ---------------------------------------------------------------------------
+// paged kv-cache append launcher (v1.2): dtype-templated scatter of one
+// fresh token's k/v rows per sequence into the pool (see the kernel
+// comment above). lens is REQUIRED (the write position is the current
+// length by definition).
+// ---------------------------------------------------------------------------
+
+template <typename T>
+void kv_append_paged_launch_t(const T* k_new, const T* v_new,
+                              const int* table, const int* lens,
+                              T* k_pool, T* v_pool, int batch, int hkv,
+                              int dim, int page, int tbl_width,
+                              std::uintptr_t stream) {
+    if (batch <= 0)
+        return;                        // nothing to append
+    if (dim % 4 != 0)
+        throw std::invalid_argument("dim must be a multiple of 4");
+    if (page < 1)
+        throw std::invalid_argument("page size must be >= 1");
+    cudaStream_t cs = (cudaStream_t)stream;
+    const int chunks = hkv * (dim / 4);
+    dim3 grid((unsigned)batch,
+              (unsigned)((chunks + kAttBlock - 1) / kAttBlock));
+    kv_append_paged_kernel<T><<<grid, kAttBlock, 0, cs>>>(
+        k_new, v_new, table, lens, k_pool, v_pool, hkv, dim, page,
+        tbl_width);
+    check_launch("kv append paged kernel launch");
+}
+
+void kv_append_paged_launch(const float* k_new, const float* v_new,
+                            const int* table, const int* lens, float* k_pool,
+                            float* v_pool, int batch, int hkv, int dim,
+                            int page, int tbl_width,
+                            std::uintptr_t stream) {
+    kv_append_paged_launch_t(k_new, v_new, table, lens, k_pool, v_pool,
+                             batch, hkv, dim, page, tbl_width, stream);
+}
+
+void kv_append_paged_launch_bf16(const void* k_new, const void* v_new,
+                                 const int* table, const int* lens,
+                                 void* k_pool, void* v_pool, int batch,
+                                 int hkv, int dim, int page, int tbl_width,
+                                 std::uintptr_t stream) {
+    kv_append_paged_launch_t(
+        static_cast<const __nv_bfloat16*>(k_new),
+        static_cast<const __nv_bfloat16*>(v_new), table, lens,
+        static_cast<__nv_bfloat16*>(k_pool),
+        static_cast<__nv_bfloat16*>(v_pool), batch, hkv, dim, page,
+        tbl_width, stream);
+}
+
+void kv_append_paged_launch_fp16(const void* k_new, const void* v_new,
+                                 const int* table, const int* lens,
+                                 void* k_pool, void* v_pool, int batch,
+                                 int hkv, int dim, int page, int tbl_width,
+                                 std::uintptr_t stream) {
+    kv_append_paged_launch_t(static_cast<const __half*>(k_new),
+                             static_cast<const __half*>(v_new), table,
+                             lens, static_cast<__half*>(k_pool),
+                             static_cast<__half*>(v_pool), batch, hkv, dim,
+                             page, tbl_width, stream);
+}
+
+void kv_append_paged_cpu(const std::vector<float>& k_new,
+                         const std::vector<float>& v_new,
+                         const std::vector<int>& table,
+                         const std::vector<int>& lens,
+                         std::vector<float>& k_pool,
+                         std::vector<float>& v_pool, int batch, int hkv,
+                         int dim, int page, int tbl_width, int num_blocks) {
+    if (dim % 4 != 0)
+        throw std::invalid_argument("dim must be a multiple of 4");
+    if (page < 1)
+        throw std::invalid_argument("page size must be >= 1");
+    if (lens.size() < (size_t)batch ||
+        table.size() < (size_t)batch * tbl_width ||
+        k_new.size() < (size_t)batch * hkv * dim ||
+        v_new.size() < (size_t)batch * hkv * dim)
+        throw std::invalid_argument("kv append operand size mismatch");
+    for (int bi = 0; bi < batch; ++bi) {
+        const int pos = lens[bi];
+        if (pos < 0 || pos >= tbl_width * page)
+            throw std::invalid_argument(
+                "lens entries must be within [0, table width * page)");
+        const int blk = table[(size_t)bi * tbl_width + pos / page];
+        if (blk < 0 || blk >= num_blocks)
+            throw std::invalid_argument(
+                "block table entries must be valid pool block ids");
+        const int off = pos % page;
+        for (int h = 0; h < hkv; ++h) {
+            const size_t dst = (((size_t)blk * hkv + h) * page + off) * dim;
+            const size_t src = ((size_t)bi * hkv + h) * dim;
+            std::copy(k_new.begin() + src, k_new.begin() + src + dim,
+                      k_pool.begin() + dst);
+            std::copy(v_new.begin() + src, v_new.begin() + src + dim,
+                      v_pool.begin() + dst);
+        }
+    }
 }
 
 } // namespace fusedtok

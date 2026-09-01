@@ -156,6 +156,54 @@ bandwidth vs SDPA; bf16/fp16 caches halve the bytes. At batch 1 the
 kernel is latency-bound, so half precision buys modest absolute time
 there - the byte savings scale with batch.
 
+### attention_decode_paged - the vLLM-style block-pool cache (v1.2)
+
+```python
+out = fusedtok.attention_decode_paged(q, k_pool, v_pool, block_table, lens)
+```
+
+- `k_pool`, `v_pool`: `[Nb, Hkv, P, D]` - a **pool of fixed-size token
+  blocks** (`P` = tokens per block, read from the pool shape) instead of
+  per-sequence contiguous spans: the layout that keeps memory
+  fragmentation out of the cache as sequences grow, shrink and get
+  evicted.
+- `block_table`: `[B, S]` int32 - sequence `b`'s token `t` lives in
+  pool block `block_table[b, t // P]` at offset `t % P`. Any valid table
+  is allowed (non-monotonic, sharing, holes) - the kernel walks the
+  indirection.
+- `lens`: optional `[B]` - valid length per sequence (`None` = every
+  sequence uses its full table width `S * P`).
+
+Same math, GQA mapping, zero-row convention and dtype matrix as the
+contiguous op; the split pipeline and its workspace are shared. GQA
+group sizes 1/2/4/8/16 (other divisors: use the contiguous op).
+Block-table **values** are validated on the CPU/staged paths
+(`ValueError`) and trusted on the zero-copy path - a device table is
+not host-readable without a sync, the same trust boundary as raw
+pointers. CUDA-graph capture requires warming the shape up once outside
+the capture (the split workspace must pre-exist).
+
+Measured cost of the indirection (v1.2, 3060, b=1 GQA 32/8 D=128
+T=16384 P=16): **1.06x** the contiguous op with bit-identical output on
+matching slice schedules.
+
+### kv_append_paged - writing tokens into the pool (v1.2)
+
+```python
+fusedtok.kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens)
+```
+
+The cache-write side of the paged loop: sequence `b`'s fresh rows
+`k_new[b]` / `v_new[b]` (each `[Hkv, D]`) land at pool block
+`block_table[b, lens[b] // P]`, offset `lens[b] % P`. **In place**
+(returns `None`); the block table itself belongs to the scheduler -
+this writes data into already-mapped blocks and never touches table
+entries. Host paths require float32 C-contiguous pools (a conversion
+would silently drop the writes - rejected with `TypeError`); the torch
+path supports the full f32/bf16/fp16 storage matrix. One tiny kernel,
+stream-ordered and graph-capturable. Typical loop: append at
+`lens[b]`, then decode with `lens + 1`.
+
 ### attention_prefill - fresh sequences
 
 ```python
@@ -245,13 +293,24 @@ tok = fusedtok.decode_step(logits, history, penalty=1.1,
 Same-token guarantee: for a fixed seed, CPU / staged / zero-copy paths
 draw the same token (documented rounding boundary: CPU uses precise
 `exp`, GPU uses `__expf`; the parity tests pin where this can matter -
-on the CDF boundary the draw may differ by one element).
+on the CDF boundary the draw may differ by one element). At very large
+vocab with near-uniform logits, every draw sits on that boundary at
+scale, so the CPU and GPU references may pick neighboring (equally
+valid) tokens for the same seed; the GPU result itself is always
+bit-identical per seed, and the window-widening schedule (adaptive
+since v1.2) never changes the sampled token.
 
 Flat-distribution caveat: when the nucleus spans most of the vocab
-(uniform-ish logits), `sample_topp` widens its window repeatedly and is
-slower than torch's fully parallel sort - documented honestly in the
-benchmarks. Real decode logits are peaked; the flat case is the worst
-case, not the typical one.
+(uniform-ish logits), `sample_topp` must effectively order the whole
+vocabulary and remains slower than torch's fully parallel sort -
+documented honestly in the benchmarks. v1.2 cut this worst case ~8x on
+a 3060 (18.2ms -> 2.2ms at n=131072) with three contract-preserving
+changes: the widening jump goes straight to the `p*total` mass bound
+instead of stepping the ladder, the full-vocabulary attempt skips the
+radix selection entirely, and the serial sampling walk batches its
+loads (the strictly-sequential float adds - the CPU-parity contract -
+are untouched, so every token is bit-identical). Real decode logits
+are peaked; the flat case is the worst case, not the typical one.
 
 ## The INT8 path
 

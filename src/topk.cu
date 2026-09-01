@@ -63,6 +63,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -118,8 +119,23 @@ constexpr int kWsCandCnt = 263;     // compaction counter
 constexpr int kWsToken = 264;       // sampled token slot (int)
 constexpr int kWsExpMax = 265;      // global logit max, fkey bits (sample)
 constexpr int kWsTotal = 266;       // global softmax total (float, sample)
-constexpr int kWsLevelDone = 267;   // level of the last completed round
-constexpr int kWsHead = 268;
+constexpr int kWsLevelDone = 268;   // level of the last completed round
+// cumulated softmax mass of the whole (failed) sampling window: written
+// by the sampling tail whenever the nucleus is not covered, read by the
+// host to sharpen the widening jump (widen_window). Lives next to
+// kWsTotal so one 8-byte readback fetches both.
+constexpr int kWsCumW = 267;        // window cum mass (sample, float)
+// argmax-dedicated slots (NOT shared with the selection pipeline): the
+// selection ticket/emit counters can be non-zero after a call, so argmax
+// cannot rely on the per-call head memset alone. These two words hold the
+// invariant "zero at kernel entry": the buffer is zeroed once at (re)alloc
+// and argmax's own finalize resets both words before the kernel exits,
+// which makes the per-call cudaMemsetAsync redundant (one launch saved on
+// every argmax call - the dominant cost of this op on submission-bound
+// hosts; WDDM measured ~20-30us per extra launch).
+constexpr int kWsArgBest = 269;     // argmax packed-key max (self-resetting)
+constexpr int kWsArgCnt = 270;      // argmax arrival counter (self-resetting)
+constexpr int kWsHead = 271;
 constexpr int kWsCand = kWsHead;               // candidates [0, 2048)
 constexpr int kWsKeys = kWsHead + kSelEarlyOut;  // key buffer A (m words)
 
@@ -144,6 +160,13 @@ unsigned long long* selection_workspace(size_t extra_words) {
         if (cudaMalloc(&nb, words * sizeof(unsigned long long)) != cudaSuccess)
             throw std::runtime_error(std::string("selection workspace alloc failed: ") +
                                      cudaGetErrorString(cudaGetLastError()));
+        // Zero the fresh buffer once. cudaMalloc memory is NOT guaranteed
+        // zero, and the argmax kernel's self-reset contract (kWsArgBest /
+        // kWsArgCnt must be zero at kernel entry) starts at the very first
+        // call after a (re)allocation. One synchronous memset per growth
+        // event only; selection calls keep their own per-call head memset
+        // and never depend on this.
+        cudaMemset(nb, 0, words * sizeof(unsigned long long));
         if (buf) cudaFree(buf);
         buf = nb;
         capacity = words;
@@ -544,7 +567,12 @@ __global__ void emit_finish_kernel(const SelArgs* __restrict__ a,
             if (cum >= p_stop * total) { nucleus_mass = cum; covered = true; break; }
         }
         if (!covered) {
-            if (k < n) return;      // window too small; host retries wider
+            if (k < n) {      // window too small; host retries wider -
+                // leave the window's whole cum mass for the host's
+                // next-jump bound (widen_window)
+                *reinterpret_cast<float*>(&ws[kWsCumW]) = cum;
+                return;
+            }
             nucleus = k;            // full window IS the vocabulary
             nucleus_mass = cum;
         }
@@ -759,12 +787,83 @@ __global__ void exp_window_kernel(const unsigned long long* __restrict__ keys,
     }
 }
 
+// Latency-hiding helper for the contract-serial walks below (v1.2).
+// The accumulation MUST stay strictly sequential (cum_{i+1} = cum_i +
+// e_i in index order - that exact fadd sequence IS the CPU-parity
+// determinism contract), but the LOADS are free to run ahead: a batch
+// of kWalkBatch independent reads is issued together, then consumed by
+// serial adds one at a time. On a full-vocabulary window (n=131072,
+// flat distributions) the naive one-load-one-add walk was pure L2
+// latency (~160 cycles/element, 12.8ms in one kernel, 97% of the whole
+// flat case); with 32 outstanding loads the same order-identical walk
+// runs memory-throughput-bound instead (~10 cycles/element).
+namespace {
+constexpr int kWalkBatch = 32;    // floats per batch = 8 x float4 loads
+// Walk 1: scan exps[0..count), return the crossing index (cum >= thr
+// first reached there) or -1; *cum_out carries the running total.
+__device__ int walk_until(const float* __restrict__ exps, int count,
+                          float thr, float* cum_out) {
+    float cum = 0.0f;
+    int i = 0;
+    // scalar prologue to a 16-byte boundary (the exps buffers are at
+    // least 4-byte aligned floats, but their word offset inside the
+    // workspace is not guaranteed even), then the vector-load body.
+    // Scheduling note: the consume side must stay BRANCH-FREE inside a
+    // batch (nvcc refuses to hoist loads above the per-element early
+    // exits, which serializes one LDG.128 per ~200 cycles - measured
+    // 12.8ms at n=131072). The adds run strictly in index order with a
+    // predicated `any` flag; on the (single) batch where the threshold
+    // is crossed the exact first index is REDONE element-by-element
+    // with the identical serial adds, so every returned index, cum and
+    // token is bit-identical to the naive scalar walk.
+    const int a = (int)(((16u - (unsigned)(uintptr_t)exps) & 15u) >> 2);
+    for (; i < a && i < count; ++i) {
+        cum += exps[i];
+        if (cum >= thr) { *cum_out = cum; return i; }
+    }
+    for (; i + kWalkBatch <= count; ) {
+        const float4* q = reinterpret_cast<const float4*>(exps + i);
+        float4 r[kWalkBatch / 4];
+        #pragma unroll
+        for (int j = 0; j < kWalkBatch / 4; ++j) r[j] = q[j];
+        const float base = cum;
+        bool any = false;
+        #pragma unroll
+        for (int j = 0; j < kWalkBatch / 4; ++j) {
+            cum += r[j].x; any |= (cum >= thr);
+            cum += r[j].y; any |= (cum >= thr);
+            cum += r[j].z; any |= (cum >= thr);
+            cum += r[j].w; any |= (cum >= thr);
+        }
+        if (any) {
+            // threshold crossed somewhere in THIS batch: replay just
+            // these 32 adds (identical order - identical bits, hot in
+            // L1) to pin the exact first index
+            float c = base;
+            for (int k = i; k < i + kWalkBatch; ++k) {
+                c += exps[k];
+                if (c >= thr) { *cum_out = c; return k; }
+            }
+        }
+        i += kWalkBatch;
+    }
+    for (; i < count; ++i) {                          // scalar tail
+        cum += exps[i];
+        if (cum >= thr) { *cum_out = cum; return i; }
+    }
+    *cum_out = cum;
+    return -1;
+}
+} // namespace
+
 // Identical arithmetic and accumulation order to the in-finisher sample
 // scan (and to the CPU reference): one thread walks the sorted keys. The
 // serial walk is what keeps per-seed CPU/GPU token parity stable; big
 // windows only occur for flat distributions (the host widening loop).
 // `exps` carries the precomputed exp column (exp_window_kernel); the
-// walk is two sequential passes - total mass, then inverse-CDF.
+// walk is two sequential passes - total mass, then inverse-CDF - both
+// batched by walk_until (load pipelining only; the fadd order is
+// untouched, so every token is bit-identical to the scalar walk).
 __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys,
                                      const float* __restrict__ exps,
                                      unsigned long long* __restrict__ ws,
@@ -780,19 +879,19 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     // reference, which compares an identical serial accumulation).
     const float total = *reinterpret_cast<const float*>(&ws[kWsTotal]);
     float cum = 0.0f;
-    int nucleus = 0;
-    float nucleus_mass = 0.0f;
-    bool covered = false;
-    for (int i = 0; i < k; ++i) {
-        cum += exps[i];
-        nucleus = i + 1;
-        if (cum >= p_stop * total) { nucleus_mass = cum; covered = true; break; }
+    const int edge = walk_until(exps, k, p_stop * total, &cum);
+    if (edge < 0) {
+        if (k < n) {              // window too small; host retries wider -
+            // leave the window's whole cum mass for the host's
+            // next-jump bound (widen_window)
+            *reinterpret_cast<float*>(&ws[kWsCumW]) = cum;
+            return;
+        }
     }
-    if (!covered) {
-        if (k < n) return;          // window too small; host retries wider
-        nucleus = k;                // full window IS the vocabulary
-        nucleus_mass = cum;
-    }
+    const int nucleus = (edge < 0) ? k : edge + 1;
+    // walk_until reports cum AT the crossing (covers the edge < 0 case
+    // too: full-window cum, exactly what the forced-coverage path used)
+    const float nucleus_mass = cum;
     unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
@@ -800,13 +899,10 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
     const float target = u * nucleus_mass;
     cum = 0.0f;
-    for (int i = 0; i < nucleus; ++i) {
-        cum += exps[i];
-        if (cum >= target) {
-            *token_out = (int)(0xFFFFFFFFu - (unsigned)(keys[i] & 0xFFFFFFFFu));
-            break;
-        }
-    }
+    const int hit = walk_until(exps, nucleus, target, &cum);
+    if (hit >= 0)
+        *token_out = (int)(0xFFFFFFFFu -
+                           (unsigned)(keys[hit] & 0xFFFFFFFFu));
     if (count_out) *count_out = nucleus;
 }
 
@@ -1206,6 +1302,47 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
     select_common(x, vals, idxs, count_out, n, n, p, stream);
 }
 
+// Adaptive widening jump (v1.2). After a window attempt fails to cover
+// the nucleus, two floats the attempt already produced steer the next
+// window size (one 8-byte readback of the adjacent kWsTotal/kWsCumW
+// words):
+//   T = GLOBAL softmax total (exptotal_kernel, max-normalized: the
+//       largest exp is exactly 1.0f)
+//   C = whole-window cum mass (stored by the sampling tail on failure)
+// Every element past rank W is at most C/W (the smallest of the top-W
+// exps bounds the rest, and it is at most their average), so covering
+// the remaining p*T - C mass needs at least (p*T - C)*W/C further
+// elements: w >= ceil(W * p * T / C) - a necessary lower bound that is
+// TIGHT for flat distributions (all exps ~ 1 -> w ~ p*n, one jump to
+// (nearly) the full vocabulary) and still useful on heavy tails like a
+// plain randn (max-normalization flattens everything but the extreme
+// tail, so the nucleus is surprisingly wide). The x8 ladder step stays
+// as the floor, so mid-tailed distributions never regress. The bound is
+// rounded up to a power of two for slack against float drift - a
+// hair-miss would otherwise cost one more full attempt. The sampled
+// token is independent of the jump schedule (the threshold uses the
+// global mass and the draw renormalizes inside the nucleus): only the
+// retry count changes, which is what this saves.
+static int widen_window(int window, int n, float p,
+                        const unsigned long long* ws) {
+    float mass[2] = {0.0f, 0.0f};           // [total, window cum]
+    if (cudaMemcpy(mass, ws + kWsTotal, 2 * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("sample mass readback failed");
+    const double total = (double)mass[0];
+    const double cw = (double)mass[1];
+    long long lb;
+    if (cw > 0.0 && p * total > cw)         // else keep the plain bound
+        lb = (long long)std::ceil((double)window * p * total / cw) + 1;
+    else
+        lb = (long long)std::ceil(p * total) + 1;
+    const long long want = std::max<long long>((long long)window * 8, lb);
+    if (want >= n) return n;
+    int mp = 1;                       // pow2 headroom over the bound
+    while (mp < want) mp <<= 1;
+    return std::min(n, mp);
+}
+
 // ---------------------------------------------------------------------------
 // fused nucleus sampling: softmax(logits/T) -> nucleus(p) -> inverse-CDF
 // draw from a hash-derived uniform. The token comes back through a
@@ -1225,8 +1362,9 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
         throw std::invalid_argument("temperature must be > 0");
     // Widening-window strategy: sort only the top-M candidates (M starts
     // at the early-exit/in-block-sort size), sample within them; if the
-    // nucleus is not covered by the window, retry with 4x as many.
-    // Typical distributions are covered by the first window.
+    // nucleus is not covered by the window, retry wider - adaptively via
+    // the p*T mass bound (widen_window). Typical distributions are
+    // covered by the first window.
     int window = std::min(kSelEarlyOut, n);
     for (;;) {
         int m = 1;
@@ -1246,22 +1384,35 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
         cudaMemcpyAsync(token_out, &token, sizeof(int), cudaMemcpyHostToDevice, cs);
         ship_args(cs, dargs, x, nullptr, nullptr, nullptr, p);
         const int grid = selection_grid(n);
-        for (int level = 7; level >= 0; --level)
-            select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
-                dargs, ws, n, level, (unsigned long long)window, 1.0f / t,
-                kNoPen);
-        select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
-                                                           1.0f / t, kNoPen);
+        // Full-vocabulary fast path (v1.2): when the window covers the
+        // whole vocabulary every key survives, so the radix rounds and
+        // the finalize are pure waste - emit_kernel's k==n branch (a
+        // plain parallel pack) is all the "selection" that is needed.
+        // The sort / exp / serial-walk tail below is unchanged, so the
+        // accumulation order (and therefore every sampled token) stays
+        // exactly what the full pipeline produced.
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window, 1.0f / t,
+                    kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
+                                                               1.0f / t,
+                                                               kNoPen);
+        }
         // global softmax mass (max, then total): the nucleus threshold
         // must be global, not window-local (see exptotal_kernel)
         expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, 1.0f / t, kNoPen);
         exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, 1.0f / t, kNoPen);
         check_launch("sample round launch");
-        if (window <= kSelEarlyOut) {
+        if (!full && window <= kSelEarlyOut) {
             emit_finish_kernel<<<grid, kSelBlock, 0, cs>>>(
                 dargs, ws, n, window, 1.0f / t, seed, /*sample=*/1, kNoPen);
             check_launch("sample emit+finish launch");
         } else {
+            // partial window: two-level emit; full window: emit's k==n
+            // branch degenerates to the parallel pack (see above)
             emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
                                                     1.0f / t, kNoPen);
             chunk_sort_kernel<<<(m + kSelSortChunk - 1) / kSelSortChunk,
@@ -1298,13 +1449,7 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
             return token;                  // nucleus covered, token sampled
         if (window == n)
             throw std::runtime_error("sample nucleus not covered");
-        // x8: flat distributions need windows 50-100x the vocab tail;
-        // x4 needed up to five full pipeline attempts on n=131072, each
-        // re-histogramming every key. The sampled token is unaffected by
-        // the jump size (a covered nucleus samples identically - the
-        // threshold is the global mass, the renormalization the nucleus
-        // mass), only the number of retries changes.
-        window = std::min(n, window * 8);  // widen and retry
+        window = widen_window(window, n, p, ws);  // widen and retry
     }
 }
 
@@ -1366,19 +1511,27 @@ long long decode_step_launch(const float* x, const long long* ids,
                                     kSelBlock, 0, cs>>>(ids, m, bm);
         const int grid = selection_grid(n);
         const float inv_t = 1.0f / t;
-        for (int level = 7; level >= 0; --level)
-            select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
-                dargs, ws, n, level, (unsigned long long)window, inv_t, pen);
-        select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
-                                                           inv_t, pen);
+        // full-vocabulary fast path: same rationale as sample_topp (the
+        // radix rounds cannot discard anything when window == n)
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window, inv_t,
+                    pen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
+                                                               inv_t, pen);
+        }
         expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, pen);
         exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, pen);
         check_launch("decode step round launch");
-        if (window <= kSelEarlyOut) {
+        if (!full && window <= kSelEarlyOut) {
             emit_finish_kernel<<<grid, kSelBlock, 0, cs>>>(
                 dargs, ws, n, window, inv_t, seed, /*sample=*/1, pen);
             check_launch("decode step finish launch");
         } else {
+            // partial window: two-level emit; full window: emit's k==n
+            // branch degenerates to the parallel pack
             emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
                                                     inv_t, pen);
             chunk_sort_kernel<<<(mm + kSelSortChunk - 1) / kSelSortChunk,
@@ -1414,7 +1567,7 @@ long long decode_step_launch(const float* x, const long long* ids,
             return token;
         if (window == n)
             throw std::runtime_error("decode step nucleus not covered");
-        window = std::min(n, window * 8);  // same jump-size rationale
+        window = widen_window(window, n, p, ws);  // same adaptive jump
     }
 }
 
@@ -1436,9 +1589,10 @@ __global__ void sample_topk_serial_kernel(
     const float* __restrict__ exps, int* __restrict__ token_out,
     int k, unsigned long long seed) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // both walks batched by walk_until: load pipelining only, the fadd
+    // order (the CPU-parity contract) is untouched (v1.2)
     float window_mass = 0.0f;
-    for (int i = 0; i < k; ++i)
-        window_mass += exps[i];
+    walk_until(exps, k, INFINITY, &window_mass);   // sum without crossing
     unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
@@ -1446,16 +1600,10 @@ __global__ void sample_topk_serial_kernel(
     const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
     const float target = u * window_mass;
     float cum = 0.0f;
-    for (int i = 0; i < k; ++i) {
-        cum += exps[i];
-        if (cum >= target) {
-            *token_out = (int)(0xFFFFFFFFu -
-                               (unsigned)(keys[i] & 0xFFFFFFFFu));
-            return;
-        }
-    }
+    const int hit = walk_until(exps, k, target, &cum);
+    const int idx = (hit >= 0) ? hit : k - 1;      // rounding fallback
     *token_out = (int)(0xFFFFFFFFu -
-                       (unsigned)(keys[k - 1] & 0xFFFFFFFFu));  // rounding
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
 long long sample_topk_launch(const float* x, int n, int k, float t,
@@ -1566,8 +1714,9 @@ __global__ void argmax_kernel(const float* __restrict__ x,
         const unsigned int arrived = atomicAdd(counter, 1u);
         if (arrived == gridDim.x - 1) {   // last block: publish the answer
             __threadfence();              // acquire: see every block's atomicMax
-            *counter = 0u;                // reset for the next launch
             *out = (int)(0xFFFFFFFFu - (unsigned)((*best) & 0xFFFFFFFFu));
+            *best = 0ULL;                 // self-reset: next launch needs no memset
+            *counter = 0u;
         }
     }
 }
@@ -1584,11 +1733,14 @@ long long argmax_cpu(const std::vector<float>& x) {
 void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream) {
     if (n <= 0) return;
     unsigned long long* ws = selection_workspace(0);
-    // Reuse two head words as the best-key slot + arrival counter (16
-    // bytes, self-resetting). Every selection call memsets the whole head
-    // before its own kernels, so cross-op clobbering is impossible.
-    unsigned long long* best = ws + kWsTicket;
-    cudaMemsetAsync(best, 0, 2 * sizeof(unsigned long long), (cudaStream_t)stream);
+    // Dedicated self-resetting slots (see kWsArgBest): zero at entry by
+    // contract - zeroed once at workspace (re)alloc and reset by every
+    // kernel's finalize - so no per-call cudaMemsetAsync is needed. The
+    // saved launch is the dominant cost of this op on submission-bound
+    // hosts. Selection calls memset the whole head (covering these slots)
+    // at their own start, which keeps the invariant across mixed call
+    // sequences on the same stream.
+    unsigned long long* best = ws + kWsArgBest;
     const int grid = (int)((n + kSelBlock - 1) / kSelBlock);
     argmax_kernel<<<grid, kSelBlock, 0, (cudaStream_t)stream>>>(
         x, best, reinterpret_cast<unsigned int*>(best + 1), n, out);

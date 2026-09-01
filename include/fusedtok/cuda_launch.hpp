@@ -17,6 +17,7 @@
 // the kernels with no staging copies.
 
 #include <cstdint>
+#include <vector>
 
 // bf16 storage type (compute stays float32)
 struct __nv_bfloat16;
@@ -176,6 +177,64 @@ void attention_prefill_launch_fp16(const void* q, const void* k,
                                    int batch, int q_heads, int kv_heads,
                                    int seq, int dim, bool causal,
                                    std::uintptr_t stream = 0);
+
+// --- attention (decode step) over a PAGED kv-cache (v1.2) --------------------
+// Same math as attention_decode_launch, but the kv-cache is a block pool
+// [Nb, Hkv, P, D] reached through a per-sequence block table [B, S] (token
+// t of sequence b lives at pool[table[b, t / P], kv, t % P, :]). lens may
+// be null (every sequence uses its full table width). The split path's
+// float32 workspace is shared with the contiguous op; warm a shape up
+// OUTSIDE a CUDA-graph capture before capturing it (the workspace must
+// pre-exist; there is no allocation-free fallback path here). GQA group
+// must be one of 1/2/4/8/16. dim: multiple of 4, at most 512.
+void attention_decode_paged_launch(const float* q, const float* k_pool,
+                                   const float* v_pool, const int* table,
+                                   const int* lens, float* out,
+                                   int batch, int q_heads, int kv_heads,
+                                   int page, int tbl_width, int dim,
+                                   std::uintptr_t stream = 0);
+void attention_decode_paged_launch_bf16(const void* q, const void* k_pool,
+                                        const void* v_pool, const int* table,
+                                        const int* lens, void* out,
+                                        int batch, int q_heads, int kv_heads,
+                                        int page, int tbl_width, int dim,
+                                        std::uintptr_t stream = 0);
+void attention_decode_paged_launch_fp16(const void* q, const void* k_pool,
+                                        const void* v_pool, const int* table,
+                                        const int* lens, void* out,
+                                        int batch, int q_heads, int kv_heads,
+                                        int page, int tbl_width, int dim,
+                                        std::uintptr_t stream = 0);
+
+// --- paged kv-cache append (v1.2) -------------------------------------------
+// Scatter ONE fresh token's k/v rows per sequence into the pool blocks:
+// k_new/v_new are [B, Hkv, D], the write position of sequence b is its
+// CURRENT length lens[b] (required), landing in block table[b, lens/P]
+// at offset lens%P. IN-PLACE on the pools; the scheduler owns the table
+// (this never writes table entries). Same dtype family and dim rules as
+// the attention ops; one tiny kernel, stream-ordered and capturable.
+void kv_append_paged_launch(const float* k_new, const float* v_new,
+                            const int* table, const int* lens, float* k_pool,
+                            float* v_pool, int batch, int hkv, int dim,
+                            int page, int tbl_width,
+                            std::uintptr_t stream = 0);
+void kv_append_paged_launch_bf16(const void* k_new, const void* v_new,
+                                 const int* table, const int* lens,
+                                 void* k_pool, void* v_pool, int batch,
+                                 int hkv, int dim, int page, int tbl_width,
+                                 std::uintptr_t stream = 0);
+void kv_append_paged_launch_fp16(const void* k_new, const void* v_new,
+                                 const int* table, const int* lens,
+                                 void* k_pool, void* v_pool, int batch,
+                                 int hkv, int dim, int page, int tbl_width,
+                                 std::uintptr_t stream = 0);
+void kv_append_paged_cpu(const std::vector<float>& k_new,
+                         const std::vector<float>& v_new,
+                         const std::vector<int>& table,
+                         const std::vector<int>& lens,
+                         std::vector<float>& k_pool,
+                         std::vector<float>& v_pool, int batch, int hkv,
+                         int dim, int page, int tbl_width, int num_blocks);
 
 // --- bf16 variants: float32 compute, bf16 storage ---------------------------
 // Weight/bias parameters stay float32 (norm weights are commonly kept fp32

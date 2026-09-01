@@ -17,10 +17,12 @@ try:
     import fusedtok
 except ImportError:
     # dev tree fallback: try the common CMake build dirs + python/ package,
-    # no install needed
+    # no install needed. NOTE: "build" must WIN over "build2" (insert(0)
+    # reverses the loop order, so build2 is listed first) - a stale
+    # build2 pyd shadowing the fresh build once broke this demo silently.
     import os
     here = os.path.dirname(os.path.abspath(__file__))
-    for cand in ("build", "build2"):
+    for cand in ("build2", "build"):
         sys.path.insert(0, os.path.join(here, "..", cand))
     sys.path.insert(0, os.path.join(here, "..", "python"))
     import fusedtok
@@ -311,6 +313,29 @@ def main():
             label = f"decode {str(half_dt).split('.')[-1]} vs f32"
             print(f"  {label:<26} {'PASS' if ok else 'FAIL'}")
             ALL_OK &= ok
+
+        # v1.2: the same decode over a PAGED (vLLM-style block-pool)
+        # cache - pools [Nb, Hkv, P, D] + a per-sequence block table.
+        # Build the pool by appending token-by-token with kv_append_paged
+        # and match the contiguous result.
+        page = 4                                     # small demo pool
+        width = (6 + page - 1) // page
+        nb = 4 * width                               # headroom, holes ok
+        pool_k = torch.zeros(nb, 2, page, 16, device="cuda")
+        pool_v = torch.zeros(nb, 2, page, 16, device="cuda")
+        table = torch.tensor([[1, 7], [3, 0]], dtype=torch.int32,
+                             device="cuda")          # non-monotonic on purpose
+        for step in range(6):                        # both sequences grow
+            lens_now = torch.tensor([step, min(step, 2)],
+                                    dtype=torch.int32, device="cuda")
+            kn = torch.stack([kt[0, :, step], kt[1, :, min(step, 2)]], 0)
+            vn = torch.stack([vt[0, :, step], vt[1, :, min(step, 2)]], 0)
+            fusedtok.kv_append_paged(pool_k, pool_v, table, kn, vn, lens_now)
+        plens = torch.tensor([6, 3], dtype=torch.int32, device="cuda")
+        yp = fusedtok.attention_decode_paged(qt, pool_k, pool_v, table, plens)
+        torch.cuda.synchronize()
+        check("paged block-pool == contiguous", yp.cpu().numpy(), ref,
+              tol=1e-4)
 
     print(SEP)
     print("attention prefill: fresh-sequence causal attention (S query rows)")

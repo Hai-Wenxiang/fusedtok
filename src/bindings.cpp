@@ -1083,6 +1083,253 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("out"), py::arg("batch"), py::arg("hq"), py::arg("hkv"),
        py::arg("t_seq"), py::arg("dim"), py::arg("stream") = 0);
 
+    // --- paged kv-cache decode (v1.2): pools [Nb,Hkv,P,D] + block table ---
+    m.def("attention_decode_paged_cpu",
+          [](FArray q, FArray k_pool, FArray v_pool, IArray table,
+             py::object lens, int batch, int hq, int hkv, int page,
+             int tbl_width, int num_blocks, int dim) {
+        std::vector<int> lv;
+        const std::vector<int>* lp = nullptr;
+        if (!lens.is_none()) {
+            IArray l_arr = lens;
+            if (l_arr.size() != (py::ssize_t)batch)
+                throw std::invalid_argument("lens must have batch entries");
+            lv.assign(l_arr.data(), l_arr.data() + l_arr.size());
+            lp = &lv;
+        }
+        std::vector<int> tv(table.data(), table.data() + table.size());
+        auto out = ft::attention_decode_paged_cpu(
+            to_vec(q), to_vec(k_pool), to_vec(v_pool), tv, lp, batch, hq,
+            hkv, page, tbl_width, num_blocks, dim);
+        return wrap_vec(out, {(py::ssize_t)batch, (py::ssize_t)hq,
+                              (py::ssize_t)dim});
+    }, py::arg("q"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("table"), py::arg("lens"), py::arg("batch"), py::arg("hq"),
+       py::arg("hkv"), py::arg("page"), py::arg("tbl_width"),
+       py::arg("num_blocks"), py::arg("dim"));
+
+    m.def("attention_decode_paged",
+          [](FArray q, FArray k_pool, FArray v_pool, IArray table,
+             py::object lens, int batch, int hq, int hkv, int page,
+             int tbl_width, int num_blocks, int dim) {
+        if (q.size() != (py::ssize_t)batch * hq * dim ||
+            k_pool.size() !=
+                (py::ssize_t)num_blocks * hkv * page * dim ||
+            v_pool.size() != k_pool.size() ||
+            table.size() != (py::ssize_t)batch * tbl_width)
+            throw std::invalid_argument("attention operand size mismatch");
+        const bool has_lens = !lens.is_none();
+        IArray l_arr;
+        if (has_lens) {
+            l_arr = lens;
+            if (l_arr.size() != (py::ssize_t)batch)
+                throw std::invalid_argument("lens must have batch entries");
+        }
+        // host-side table/lens validation (staged inputs are host
+        // memory; the zero-copy launch path trusts device values)
+        if (page < 1)
+            throw std::invalid_argument("page size must be >= 1");
+        const int span = tbl_width * page;
+        for (py::ssize_t i = 0; i < table.size(); ++i) {
+            const int blk = table.data()[i];
+            if (blk < 0 || blk >= num_blocks)
+                throw std::invalid_argument(
+                    "block table entries must be valid pool block ids");
+        }
+        if (has_lens)
+            for (py::ssize_t i = 0; i < l_arr.size(); ++i)
+                if (l_arr.data()[i] < 0 || l_arr.data()[i] > span)
+                    throw std::invalid_argument(
+                        "lens entries must be within [0, table width * page]");
+        const size_t kv_bytes =
+            (size_t)num_blocks * hkv * page * dim * 4;
+        const size_t out_n = (size_t)batch * hq * dim;
+        py::array_t<float> out(
+            std::vector<py::ssize_t>{batch, hq, dim});
+        if (out_n == 0) return out;
+        DevBuf dq(q.size() * 4), dk(kv_bytes), dv(kv_bytes),
+              dt((size_t)batch * tbl_width * 4),
+              dl(has_lens ? (size_t)batch * 4 : 0), dy(out_n * 4);
+        h2d(dq.get(), q.data(), q.size() * 4);
+        h2d(dk.get(), k_pool.data(), kv_bytes);
+        h2d(dv.get(), v_pool.data(), kv_bytes);
+        h2d(dt.get(), table.data(), (size_t)batch * tbl_width * 4);
+        if (has_lens) h2d(dl.get(), l_arr.data(), (size_t)batch * 4);
+        ft::attention_decode_paged_launch(
+            dq.fget(), dk.fget(), dv.fget(),
+            static_cast<const int*>(dt.get()),
+            has_lens ? static_cast<const int*>(dl.get()) : nullptr,
+            dy.fget(), batch, hq, hkv, page, tbl_width, dim);
+        d2h(out.mutable_data(), dy.get(), out_n * 4);
+        sync_device("attention decode paged kernel");
+        return out;
+    }, py::arg("q"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("table"), py::arg("lens"), py::arg("batch"), py::arg("hq"),
+       py::arg("hkv"), py::arg("page"), py::arg("tbl_width"),
+       py::arg("num_blocks"), py::arg("dim"));
+
+    m.def("attention_decode_paged_launch",
+          [](py::int_ q, py::int_ k_pool, py::int_ v_pool, py::int_ table,
+             py::object lens, py::int_ out, int batch, int hq, int hkv,
+             int page, int tbl_width, int dim, std::uintptr_t stream) {
+        const int* lp = nullptr;
+        if (!lens.is_none())
+            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        ft::attention_decode_paged_launch(
+            df(q), df(k_pool), df(v_pool),
+            reinterpret_cast<const int*>((uintptr_t)table), lp, dfm(out),
+            batch, hq, hkv, page, tbl_width, dim, stream);
+    }, py::arg("q"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("table"), py::arg("lens"), py::arg("out"), py::arg("batch"),
+       py::arg("hq"), py::arg("hkv"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("attention_decode_paged_launch_bf16",
+          [](py::int_ q, py::int_ k_pool, py::int_ v_pool, py::int_ table,
+             py::object lens, py::int_ out, int batch, int hq, int hkv,
+             int page, int tbl_width, int dim, std::uintptr_t stream) {
+        const int* lp = nullptr;
+        if (!lens.is_none())
+            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        ft::attention_decode_paged_launch_bf16(
+            reinterpret_cast<const void*>((uintptr_t)q),
+            reinterpret_cast<const void*>((uintptr_t)k_pool),
+            reinterpret_cast<const void*>((uintptr_t)v_pool),
+            reinterpret_cast<const int*>((uintptr_t)table), lp,
+            reinterpret_cast<void*>((uintptr_t)out),
+            batch, hq, hkv, page, tbl_width, dim, stream);
+    }, py::arg("q"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("table"), py::arg("lens"), py::arg("out"), py::arg("batch"),
+       py::arg("hq"), py::arg("hkv"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("attention_decode_paged_launch_fp16",
+          [](py::int_ q, py::int_ k_pool, py::int_ v_pool, py::int_ table,
+             py::object lens, py::int_ out, int batch, int hq, int hkv,
+             int page, int tbl_width, int dim, std::uintptr_t stream) {
+        const int* lp = nullptr;
+        if (!lens.is_none())
+            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        ft::attention_decode_paged_launch_fp16(
+            reinterpret_cast<const void*>((uintptr_t)q),
+            reinterpret_cast<const void*>((uintptr_t)k_pool),
+            reinterpret_cast<const void*>((uintptr_t)v_pool),
+            reinterpret_cast<const int*>((uintptr_t)table), lp,
+            reinterpret_cast<void*>((uintptr_t)out),
+            batch, hq, hkv, page, tbl_width, dim, stream);
+    }, py::arg("q"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("table"), py::arg("lens"), py::arg("out"), py::arg("batch"),
+       py::arg("hq"), py::arg("hkv"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("dim"), py::arg("stream") = 0);
+
+    // --- paged kv-cache append (v1.2): in-place scatter of one token ---
+    m.def("kv_append_paged_cpu",
+          [](FArray k_new, FArray v_new, IArray table, IArray lens,
+             FArray k_pool, FArray v_pool, int batch, int hkv, int dim,
+             int page, int tbl_width, int num_blocks) {
+        std::vector<int> tv(table.data(), table.data() + table.size());
+        std::vector<int> lv(lens.data(), lens.data() + lens.size());
+        // copy-in so the in-place host mutation stays out of numpy's view
+        // until the wrapper writes back
+        std::vector<float> kp(k_pool.data(), k_pool.data() + k_pool.size());
+        std::vector<float> vp(v_pool.data(), v_pool.data() + v_pool.size());
+        ft::kv_append_paged_cpu(to_vec(k_new), to_vec(v_new), tv, lv, kp,
+                                vp, batch, hkv, dim, page, tbl_width,
+                                num_blocks);
+        std::copy(kp.begin(), kp.end(), k_pool.mutable_data());
+        std::copy(vp.begin(), vp.end(), v_pool.mutable_data());
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("table"),
+       py::arg("lens"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("batch"), py::arg("hkv"), py::arg("dim"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("num_blocks"));
+
+    m.def("kv_append_paged",
+          [](FArray k_new, FArray v_new, IArray table, IArray lens,
+             FArray k_pool, FArray v_pool, int batch, int hkv, int dim,
+             int page, int tbl_width, int num_blocks) {
+        if (k_new.size() != (py::ssize_t)batch * hkv * dim ||
+            v_new.size() != k_new.size() ||
+            table.size() != (py::ssize_t)batch * tbl_width ||
+            lens.size() != (py::ssize_t)batch ||
+            k_pool.size() != (py::ssize_t)num_blocks * hkv * page * dim ||
+            v_pool.size() != k_pool.size())
+            throw std::invalid_argument("kv append operand size mismatch");
+        const size_t kv_bytes =
+            (size_t)num_blocks * hkv * page * dim * 4;
+        DevBuf dk_new(k_new.size() * 4), dv_new(v_new.size() * 4),
+              dt((size_t)batch * tbl_width * 4),
+              dl((size_t)batch * 4),
+              dkp(kv_bytes), dvp(kv_bytes);
+        h2d(dk_new.get(), k_new.data(), k_new.size() * 4);
+        h2d(dv_new.get(), v_new.data(), v_new.size() * 4);
+        h2d(dt.get(), table.data(), (size_t)batch * tbl_width * 4);
+        h2d(dl.get(), lens.data(), (size_t)batch * 4);
+        h2d(dkp.get(), k_pool.data(), kv_bytes);
+        h2d(dvp.get(), v_pool.data(), kv_bytes);
+        ft::kv_append_paged_launch(
+            dk_new.fget(), dv_new.fget(),
+            static_cast<const int*>(dt.get()),
+            static_cast<const int*>(dl.get()), dkp.fget(), dvp.fget(),
+            batch, hkv, dim, page, tbl_width);
+        d2h(k_pool.mutable_data(), dkp.get(), kv_bytes);
+        d2h(v_pool.mutable_data(), dvp.get(), kv_bytes);
+        sync_device("kv append paged kernel");
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("table"),
+       py::arg("lens"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("batch"), py::arg("hkv"), py::arg("dim"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("num_blocks"));
+
+    m.def("kv_append_paged_launch",
+          [](py::int_ k_new, py::int_ v_new, py::int_ table,
+             py::int_ lens, py::int_ k_pool, py::int_ v_pool, int batch,
+             int hkv, int dim, int page, int tbl_width,
+             std::uintptr_t stream) {
+        ft::kv_append_paged_launch(
+            df(k_new), df(v_new),
+            reinterpret_cast<const int*>((uintptr_t)table),
+            reinterpret_cast<const int*>((uintptr_t)lens), dfm(k_pool),
+            dfm(v_pool), batch, hkv, dim, page, tbl_width, stream);
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("table"),
+       py::arg("lens"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("batch"), py::arg("hkv"), py::arg("dim"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("stream") = 0);
+
+    m.def("kv_append_paged_launch_bf16",
+          [](py::int_ k_new, py::int_ v_new, py::int_ table,
+             py::int_ lens, py::int_ k_pool, py::int_ v_pool, int batch,
+             int hkv, int dim, int page, int tbl_width,
+             std::uintptr_t stream) {
+        ft::kv_append_paged_launch_bf16(
+            reinterpret_cast<const void*>((uintptr_t)k_new),
+            reinterpret_cast<const void*>((uintptr_t)v_new),
+            reinterpret_cast<const int*>((uintptr_t)table),
+            reinterpret_cast<const int*>((uintptr_t)lens),
+            reinterpret_cast<void*>((uintptr_t)k_pool),
+            reinterpret_cast<void*>((uintptr_t)v_pool),
+            batch, hkv, dim, page, tbl_width, stream);
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("table"),
+       py::arg("lens"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("batch"), py::arg("hkv"), py::arg("dim"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("stream") = 0);
+
+    m.def("kv_append_paged_launch_fp16",
+          [](py::int_ k_new, py::int_ v_new, py::int_ table,
+             py::int_ lens, py::int_ k_pool, py::int_ v_pool, int batch,
+             int hkv, int dim, int page, int tbl_width,
+             std::uintptr_t stream) {
+        ft::kv_append_paged_launch_fp16(
+            reinterpret_cast<const void*>((uintptr_t)k_new),
+            reinterpret_cast<const void*>((uintptr_t)v_new),
+            reinterpret_cast<const int*>((uintptr_t)table),
+            reinterpret_cast<const int*>((uintptr_t)lens),
+            reinterpret_cast<void*>((uintptr_t)k_pool),
+            reinterpret_cast<void*>((uintptr_t)v_pool),
+            batch, hkv, dim, page, tbl_width, stream);
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("table"),
+       py::arg("lens"), py::arg("k_pool"), py::arg("v_pool"),
+       py::arg("batch"), py::arg("hkv"), py::arg("dim"), py::arg("page"),
+       py::arg("tbl_width"), py::arg("stream") = 0);
+
     m.def("attention_prefill_cpu", [](FArray q, FArray k, FArray v,
                                       int batch, int hq, int hkv, int seq,
                                       int dim, bool causal) {

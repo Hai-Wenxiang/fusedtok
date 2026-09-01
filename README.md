@@ -39,6 +39,8 @@ traffic and launch overhead.
 | ✅ | qgemm | INT8 matmul, int32-exact: cp.async double-buffered pipelined IMMA GEMM with runtime tile tuning (64x64 / 128x128) + warp-per-row GEMV (M=1 decode; 2x vs fp16 projection) |
 | ✅ | qgemm_perchannel | the W8A8 layout real INT8 inference uses: per-output-channel weight scales fused into the same kernel's epilogue at zero cost |
 | ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths; **float32 / bfloat16 / float16 storage** (half-precision cache = half the decode bytes, softmax stays float32) |
+| ✅ | attention_decode_paged | the v1.2 headline: the same decode attention over a **vLLM-style block-pool kv-cache** `[Nb, Hkv, P, D]` walked through a per-sequence block table - fragmentation-free cache memory; any valid table honored, f32/bf16/fp16 storage, 1.06-1.07x the contiguous op (7.9x / 4.3x vs SDPA on the materialized reference) |
+| ✅ | kv_append_paged | the cache-write side of the paged loop: one fresh token's k/v rows per sequence scattered in place into the pool at position `lens[b]` (one tiny kernel, f32/bf16/fp16) |
 | ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional), float32 / bf16 / fp16 storage; convenience path - heavyweight prefill stays SDPA/flash territory (honest ~0.45x f32) |
 
 ## Install
@@ -120,6 +122,11 @@ out = fusedtok.attention_decode(
     q_heads,                                    # [B, Hq, D] new token
     k_cache, v_cache,                           # [B, Hkv, T, D]
     lens=torch.tensor([1023, 512], dtype=torch.int32, device="cuda"))
+# ...or over a paged (vLLM-style block-pool) cache: pools [Nb, Hkv, P, D]
+# + a per-sequence block table; append each new token, then decode
+fusedtok.kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens)
+out = fusedtok.attention_decode_paged(q_heads, k_pool, v_pool,
+                                      block_table, lens + 1)
 # fresh-sequence prefill (causal by default; convenience path)
 ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
 
@@ -173,7 +180,7 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 
 ## API stability
 
-1.0 freezes the public surface: the names in `fusedtok.__all__` (30
+1.0 freezes the public surface: the names in `fusedtok.__all__` (32
 operators + helpers) keep their signatures across the 1.x series.
 Type stubs (`__init__.pyi`, PEP 561 `py.typed`) ship with the package.
 New operators arrive in minor releases; breaking changes require a new
@@ -191,23 +198,24 @@ timed region). Largest shape per op; full data:
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| attention_decode (GQA) | T=16384, D=128 | 860 µs | 7627 µs (SDPA) | **8.87x** |
-| attention_decode bf16 | T=16384, D=128 | 859 µs | 1801 µs (SDPA bf16) | **2.10x** |
-| RoPE NeoX (q+k) | [8192×4096] | 1640 µs | 10044 µs | **6.12x** |
-| RMSNorm (+residual) | [4096×4096] | 612 µs | 2060 µs | **3.36x** |
-| SwiGLU | [4096×4096] | 608 µs | 1021 µs | **1.68x** |
-| top-k (k=50) | [131072] | 80 µs | 132 µs | **1.66x** |
-| top-k (k=4096, mid-k) | [131072] | 112 µs | 193 µs | **1.72x** |
-| LayerNorm | [4096×4096] | 442 µs | 611 µs | **1.38x** |
-| Softmax | [4096×4096] | 411 µs | 433 µs | 1.05x |
-| SiLU / GeLU / add | [4096×4096] | ~410-610 µs | ~410-607 µs | ~1.0x |
-| sample_topk k=50 | [131072] | 159 µs | 309 µs (topk+multinomial) | **1.94x** |
-| sample_topp p=0.9 (peaked) | [131072] | 145 µs | 406 µs (sort+mask+multinomial) | **2.81x** |
-| sample_topp p=0.9 (flat worst case) | [131072] | 13858 µs | 379 µs | 0.03x (honest, see below) |
-| argmax | [131072] | 45 µs | 45 µs | 1.00x (incl. host readback) |
-| int8 qgemm (IMMA) | [4096×11008×4096] | 9522 µs (38.8 TOPS) | 4521 µs (cuBLASLt) | 0.47x (honest) |
-| int8 qgemm pc (W8A8) | [4096×4096×4096] | 3519 µs (39.1 TOPS) | 2056 µs (cuBLASLt + broadcast) | 0.58x (honest) |
-| attention_prefill (causal) | S=1024, D=128 | 5775 µs | 2602 µs (SDPA flash) | 0.45x (honest) |
+| attention_decode (GQA) | T=16384, D=128 | 856 µs | 7608 µs (SDPA) | **8.89x** |
+| attention_decode_paged (GQA) | T=16384, D=128, P=16 | 959 µs | 7606 µs (SDPA) | **7.93x** |
+| attention_decode bf16 | T=16384, D=128 | 851 µs | 1790 µs (SDPA bf16) | **2.10x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1637 µs | 10054 µs | **6.14x** |
+| RMSNorm (+residual) | [4096×4096] | 612 µs | 2063 µs | **3.37x** |
+| sample_topp p=0.9 (peaked) | [131072] | 152 µs | 407 µs (sort+mask+multinomial) | **2.69x** |
+| sample_topk k=50 | [131072] | 152 µs | 291 µs (topk+multinomial) | **1.91x** |
+| SwiGLU | [4096×4096] | 606 µs | 1026 µs | **1.69x** |
+| top-k (k=50) | [131072] | 87 µs | 141 µs | **1.62x** |
+| top-k (k=4096, mid-k) | [131072] | 116 µs | 159 µs | **1.36x** |
+| LayerNorm | [4096×4096] | 447 µs | 615 µs | **1.38x** |
+| Softmax | [4096×4096] | 410 µs | 434 µs | **1.06x** |
+| SiLU / GeLU / add | [4096×4096] | ~410-609 µs | ~411-611 µs | ~1.0x |
+| argmax | [131072] | 54 µs | 39 µs | 0.73x (event-timed, noisy on WDDM; wall probe 1.12x - see below) |
+| int8 qgemm (IMMA) | [4096×11008×4096] | 9467 µs (38.9 TOPS) | 4505 µs (cuBLASLt) | 0.48x (honest) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 3532 µs (38.8 TOPS) | 2063 µs (cuBLASLt + broadcast) | 0.58x (honest) |
+| attention_prefill (causal) | S=1024, D=128 | 5723 µs | 2575 µs (SDPA flash) | 0.45x (honest) |
+| sample_topp p=0.9 (flat worst case) | [131072] | 2141 µs | 356 µs | 0.17x (honest, see below) |
 
 Row-wise kernels (norms, softmax) autotune their thread-block size per
 shape at first call (v0.4.1); the table reflects the tuned choices.
@@ -219,21 +227,22 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8371 µs | **6.05x** |
-| attention_decode (GQA) | T=16384, D=128 | 574 µs | 2681 µs (SDPA) | **4.67x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1384 µs | 8370 µs | **6.05x** |
+| attention_decode (GQA) | T=16384, D=128 | 573 µs | 2682 µs (SDPA) | **4.68x** |
+| attention_decode_paged (GQA) | T=16384, D=128, P=16 | 624 µs | 2681 µs (SDPA) | **4.29x** |
 | attention_decode bf16 | T=16384, D=128 | 548 µs | 640 µs (SDPA bf16) | **1.17x** |
-| RMSNorm (+residual) | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
+| RMSNorm (+residual) | [4096×4096] | 505 µs | 1657 µs | **3.28x** |
+| sample_topp p=0.9 (peaked) | [131072] | 63 µs | 156 µs (sort+mask+multinomial) | **2.48x** |
+| sample_topk k=50 | [131072] | 46 µs | 93 µs (topk+multinomial) | **2.04x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
-| top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.53x** |
-| top-k (k=4096, mid-k) | [131072] | 49 µs | 54 µs (CUB) | 1.11x |
-| LayerNorm / Softmax | [4096×4096] | ~345 µs | ~348 µs | 1.0x |
-| sample_topk k=50 | [131072] | 46 µs | 94 µs (topk+multinomial) | **2.04x** |
-| sample_topp p=0.9 (peaked) | [131072] | 63 µs | 155 µs (sort+mask+multinomial) | **2.48x** |
-| sample_topp p=0.9 (flat worst case) | [131072] | 9944 µs | 158 µs | 0.02x (honest, see below) |
-| argmax | [131072] | 17 µs | 14 µs | 0.84x (incl. host readback) |
-| int8 qgemm (IMMA) | [4096×11008×4096] | 5483 µs (67.4 TOPS) | 2201 µs (cuBLASLt) | 0.40x (honest) |
-| int8 qgemm pc (W8A8) | [4096×4096×4096] | 2078 µs (66.1 TOPS) | 1142 µs (cuBLASLt + broadcast) | 0.55x (honest) |
-| attention_prefill (causal) | S=1024, D=128 | 3294 µs | 1425 µs (SDPA flash) | 0.43x (honest) |
+| top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.51x** |
+| top-k (k=4096, mid-k) | [131072] | 50 µs | 54 µs (CUB) | 1.09x |
+| LayerNorm / Softmax | [4096×4096] | ~343-346 µs | ~344-351 µs | ~1.0x |
+| argmax | [131072] | 17 µs | 14 µs | 0.83x (event-timed, noisy; wall probe 0.96x) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 2078 µs (66.1 TOPS) | 1140 µs (cuBLASLt + broadcast) | 0.55x (honest) |
+| attention_prefill (causal) | S=1024, D=128 | 3295 µs | 1421 µs (SDPA flash) | 0.43x (honest) |
+| int8 qgemm (IMMA) | [4096×11008×4096] | 5477 µs (67.4 TOPS) | 2195 µs (cuBLASLt) | 0.40x (honest) |
+| sample_topp p=0.9 (flat worst case) | [131072] | 1618 µs | 166 µs | 0.10x (honest, see below) |
 
 On smaller shapes the Blackwell card shows bigger wins (softmax 2.5x,
 RMSNorm 3.2x at 256 rows, attention decode 3.78x at T=4096 running
@@ -252,17 +261,23 @@ cached CUDA graph) beats torch's CUB radix select at small k on both
 GPUs; the v1.0 retune (in-block-sort threshold and sort chunk both
 dropped 2048 -> 1024 - a single block bitonic-sorting 2048 keys was the
 whole mid-k regression) brings the mid-k window to parity-or-winning as
-well (k=4096 @131k: 1.72x / 1.11x). The fused samplers win against the
+well (k=4096 @131k: 1.36x / 1.09x). The fused samplers win against the
 eager composites when the logits look like real decode output
-(sample_topp peaked: 2.81x / 2.48x; sample_topk: 1.94x / 2.04x); on a
-FLAT distribution sample_topp is honestly 0.02-0.03x - the nucleus then
-spans most of the vocab, the widening loop reruns the pipeline on
-ever-larger windows (x8 jumps since 1.0.1), and the final serial scan
-is single-threaded by design (documented since v0.4; torch's fully
-parallel sort handles that regime natively).
-attention_decode wins
+(sample_topp peaked: 2.69x / 2.48x; sample_topk: 1.91x / 2.04x); on a
+FLAT distribution sample_topp is honestly 0.10-0.17x — the nucleus then
+spans ~90% of the vocabulary and the pipeline must effectively order
+the whole thing. v1.2 cut that worst case ~8.5x (18.2ms -> 2.2ms at
+n=131072 on a 3060) with three token-preserving changes - an adaptive
+window jump driven by a p*total mass bound, a full-vocabulary fast
+path that skips the selection stages, and a batched-load serial sampling
+walk (the strictly sequential float adds ARE the CPU-parity determinism
+contract; only the loads got pipelined) - but torch's fully parallel
+sort still owns that regime. attention_decode wins
 big at decode (one launch streams the GQA cache once at up to ~156 GB/s
 effective while SDPA pays head expansion or small-query inefficiency);
+attention_decode_paged (v1.2) pays only 1.06-1.07x for the block-table
+indirection of the fragmentation-free vLLM-style cache layout, with
+bit-identical output on matching slice schedules;
 attention_prefill is the honest convenience path at ~0.45x of SDPA's
 flash backend — no tensor cores by design, so heavyweight prefill stays
 with SDPA/FlashAttention. The INT8 decode GEMV moves half the bytes of
@@ -280,8 +295,14 @@ zero kernel cost — the composite torch reference pays for that
 broadcast separately, which is where its 0.55-0.58x comes from.
 
 All sampling rows above measure FIXED logits since 1.1.1 (the bench
-seeds torch's RNG): run-to-run comparison of the JSONs is exact, where
-earlier runs sampled fresh draws each time.
+seeds torch's RNG); since v1.2 the peaked row spikes +20 and the flat
+row uses near-uniform logits — both regimes are now deterministically
+what their labels say (the v1.1 peaked row sat on the coverage boundary
+at n=131072 and flipped regimes per seed). The argmax rows are
+event-timed over a host-synchronized call and swing on WDDM
+(0.73-1.24x across runs); wall-clock probes with the sync excluded
+from the timed loop measure 1.12x (3060) / 0.96x (5060 Ti) — v1.2
+removed one CUDA submission and one allocation per call.
 
 ## Development
 
@@ -329,6 +350,13 @@ suite on every push.
   `attention_prefill` accept bfloat16 and float16 caches (float32
   compute, half the decode bytes); parallel exp precompute halves the
   flat-distribution sampling worst case with bit-identical tokens
+- 1.2 (released): paged kv-cache attention — `attention_decode_paged`
+  over a vLLM-style block pool `[Nb, Hkv, P, D]` + per-sequence block
+  tables (1.06-1.07x the contiguous op, any valid table honored) and
+  `kv_append_paged` (the in-place cache-write side); flat-distribution
+  sampling worst case cut ~8.5x (adaptive widening jump + full-vocab
+  fast path + batched-load serial walk, tokens bit-identical); argmax
+  launch diet (one submission and one allocation less per call)
 
 ## Community
 

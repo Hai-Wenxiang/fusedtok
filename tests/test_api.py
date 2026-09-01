@@ -46,7 +46,9 @@ FROZEN_API = frozenset({
     "qgemm_perchannel",
     "decode_step",
     "attention_decode",
+    "attention_decode_paged",
     "attention_prefill",
+    "kv_append_paged",
 })
 
 

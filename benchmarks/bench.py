@@ -220,18 +220,28 @@ def main():
 
         # TWO regimes, honestly labeled: PEAKED logits (a dominant token -
         # the decode-time case, covered by the first sampling window) and
-        # FLAT logits (worst case: the nucleus spans most of the vocab and
-        # the widening loop reruns the pipeline on ever-larger windows)
+        # FLAT logits (worst case: the nucleus spans ~p*n of the vocab, so
+        # the first window cannot cover it). v1.2 notes: the peaked spike
+        # is +20 because +10 at n=131072 sits ON the coverage boundary -
+        # the max-normalized tail carries ~11% of the mass and p=0.9
+        # needs 10%, so the row was a per-seed coin flip between the
+        # fast first-window path and a several-thousand-token nucleus
+        # (measured: nucleus 6855 wide on one seed, instant on another).
+        # +20 makes the top-1 mass ~1/T with a vanishing tail: the row
+        # measures what its label says. The "flat" row uses near-uniform
+        # logits (randn * 1e-3) for the same reason (v1.1's plain randn
+        # nucleus was only ~8k wide - a mid-tail, not the worst case).
         peaked = torch.randn(vocab, device="cuda")
-        peaked[peaked.argmax()] += 10.0
+        peaked[peaked.argmax()] += 20.0
         record("sample_topp peaked", f"[{vocab}]",
-               lambda: fusedtok.sample_topp(peaked, 0.9),
-               lambda: torch_sample_topp_flat(peaked),
-               max(20, iters // 4))
+                lambda: fusedtok.sample_topp(peaked, 0.9),
+                lambda: torch_sample_topp_flat(peaked),
+                max(20, iters // 4))
+        flat_logits = torch.randn(vocab, device="cuda") * 1e-3
         record("sample_topp flat (worst)", f"[{vocab}]",
-               lambda: fusedtok.sample_topp(logits, 0.9),
-               lambda: torch_sample_topp_flat(logits),
-               max(10, iters // 6))
+                lambda: fusedtok.sample_topp(flat_logits, 0.9),
+                lambda: torch_sample_topp_flat(flat_logits),
+                max(10, iters // 6))
 
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),
@@ -300,6 +310,26 @@ def main():
                    qb.unsqueeze(2), kkb, vvb).squeeze(2),
                max(20, iters // 2),
                bytes_moved=(2 * kb.numel() + qb.numel() * 2) * 2)
+        # paged variant (v1.2): the same cache content in a block pool
+        # (P=16) walked through a shuffled block table; the SDPA
+        # reference reads the materialized contiguous cache - the row
+        # measures the paging indirection against the same math
+        if cache_rows == 16384:
+            page = 16
+            width = cache_rows // page
+            perm = torch.randperm(width)
+            pool_k = torch.zeros(width, hkv, page, d, device="cuda")
+            pool_v = torch.zeros(width, hkv, page, d, device="cuda")
+            for sidx in range(width):
+                pool_k[perm[sidx]] = k[:, :, sidx * page:(sidx + 1) * page]
+                pool_v[perm[sidx]] = v[:, :, sidx * page:(sidx + 1) * page]
+            table = perm.unsqueeze(0).to(torch.int32)
+            record("attn decode paged", f"T={cache_rows}",
+                   lambda: fusedtok.attention_decode_paged(q, pool_k,
+                                                           pool_v, table),
+                   lambda: torch.nn.functional.scaled_dot_product_attention(
+                       q.unsqueeze(2), kk, vv).squeeze(2),
+                   max(20, iters // 2), bytes_moved=kv_bytes)
 
     b, hq, hkv, d, s = 1, 32, 8, 128, 1024
     qp = torch.randn(b, hq, s, d, device="cuda")
