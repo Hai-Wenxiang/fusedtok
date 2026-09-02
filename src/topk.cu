@@ -38,15 +38,15 @@
 //   stage 4a - k <= kSelEarlyOut: the emit kernel's last block sorts the
 //     k keys in shared memory, decodes values/indices, and (in nucleus /
 //     sampling mode) runs the serial mass scan - one launch finishes.
-//   stage 4b - k > kSelEarlyOut: chunk sort (per-block 2048-key shared
-//     bitonic) + a merge ladder with ONE plain launch per level
+//   stage 4b - k > kSelEarlyOut: chunk sort (per-block kSelSortChunk-key
+//     shared bitonic) + a merge ladder with ONE plain launch per level
 //     (merge-path co-rank tiles), then an elementwise decode kernel and,
 //     for top-p, a two-kernel parallel nucleus count.
 //
 // Workspace (histogram, tickets, counters, key buffers) is process-cached
 // and grown on demand: per-call cudaMalloc/cudaFree would synchronize the
 // device and serialize repeated invocations (and break CUDA graph
-// capture). A fixed 265-word head is zeroed with one async memset per
+// capture). A fixed kWsHead-word head is zeroed with one async memset per
 // call; all later state flows through that region.
 //
 // Devices without cooperative launch: no longer special-cased - plain
@@ -62,9 +62,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <climits>
 #include <cmath>
-#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -104,6 +102,15 @@ constexpr int kSelEarlyOut = 1024;
 constexpr int kSelMergeTile = 256;
 // grid cap for the pipelined kernels (ticket scans stay short)
 constexpr int kMaxGrid = 1024;
+// Nucleus-scan scratch reserved between the key buffers and the args
+// block: topp_partial_kernel writes ONE float per block and its grid is
+// capped at kMaxGrid blocks, so the reserve must hold kMaxGrid floats
+// (kMaxGrid/2 u64 words). The old 256-word reserve (512 floats) was
+// exactly enough for n = 512*256 = 131072 - the suite's largest vocab -
+// and vocabularies beyond that (e.g. Qwen's 152064) overflowed into the
+// SelArgs block and corrupted the output pointers (fixed in 1.2.1).
+constexpr int kWsScanWords =
+    kMaxGrid * (int)sizeof(float) / (int)sizeof(unsigned long long);
 
 // Workspace head layout (unsigned long long words). The head is zeroed
 // by one async memset at the start of every call; the tail (candidates +
@@ -113,18 +120,17 @@ constexpr int kWsEmit = 257;        // emit counter
 constexpr int kWsTie = 258;         // tie counter
 constexpr int kWsPrefix = 259;      // refinement prefix / final k_min
 constexpr int kWsRemaining = 260;   // keys still needed / tie_take
-constexpr int kWsSurvivors = 261;   // boundary-bin population (info)
-constexpr int kWsStage = 262;       // 0 refine | 1 compact next | 2 done
-constexpr int kWsCandCnt = 263;     // compaction counter
-constexpr int kWsToken = 264;       // sampled token slot (int)
-constexpr int kWsExpMax = 265;      // global logit max, fkey bits (sample)
-constexpr int kWsTotal = 266;       // global softmax total (float, sample)
-constexpr int kWsLevelDone = 268;   // level of the last completed round
+constexpr int kWsStage = 261;       // 0 refine | 1 compact next | 2 done
+constexpr int kWsCandCnt = 262;     // compaction counter
+constexpr int kWsToken = 263;       // sampled token slot (int)
+constexpr int kWsExpMax = 264;      // global logit max, fkey bits (sample)
+constexpr int kWsTotal = 265;       // global softmax total (float, sample)
 // cumulated softmax mass of the whole (failed) sampling window: written
 // by the sampling tail whenever the nucleus is not covered, read by the
 // host to sharpen the widening jump (widen_window). Lives next to
 // kWsTotal so one 8-byte readback fetches both.
-constexpr int kWsCumW = 267;        // window cum mass (sample, float)
+constexpr int kWsCumW = 266;        // window cum mass (sample, float)
+constexpr int kWsLevelDone = 267;   // level of the last completed round
 // argmax-dedicated slots (NOT shared with the selection pipeline): the
 // selection ticket/emit counters can be non-zero after a call, so argmax
 // cannot rely on the per-call head memset alone. These two words hold the
@@ -133,18 +139,19 @@ constexpr int kWsCumW = 267;        // window cum mass (sample, float)
 // which makes the per-call cudaMemsetAsync redundant (one launch saved on
 // every argmax call - the dominant cost of this op on submission-bound
 // hosts; WDDM measured ~20-30us per extra launch).
-constexpr int kWsArgBest = 269;     // argmax packed-key max (self-resetting)
-constexpr int kWsArgCnt = 270;      // argmax arrival counter (self-resetting)
-constexpr int kWsHead = 271;
-constexpr int kWsCand = kWsHead;               // candidates [0, 2048)
+constexpr int kWsArgBest = 268;     // argmax packed-key max (self-resetting)
+constexpr int kWsArgCnt = 269;      // argmax arrival counter (self-resetting)
+constexpr int kWsHead = 270;
+constexpr int kWsCand = kWsHead;               // candidates [0, kSelEarlyOut)
 constexpr int kWsKeys = kWsHead + kSelEarlyOut;  // key buffer A (m words)
 
 // ---------------------------------------------------------------------------
 // process-cached workspace
 // ---------------------------------------------------------------------------
 
-// Layout: [0..kWsHead) control head (zeroed per call), [kWsCand..+2048)
-// early-exit candidates, then key buffer A (m words), key buffer B (m
+// Layout: [0..kWsHead) control head (zeroed per call), [kWsCand..+
+// kSelEarlyOut) early-exit candidates, then key buffer A (m words), key
+// buffer B (m
 // words, merge scratch), then 1024 floats of block-sum scratch for the
 // big-path nucleus count. Guarded by a mutex; never freed (bounded by the
 // largest call). Not safe for concurrent selection launches on different
@@ -232,7 +239,7 @@ struct SelArgs {
 
 // Device-side arg slot for a given pad size m (after the scan scratch).
 inline size_t sel_args_off(int m) {
-    return kWsHead + (size_t)kSelEarlyOut + 2 * (size_t)m + 256;
+    return kWsHead + (size_t)kSelEarlyOut + 2 * (size_t)m + kWsScanWords;
 }
 
 // Pinned host mirror as a rotating ring: the CPU may rewrite the args
@@ -411,7 +418,6 @@ __global__ void select_round_kernel(const SelArgs* __restrict__ a,
             if (acc + c >= remaining) {
                 ws[kWsPrefix] = prefix | ((unsigned long long)b << (8 * level));
                 ws[kWsRemaining] = remaining - acc;
-                ws[kWsSurvivors] = c;
                 ws[kWsLevelDone] = (unsigned long long)level;
                 // Small boundary bin: the finalize launch compacts + sorts
                 // these survivors instead of histogramming again.
@@ -1211,10 +1217,10 @@ void select_common(const float* x, float* vals, long long* idxs,
     cudaStream_t cs = (cudaStream_t)stream;
     int m = 1;
     while (m < k) m <<= 1;                        // sort pad size
-    // candidates + two m-word key buffers + 1024 floats of scan scratch
-    // + the per-call args block
+    // candidates + two m-word key buffers + kMaxGrid floats of scan
+    // scratch + the per-call args block
     unsigned long long* ws =
-        selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m + 256 +
+        selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m + kWsScanWords +
                             sizeof(SelArgs) / sizeof(unsigned long long));
     SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
     // outer capture in progress (torch.cuda.graph): contribute the raw
@@ -1372,7 +1378,7 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
         // Grow the workspace BEFORE presetting the token slot: the growth
         // would otherwise free the buffer the slot lives in.
         unsigned long long* ws =
-            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m + 256 +
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m + kWsScanWords +
                                 sizeof(SelArgs) / sizeof(unsigned long long));
         cudaStream_t cs = (cudaStream_t)stream;
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
@@ -1486,7 +1492,7 @@ long long decode_step_launch(const float* x, const long long* ids,
         int mm = 1;
         while (mm < window) mm <<= 1;
         unsigned long long* ws = selection_workspace(
-            (size_t)kSelEarlyOut + 2 * (size_t)mm + 256 + bitmap_words +
+            (size_t)kSelEarlyOut + 2 * (size_t)mm + kWsScanWords + bitmap_words +
             sizeof(SelArgs) / sizeof(unsigned long long));
         // bitmap lives right after the args block; it must be zeroed on
         // every (re)try because the marking kernel ORs bits in - zero
@@ -1619,7 +1625,7 @@ long long sample_topk_launch(const float* x, int n, int k, float t,
     int mm = 1;
     while (mm < k) mm <<= 1;                      // sort pad size
     unsigned long long* ws =
-        selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)mm + 256 +
+        selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)mm + kWsScanWords +
                             sizeof(SelArgs) / sizeof(unsigned long long));
     SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(mm));
     int* token_out = reinterpret_cast<int*>(ws + kWsToken);
@@ -1743,7 +1749,7 @@ void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream) {
     unsigned long long* best = ws + kWsArgBest;
     const int grid = (int)((n + kSelBlock - 1) / kSelBlock);
     argmax_kernel<<<grid, kSelBlock, 0, (cudaStream_t)stream>>>(
-        x, best, reinterpret_cast<unsigned int*>(best + 1), n, out);
+        x, best, reinterpret_cast<unsigned int*>(ws + kWsArgCnt), n, out);
     check_launch("argmax kernel launch");
 }
 

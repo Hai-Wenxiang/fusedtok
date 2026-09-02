@@ -19,7 +19,6 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
-#include <type_traits>
 
 namespace fusedtok {
 

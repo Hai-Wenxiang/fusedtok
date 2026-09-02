@@ -93,7 +93,8 @@ long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
                           unsigned long long seed);
 
 // ---------------------------------------------------------------------------
-// INT8 symmetric per-tensor quantization (storage path; GEMM is v0.4+):
+// INT8 symmetric per-tensor quantization (the storage half; the compute
+// half - IMMA qgemm / decode GEMV - is declared just below):
 //   scale = max(|x|) / 127; q = clamp(round(x / scale), -127, 127)
 // ---------------------------------------------------------------------------
 

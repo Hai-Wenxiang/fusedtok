@@ -46,8 +46,10 @@ __global__ void rope_kernel(const T* x, T* y, int seq, int dim,
     int j = p - row * pairs_per_row;                 // pair index within row
     int m = row + pos_offset;                        // absolute position
 
-    const float inv_log2_theta = log2f(theta);
-    float freq = exp2f(-(2.0f * j / dim) * inv_log2_theta);
+    // freq = theta^(-2j/dim) computed as exp2(-(2j/dim) * log2(theta)):
+    // one log2 per thread, SFU exp2 instead of powf
+    const float log2_theta = log2f(theta);
+    float freq = exp2f(-(2.0f * j / dim) * log2_theta);
     float angle = m * freq;
     float c, s;
     sincosf(angle, &s, &c);
@@ -73,8 +75,10 @@ __global__ void rope_neox_kernel(const T* x, T* y, int seq, int dim,
     int j = p - row * half;
     int m = row + pos_offset;
 
-    const float inv_log2_theta = log2f(theta);
-    float freq = exp2f(-(2.0f * j / dim) * inv_log2_theta);
+    // freq = theta^(-2j/dim) computed as exp2(-(2j/dim) * log2(theta)):
+    // one log2 per thread, SFU exp2 instead of powf
+    const float log2_theta = log2f(theta);
+    float freq = exp2f(-(2.0f * j / dim) * log2_theta);
     float angle = m * freq;
     float c, s;
     sincosf(angle, &s, &c);

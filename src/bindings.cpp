@@ -138,6 +138,15 @@ const long long* dll(py::int_ p) { return reinterpret_cast<const long long*>((ui
 long long* dllm(py::int_ p) { return reinterpret_cast<long long*>((uintptr_t)p); }
 int* dim_(py::int_ p) { return reinterpret_cast<int*>((uintptr_t)p); }
 
+// Optional device pointer from an optional tensor-like argument: py::none
+// (or an omitted default) becomes nullptr. Used for the attention `lens`
+// and friends, whose "not provided" case means "use the full cache".
+const int* opt_int_ptr(const py::object& o) {
+    if (o.is_none())
+        return nullptr;
+    return reinterpret_cast<const int*>((uintptr_t)py::int_(o));
+}
+
 // ---------------------------------------------------------------------------
 // Staged CUDA drivers for elementwise ops (numpy in -> numpy out)
 // ---------------------------------------------------------------------------
@@ -319,7 +328,8 @@ PYBIND11_MODULE(_fusedtok, m) {
         py::arg("out"), py::arg("n"), py::arg("stream") = 0);
     m.def("rmsnorm_launch_bf16", [dbf, dbfm](py::int_ x, py::int_ w, py::object r,
                                              py::int_ out, int rows, int cols, float eps, std::uintptr_t stream) {
-        const float* rp_f = nullptr;   // residual is bf16 like x
+        // residual shares x's bf16 storage (the wrapper enforces the
+        // dtype match), so it rides the BF* path directly
         const BF* rp = r.is_none()
             ? nullptr
             : reinterpret_cast<const BF*>((uintptr_t)py::int_(r));
@@ -543,13 +553,6 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("neox"), py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
        py::arg("theta"), py::arg("pos_offset"), py::arg("stream") = 0);
 
-    // explicit-layout aliases (float32)
-    m.def("rope_neox_launch", [](py::int_ in, py::int_ out, int seq, int dim,
-                                 double theta, int pos_offset, std::uintptr_t stream) {
-        ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset, stream);
-    }, py::arg("in"), py::arg("out"), py::arg("seq"), py::arg("dim"),
-       py::arg("theta"), py::arg("pos_offset"), py::arg("stream") = 0);
-
     // ==================================================================
     // Sampling / logits post-processing
     // ==================================================================
@@ -574,7 +577,7 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("topk_cpu", [](FArray x, int k) {
         if (x.ndim() != 1) throw std::invalid_argument("topk expects 1-D input");
-        if (k < 0 || (size_t)k > x.size())
+        if (k < 0 || (py::ssize_t)k > x.size())
             throw std::invalid_argument("k must be in [0, n]");
         auto [vals, idxs] = ft::topk_cpu(to_vec(x), k);
         return py::make_tuple(wrap_vec(vals, {(py::ssize_t)k}), wrap_ivec(idxs));
@@ -764,6 +767,17 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     // Zero-copy torch path: device pointer in, token out (the one-int
     // readback is inherent to returning a host value).
+    m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
+                                   unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
+        if (!(p > 0.0 && p <= 1.0))
+            throw std::invalid_argument("p must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_topp_launch(df(x), n, (float)p, (float)t, seed, stream);
+    }, py::arg("logits"), py::arg("n"), py::arg("p"), py::arg("t"),
+       py::arg("seed"), py::arg("stream") = 0);
+
     // ==================================================================
     // INT8 symmetric per-tensor quantization
     // ==================================================================
@@ -829,10 +843,12 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("a"), py::arg("b"), py::arg("m"), py::arg("n"), py::arg("k"),
        py::arg("sa"), py::arg("sb"));
 
-    m.def("qgemm", [](py::array_t<signed char, py::array::c_style> a,
-                      py::array_t<signed char, py::array::c_style> b,
-                      int m, int n, int k, float sa, float sb) {
-        // staged: copy both operands up, run, copy the result back
+    // staged qgemm driver shared by the per-tensor and per-channel
+    // flavors: identical validation, uploads and readback; only the
+    // launcher differs (the per-channel wrapper uploads its own scale
+    // vector alongside)
+    auto staged_gemm = [&](const auto& a, const auto& b, int m, int n,
+                           int k, const char* sync_what, auto&& launch) {
         if (a.size() != (py::ssize_t)m * k || b.size() != (py::ssize_t)n * k)
             throw std::invalid_argument("qgemm operand size mismatch");
         if ((long long)m * n * k > (1LL << 38))
@@ -843,14 +859,24 @@ PYBIND11_MODULE(_fusedtok, m) {
         DevBuf dy((size_t)m * n * 4);
         // the launcher no-ops empty operands and zero-fills K == 0
         if (m > 0 && n > 0)
-            ft::qgemm_launch(reinterpret_cast<const signed char*>(da.fget()),
-                             reinterpret_cast<const signed char*>(db.fget()),
-                             dy.fget(), m, n, k, sa, sb, 0);
+            launch(reinterpret_cast<const signed char*>(da.fget()),
+                   reinterpret_cast<const signed char*>(db.fget()),
+                   dy.fget());
         py::array_t<float> out(std::vector<py::ssize_t>{m, n});
         if ((long long)m * n > 0)
             d2h(out.mutable_data(), dy.get(), (size_t)m * n * 4);
-        sync_device("qgemm kernel");
+        sync_device(sync_what);
         return out;
+    };
+
+    m.def("qgemm", [&](py::array_t<signed char, py::array::c_style> a,
+                       py::array_t<signed char, py::array::c_style> b,
+                       int m, int n, int k, float sa, float sb) {
+        return staged_gemm(
+            a, b, m, n, k, "qgemm kernel",
+            [&](const signed char* da, const signed char* db, float* dy) {
+                ft::qgemm_launch(da, db, dy, m, n, k, sa, sb, 0);
+            });
     }, py::arg("a"), py::arg("b"), py::arg("m"), py::arg("n"), py::arg("k"),
        py::arg("sa"), py::arg("sb"));
 
@@ -889,33 +915,20 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("a"), py::arg("b"), py::arg("sb"), py::arg("m"), py::arg("n"),
        py::arg("k"), py::arg("sa"));
 
-    m.def("qgemm_perchannel", [](py::array_t<signed char, py::array::c_style> a,
-                                 py::array_t<signed char, py::array::c_style> b,
-                                 FArray sb, int m, int n, int k, float sa) {
-        // staged: copy operands + scale vector up, run, copy the result back
-        if (a.size() != (py::ssize_t)m * k || b.size() != (py::ssize_t)n * k)
-            throw std::invalid_argument("qgemm operand size mismatch");
+    m.def("qgemm_perchannel", [&](py::array_t<signed char, py::array::c_style> a,
+                                  py::array_t<signed char, py::array::c_style> b,
+                                  FArray sb, int m, int n, int k, float sa) {
         if (sb.size() != n)
             throw std::invalid_argument("per-channel scale vector must have n entries");
-        if ((long long)m * n * k > (1LL << 38))
-            throw std::invalid_argument("qgemm operands too large");
-        DevBuf da(a.size()), db(b.size()), dsb((size_t)n * 4);
-        h2d(da.get(), a.data(), a.size());
-        h2d(db.get(), b.data(), b.size());
+        DevBuf dsb((size_t)n * 4);          // outlives the launch below
         h2d(dsb.get(), sb.data(), (size_t)n * 4);
-        DevBuf dy((size_t)m * n * 4);
-        // the launcher no-ops empty operands and zero-fills K == 0
-        if (m > 0 && n > 0)
-            ft::qgemm_perchannel_launch(
-                reinterpret_cast<const signed char*>(da.fget()),
-                reinterpret_cast<const signed char*>(db.fget()),
-                reinterpret_cast<const float*>(dsb.fget()),
-                dy.fget(), m, n, k, sa, 0);
-        py::array_t<float> out(std::vector<py::ssize_t>{m, n});
-        if ((long long)m * n > 0)
-            d2h(out.mutable_data(), dy.get(), (size_t)m * n * 4);
-        sync_device("qgemm per-channel kernel");
-        return out;
+        return staged_gemm(
+            a, b, m, n, k, "qgemm per-channel kernel",
+            [&](const signed char* da, const signed char* db, float* dy) {
+                ft::qgemm_perchannel_launch(
+                    da, db, reinterpret_cast<const float*>(dsb.fget()),
+                    dy, m, n, k, sa, 0);
+            });
     }, py::arg("a"), py::arg("b"), py::arg("sb"), py::arg("m"), py::arg("n"),
        py::arg("k"), py::arg("sa"));
 
@@ -1038,9 +1051,7 @@ PYBIND11_MODULE(_fusedtok, m) {
                                         int batch, int hq, int hkv,
                                         int t_seq, int dim,
                                         std::uintptr_t stream) {
-        const int* lp = nullptr;
-        if (!lens.is_none())
-            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        const int* lp = opt_int_ptr(lens);
         ft::attention_decode_launch(df(q), df(k), df(v), lp, dfm(out),
                                     batch, hq, hkv, t_seq, dim, stream);
     }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("lens"),
@@ -1053,9 +1064,7 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ q, py::int_ k, py::int_ v, py::object lens,
              py::int_ out, int batch, int hq, int hkv, int t_seq, int dim,
              std::uintptr_t stream) {
-        const int* lp = nullptr;
-        if (!lens.is_none())
-            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        const int* lp = opt_int_ptr(lens);
         ft::attention_decode_launch_bf16(
             reinterpret_cast<const void*>((uintptr_t)q),
             reinterpret_cast<const void*>((uintptr_t)k),
@@ -1070,9 +1079,7 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ q, py::int_ k, py::int_ v, py::object lens,
              py::int_ out, int batch, int hq, int hkv, int t_seq, int dim,
              std::uintptr_t stream) {
-        const int* lp = nullptr;
-        if (!lens.is_none())
-            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        const int* lp = opt_int_ptr(lens);
         ft::attention_decode_launch_fp16(
             reinterpret_cast<const void*>((uintptr_t)q),
             reinterpret_cast<const void*>((uintptr_t)k),
@@ -1172,13 +1179,11 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ q, py::int_ k_pool, py::int_ v_pool, py::int_ table,
              py::object lens, py::int_ out, int batch, int hq, int hkv,
              int page, int tbl_width, int dim, std::uintptr_t stream) {
-        const int* lp = nullptr;
-        if (!lens.is_none())
-            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
-        ft::attention_decode_paged_launch(
-            df(q), df(k_pool), df(v_pool),
-            reinterpret_cast<const int*>((uintptr_t)table), lp, dfm(out),
-            batch, hq, hkv, page, tbl_width, dim, stream);
+         const int* lp = opt_int_ptr(lens);
+         ft::attention_decode_paged_launch(
+             df(q), df(k_pool), df(v_pool),
+             reinterpret_cast<const int*>((uintptr_t)table), lp, dfm(out),
+             batch, hq, hkv, page, tbl_width, dim, stream);
     }, py::arg("q"), py::arg("k_pool"), py::arg("v_pool"),
        py::arg("table"), py::arg("lens"), py::arg("out"), py::arg("batch"),
        py::arg("hq"), py::arg("hkv"), py::arg("page"),
@@ -1188,10 +1193,8 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ q, py::int_ k_pool, py::int_ v_pool, py::int_ table,
              py::object lens, py::int_ out, int batch, int hq, int hkv,
              int page, int tbl_width, int dim, std::uintptr_t stream) {
-        const int* lp = nullptr;
-        if (!lens.is_none())
-            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
-        ft::attention_decode_paged_launch_bf16(
+         const int* lp = opt_int_ptr(lens);
+         ft::attention_decode_paged_launch_bf16(
             reinterpret_cast<const void*>((uintptr_t)q),
             reinterpret_cast<const void*>((uintptr_t)k_pool),
             reinterpret_cast<const void*>((uintptr_t)v_pool),
@@ -1207,9 +1210,7 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ q, py::int_ k_pool, py::int_ v_pool, py::int_ table,
              py::object lens, py::int_ out, int batch, int hq, int hkv,
              int page, int tbl_width, int dim, std::uintptr_t stream) {
-        const int* lp = nullptr;
-        if (!lens.is_none())
-            lp = reinterpret_cast<const int*>((uintptr_t)py::int_(lens));
+        const int* lp = opt_int_ptr(lens);
         ft::attention_decode_paged_launch_fp16(
             reinterpret_cast<const void*>((uintptr_t)q),
             reinterpret_cast<const void*>((uintptr_t)k_pool),
@@ -1410,15 +1411,4 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
        py::arg("batch"), py::arg("hq"), py::arg("hkv"), py::arg("seq"),
        py::arg("dim"), py::arg("causal"), py::arg("stream") = 0);
-
-    m.def("sample_topp_launch", [](py::int_ x, int n, double p, double t,
-                                   unsigned long long seed,
-                                   std::uintptr_t stream) -> long long {
-        if (!(p > 0.0 && p <= 1.0))
-            throw std::invalid_argument("p must be in (0, 1]");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        return ft::sample_topp_launch(df(x), n, (float)p, (float)t, seed, stream);
-    }, py::arg("logits"), py::arg("n"), py::arg("p"), py::arg("t"),
-       py::arg("seed"), py::arg("stream") = 0);
 }

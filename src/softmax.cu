@@ -2,12 +2,12 @@
 //
 // Two kernel variants behind one launcher:
 //
-// 1. shared-memoization path (cols <= kSmSharedMax, the LLM-relevant
-//    regime): pass 1 reduces the row max (no exp), pass 2 computes
-//    __expf(x - m) ONCE per element, stores it in dynamic shared memory,
-//    and reduces the sum, pass 3 scales from shared. Only one exp per
-//    element total - the exp/SFU unit, not bandwidth, is this kernel's
-//    bottleneck on consumer GPUs.
+// 1. register-resident path (cols <= kSmPerThread * kSmBlock, the
+//    LLM-relevant regime): each thread keeps its slice of the row in
+//    registers, so x is read ONCE, __expf(x - m) is computed ONCE per
+//    element, and y is written straight from the register copy - one
+//    DRAM round trip and one exp per element, which leaves bandwidth
+//    (not the SFU) as the bottleneck.
 //
 // 2. online (flash-style) path for very wide rows: streaming (max, sum)
 //    reduction with rescaling, then a plain write pass. Row data is read
@@ -22,7 +22,6 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -39,9 +38,9 @@ void softmax_check(const std::vector<float>& x, int rows, int cols) {
 }
 
 constexpr int kSmBlock = 256;   // default block + variant-boundary basis
-// (shared staging sizes derive from the runtime block: WARPS = BLOCK/32
-// inside the templated kernels)
-// --- variant 1: register-resident path (cols <= kSmRegMax * kSmBlock) ------
+// (the register path's coverage bound derives from the runtime block:
+// WARPS = BLOCK/32 inside the templated kernels)
+// --- variant 1: register-resident path (cols <= kSmPerThread * block) ---
 // Each thread's slice of the row lives in registers, so x is read ONCE,
 // exp is computed ONCE, and y is written from the register copy - minimal
 // DRAM traffic, which is the true bottleneck once exp is single-pass.
@@ -63,27 +62,10 @@ __global__ void softmax_reg_kernel(const T* __restrict__ x,
     for (int i = threadIdx.x; i < cols && cnt < kSmPerThread; i += BLOCK)
         v[cnt++] = ld_f(xr, i);
 
-    // row max over the register slice + block reduce
+    // row max over the register slice + shared block reduce
     float m = -INFINITY;
     for (int j = 0; j < cnt; ++j) m = fmaxf(m, v[j]);
-    {
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
-        const int lane = threadIdx.x & 31;
-        const int warp = threadIdx.x >> 5;
-        if (lane == 0) sh_m[warp] = m;
-        __syncthreads();
-        if (warp == 0) {
-            m = (threadIdx.x < WARPS) ? sh_m[lane] : -INFINITY;
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
-            if (lane == 0) sh_m[0] = m;
-        }
-        __syncthreads();
-        m = sh_m[0];
-    }
+    m = block_reduce_max<BLOCK>(m, sh_m);
 
     // single exp per element; keep the exp values for the write pass
     float e[kSmPerThread];
@@ -92,24 +74,8 @@ __global__ void softmax_reg_kernel(const T* __restrict__ x,
         e[j] = __expf(v[j] - m);
         s += e[j];
     }
-    {
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            s += __shfl_down_sync(0xffffffffu, s, off);
-        const int lane = threadIdx.x & 31;
-        const int warp = threadIdx.x >> 5;
-        if (lane == 0) sh_s[warp] = s;
-        __syncthreads();
-        if (warp == 0) {
-            s = (threadIdx.x < WARPS) ? sh_s[lane] : 0.0f;
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                s += __shfl_down_sync(0xffffffffu, s, off);
-            if (lane == 0) sh_s[0] = s;
-        }
-        __syncthreads();
-    }
-    const float inv = 1.0f / sh_s[0];
+    s = block_reduce_sum<BLOCK>(s, sh_s);
+    const float inv = 1.0f / s;
 
     // write straight from registers - x is never re-read
     int j = 0;
