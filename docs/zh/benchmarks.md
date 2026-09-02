@@ -38,9 +38,10 @@ python benchmarks/bench.py            # 全套，几分钟
   越低）。
 - **（诚实）** 标注的是 fusedtok 输掉的行：attention_prefill 对
   SDPA 的 flash 后端（约 0.45x）、INT8 GEMM 对 cuBLASLt
-  （0.40–0.58x）、平坦分布的 sample_topp 对 torch 全并行排序
-  （0.10–0.17x）。这些是设计范围的声明，不是测量噪声——各
-  [主题页](usage.md)有解释。
+  （0.40-0.57x）、平坦分布的 sample_topp 对 torch 全并行排序
+  （0.17-0.29x）与宽核的 sample_minp 行（0.2-0.31x——两次加宽重试
+  加一次 64k 排序；torch 的布尔掩码组合式从不排序）。这些是设计
+  范围的声明，不是测量噪声——各[主题页](usage.md)有解释。
 - **带宽列**（GB/s）只统计该算子必须搬运的字节（如 softmax 2
   张量、rmsnorm+res 3 张量）；INT8 行的 **TOPS** 按稠密 MAC 数
   乘二每秒计算。

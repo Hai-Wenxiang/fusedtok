@@ -50,6 +50,7 @@ __all__ = [
     "topp",
     "sample_topp",
     "sample_topk",
+    "sample_minp",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -57,6 +58,7 @@ __all__ = [
     "qgemm_perchannel",
     "decode_step",
     "attention_decode",
+    "kv_append",
     "attention_decode_paged",
     "attention_prefill",
     "kv_append_paged",
@@ -93,6 +95,8 @@ def sample_topp(logits: Array, p: float, *, temperature: float = 1.0,
                 seed: int = 0, cuda: bool = False) -> int: ...
 def sample_topk(logits: Array, k: int, *, temperature: float = 1.0,
                 seed: int = 0, cuda: bool = False) -> int: ...
+def sample_minp(logits: Array, min_p: float, *, temperature: float = 1.0,
+                seed: int = 0, cuda: bool = False) -> int: ...
 def quantize_int8(x: Array) -> "tuple[Array, float]": ...
 def dequantize_int8(q: Array, scale: float) -> Array: ...
 def qadd_int8(qa: Array, sa: float, qb: Array,
@@ -107,6 +111,8 @@ def decode_step(logits: Array, sampled_ids: Array, penalty: float = 1.0, *,
 def attention_decode(q: Array, k_cache: Array, v_cache: Array,
                      lens: Optional[Array] = None,
                      *, cuda: bool = False) -> Array: ...
+def kv_append(k_cache: Array, v_cache: Array, k_new: Array, v_new: Array,
+              lens: Array, *, cuda: bool = False) -> None: ...
 def attention_decode_paged(q: Array, k_pool: Array, v_pool: Array,
                            block_table: Array,
                            lens: Optional[Array] = None,

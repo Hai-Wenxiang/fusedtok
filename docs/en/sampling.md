@@ -9,6 +9,7 @@ boundary where CPU and GPU draws may differ.
 
 - [Selection operators](#selection-operators)
 - [The fused samplers](#the-fused-samplers)
+- [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp--threshold-by-max-sampling-v13)
 - [The same-token guarantee](#the-same-token-guarantee)
 - [Flat distributions - the honest worst case](#flat-distributions---the-honest-worst-case)
 - [How the pipeline works](#how-the-pipeline-works)
@@ -64,6 +65,33 @@ hash uniform (reproducible, not cryptographically secure). Host-origin
 token ids are validated against the vocab before upload; CUDA id
 tensors are trusted (no stream sync).
 
+## sample_minp - threshold-by-max sampling (v1.3)
+
+```python
+tok = fusedtok.sample_minp(logits, min_p=0.1, temperature=0.8, seed=step)
+```
+
+Min-p (from "Turning Up the Heat: Min-p Sampling for Creative and
+Coherent LLM Outputs", 2024 - already deployed in llama.cpp, vLLM and
+friends) truncates by a VALUE threshold relative to the peak instead
+of a cumulative mass: keep every token whose probability is at least
+``min_p`` times the maximum probability, renormalize within that
+nucleus, draw with the same seeded hash.
+
+- Adaptive by construction: peaked decode logits get a tiny nucleus,
+  near-uniform logits a wide one - no window guessing on the caller's
+  side.
+- ``min_p = 1.0`` keeps only the tokens AT the maximum (unique max =
+  exactly greedy; tied maxima stay tied in the draw).
+- Deterministic per seed, same RNG and same-token guarantee as the
+  other samplers (CPU exact-``exp`` vs GPU ``__expf`` boundary caveat
+  included).
+- Implementation note: the exp column is already max-normalized
+  (``exps[0] == 1.0`` exactly), so the nucleus is simply the prefix
+  cut at the first element below ``min_p`` - no global-mass reduction
+  is needed, and the serial walk inherits the v1.3 checkpoint
+  bisection.
+
 ## The same-token guarantee
 
 For a fixed seed, the CPU / staged / zero-copy paths draw the **same
@@ -110,7 +138,11 @@ n=131072 on a 3060) with three contract-preserving changes:
    flat-case time).
 
 Real decode logits are peaked; the flat case is the worst case, not
-the typical one.
+the typical one. v1.3 added one more token-preserving cut: walk 1
+records its prefix sums at batch boundaries into shared memory and
+walk 2 binary-searches those checkpoints instead of scanning from
+index 0 (the resumed prefix is bit-identical - same adds in the same
+order), taking the flat worst case down another ~1.6x.
 
 ## How the pipeline works
 

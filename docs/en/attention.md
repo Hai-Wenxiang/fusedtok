@@ -11,6 +11,7 @@ per-sequence lengths, and the honest performance framing.
 - [attention_decode - the decode step](#attention_decode---the-decode-step)
 - [attention_decode_paged - the vLLM-style block pool](#attention_decode_paged---the-vllm-style-block-pool)
 - [kv_append_paged - writing tokens into the pool](#kv_append_paged---writing-tokens-into-the-pool)
+- [kv_append - writing tokens into the contiguous cache (v1.3)](#kv_append---writing-tokens-into-the-contiguous-cache-v13)
 - [attention_prefill - fresh sequences](#attention_prefill---fresh-sequences)
 - [Performance framing](#performance-framing)
 
@@ -114,6 +115,37 @@ for step in range(n_steps):
                              k_new, v_new, lens)          # write at lens
     out = fusedtok.attention_decode_paged(q, k_pool, v_pool,
                                           block_table, lens + 1)
+    lens += 1
+    # ... k_new/v_new for the next token come from the model
+```
+
+## kv_append - writing tokens into the contiguous cache (v1.3)
+
+```python
+fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
+```
+
+The cache-write side of the CONTIGUOUS decode loop (the twin of
+`kv_append_paged`): sequence `b`'s fresh rows `k_new[b]` / `v_new[b]`
+(each `[Hkv, D]`) land at cache row `lens[b]` of `k_cache[b]` /
+`v_cache[b]`.
+
+- **In place** (returns `None`); `lens` is REQUIRED (the write position
+  is each sequence's current length by definition).
+- Host paths require float32 C-contiguous caches (a conversion would
+  view a copy and silently drop the writes - rejected with
+  `TypeError`). The torch path supports f32/bf16/fp16 storage.
+- One tiny kernel, stream-ordered, CUDA-graph capturable.
+- Host-origin `lens` values are validated in `[0, T)`; device-resident
+  tensors are trusted (the standard zero-copy boundary).
+
+The typical loop mirrors the paged one: append at `lens[b]`, then
+decode with `lens + 1`:
+
+```python
+for step in range(n_steps):
+    fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
+    out = fusedtok.attention_decode(q, k_cache, v_cache, lens + 1)
     lens += 1
     # ... k_new/v_new for the next token come from the model
 ```

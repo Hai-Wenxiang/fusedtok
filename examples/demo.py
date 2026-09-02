@@ -285,6 +285,29 @@ def main():
             print(f"  {f'seed {seed} cuda matches cpu':<26} {'PASS' if ok else 'FAIL'}")
             ALL_OK &= ok
 
+    print("sample_minp: fused min-p sampling (v1.3, runs everywhere)")
+    probs = np.exp(lg / 0.8 - (lg / 0.8).max())
+    probs = (probs / probs.sum()).astype(np.float32)
+    floor = 0.1 * probs.max()
+    nucleus = set(np.flatnonzero(probs >= floor).tolist())
+    draws = {fusedtok.sample_minp(lg, 0.1, temperature=0.8, seed=s)
+             for s in range(16)}
+    ok = bool(draws) and draws.issubset(nucleus)
+    print(f"  {'draws stay in the min-p nucleus':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    uniq = np.array([0.1, 5.0, 4.0], dtype=np.float32)
+    ok = all(fusedtok.sample_minp(uniq, 1.0, seed=s) == 1 for s in range(4))
+    print(f"  {'min_p=1 is greedy (unique max)':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    if have_cuda and HAS_TORCH:
+        ltm = torch.from_numpy(lg).cuda()
+        for seed in (0, 7):
+            ok = fusedtok.sample_minp(ltm, 0.1, temperature=0.8,
+                                      seed=seed) == \
+                fusedtok.sample_minp(lg, 0.1, temperature=0.8, seed=seed)
+            print(f"  {f'seed {seed} cuda matches cpu':<26} {'PASS' if ok else 'FAIL'}")
+            ALL_OK &= ok
+
     print(SEP)
     print("attention: decode step, GQA + kv-cache + per-sequence lens")
     q = rng.standard_normal((2, 8, 16)).astype(np.float32)     # B=2 Hq=8 D=16
@@ -340,6 +363,24 @@ def main():
         yp = fusedtok.attention_decode_paged(qt, pool_k, pool_v, table, plens)
         torch.cuda.synchronize()
         check("paged block-pool == contiguous", yp.cpu().numpy(), ref,
+              tol=1e-4)
+
+        # v1.3: the contiguous cache-write side - build a [B, Hkv, T, D]
+        # cache row-by-row with kv_append and decode identically to the
+        # one-shot cache above
+        grow_k = torch.zeros(2, 2, 8, 16, device="cuda")
+        grow_v = torch.zeros_like(grow_k)
+        for step in range(6):
+            lens_now = torch.tensor([step, min(step, 2)],
+                                    dtype=torch.int32, device="cuda")
+            kn2 = torch.stack([kt[0, :, step], kt[1, :, min(step, 2)]], 0)
+            vn2 = torch.stack([vt[0, :, step], vt[1, :, min(step, 2)]], 0)
+            fusedtok.kv_append(grow_k, grow_v, kn2, vn2, lens_now)
+        yc = fusedtok.attention_decode(
+            qt, grow_k, grow_v,
+            torch.tensor([6, 3], dtype=torch.int32, device="cuda"))
+        torch.cuda.synchronize()
+        check("kv_append loop == contiguous", yc.cpu().numpy(), ref,
               tol=1e-4)
 
     print(SEP)

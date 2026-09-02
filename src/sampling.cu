@@ -196,4 +196,68 @@ long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
     return (long long)order[(size_t)k - 1];   // float rounding fallback
 }
 
+// ---------------------------------------------------------------------------
+// fused min-p sampling - CPU reference (v1.3)
+// ---------------------------------------------------------------------------
+
+// Same algorithm as sample_minp_launch: keep every token whose
+// probability is at least min_p times the maximum probability - in the
+// max-normalized exp column that is a prefix cut at the first element
+// with exp < min_p (exps[0] == 1.0 by construction), renormalize
+// within that nucleus and inverse-CDF the splitmix-hash uniform.
+// Identical accumulation order to the device serial kernel; CPU exact
+// exp vs device __expf gives the usual neighboring-draw caveat on
+// exp-rounding boundaries.
+long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
+                          float t, unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (!(min_p > 0.0f && min_p <= 1.0f))
+        throw std::invalid_argument("min_p must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    // order indices by (logit/T desc, index asc) - the packed-key order
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+
+    // nucleus: prefix while exp >= min_p (mass_at(0) == 1.0 >= min_p,
+    // so the nucleus is never empty for a valid min_p)
+    float nucleus_mass = 0.0f;
+    size_t nucleus = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float e = mass_at(i);
+        if (e < min_p) { nucleus = i; break; }
+        nucleus_mass += e;
+        nucleus = i + 1;
+    }
+
+    // splitmix64-finalized uniform, identical to the device side
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    for (size_t i = 0; i < nucleus; ++i) {
+        cum += mass_at(i);
+        if (cum >= target) return (long long)order[i];
+    }
+    return (long long)order[nucleus - 1];     // float rounding fallback
+}
+
 } // namespace fusedtok

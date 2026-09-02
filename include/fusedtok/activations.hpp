@@ -92,6 +92,12 @@ long long sample_topp_cpu(const std::vector<float>& logits,
 long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
                           unsigned long long seed);
 
+// Min-p variant (v1.3): keep every token with probability >= min_p
+// times the maximum probability, renormalize within that nucleus and
+// draw with the same seeded hash.
+long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
+                          float t, unsigned long long seed);
+
 // ---------------------------------------------------------------------------
 // INT8 symmetric per-tensor quantization (the storage half; the compute
 // half - IMMA qgemm / decode GEMV - is declared just below):

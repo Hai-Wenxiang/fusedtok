@@ -345,3 +345,28 @@ def test_mixed_device_inputs_rejected_with_guidance():
     w = torch.rand(16, device="cuda")  # CUDA weight: device mismatch
     with pytest.raises(TypeError):
         fusedtok.rmsnorm(x, w)
+
+
+@needs_gpu
+def test_cpu_operand_on_zero_copy_path_rejected_everywhere():
+    # a host pointer handed to a kernel is an asynchronous illegal
+    # access that POISONS the CUDA context for every later call - every
+    # zero-copy helper must reject CPU tensors up front (found by the
+    # v1.3 kv_append tests: one poisoned launch failed 100+ later tests)
+    q = torch.randn(1, 4, 8, device="cuda")
+    k = torch.randn(1, 2, 8, 8, device="cuda")
+    with pytest.raises(TypeError):
+        fusedtok.attention_decode(q, k.cpu(), k.clone())
+    with pytest.raises(TypeError):
+        fusedtok.attention_decode(q, k, k.clone().cpu())
+    kn = torch.randn(1, 2, 8)
+    kc = torch.zeros(1, 2, 8, 8, device="cuda")
+    with pytest.raises(TypeError):
+        fusedtok.kv_append(kc, kc.clone(), kn, kn.clone(), [0])
+    pool = torch.zeros(4, 2, 4, 8, device="cuda")
+    with pytest.raises(TypeError):
+        fusedtok.attention_decode_paged(q, pool.cpu(), pool.clone(),
+                                        [[0, 1]])
+    # the CUDA context must still be healthy after all the rejections
+    out = fusedtok.attention_decode(q, k, k.clone())
+    assert out.shape == q.shape

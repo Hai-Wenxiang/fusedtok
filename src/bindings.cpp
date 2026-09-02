@@ -746,6 +746,52 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("n"), py::arg("k"), py::arg("t") = 1.0,
        py::arg("seed") = 0, py::arg("stream") = 0);
 
+    m.def("sample_minp_cpu", [](FArray logits, double min_p, double t,
+                                unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_minp_cpu(to_vec(logits), (float)min_p, (float)t,
+                                   seed);
+    }, py::arg("logits"), py::arg("min_p"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_minp", [](FArray logits, double min_p, double t,
+                            unsigned long long seed) -> long long {
+        // staged: copy logits up, run, read the token back
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(min_p > 0.0 && min_p <= 1.0))
+            throw std::invalid_argument("min_p must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_minp_launch(dx.fget(), n,
+                                                       (float)min_p,
+                                                       (float)t, seed);
+        sync_device("sample minp kernel");
+        return token;
+    }, py::arg("logits"), py::arg("min_p"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_minp_launch", [](py::int_ x, int n, double min_p,
+                                   double t, unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (!(min_p > 0.0 && min_p <= 1.0))
+            throw std::invalid_argument("min_p must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_minp_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                      n, (float)min_p, (float)t, seed,
+                                      stream);
+    }, py::arg("x"), py::arg("n"), py::arg("min_p"), py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
     m.def("sample_topp", [](FArray logits, double p, double t,
                             unsigned long long seed) -> long long {
         if (logits.ndim() != 1)
@@ -1330,6 +1376,95 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("lens"), py::arg("k_pool"), py::arg("v_pool"),
        py::arg("batch"), py::arg("hkv"), py::arg("dim"), py::arg("page"),
        py::arg("tbl_width"), py::arg("stream") = 0);
+
+    // --- contiguous kv-cache append (v1.3): in-place scatter of one token ---
+    m.def("kv_append_cpu",
+          [](FArray k_new, FArray v_new, IArray lens, FArray k_cache,
+             FArray v_cache, int batch, int hkv, int dim, int t_rows) {
+        std::vector<int> lv(lens.data(), lens.data() + lens.size());
+        // copy-in so the in-place host mutation stays out of numpy's view
+        // until the wrapper writes back
+        std::vector<float> kc(k_cache.data(), k_cache.data() + k_cache.size());
+        std::vector<float> vc(v_cache.data(), v_cache.data() + v_cache.size());
+        ft::kv_append_cpu(to_vec(k_new), to_vec(v_new), lv, kc, vc, batch,
+                          hkv, dim, t_rows);
+        std::copy(kc.begin(), kc.end(), k_cache.mutable_data());
+        std::copy(vc.begin(), vc.end(), v_cache.mutable_data());
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("lens"),
+       py::arg("k_cache"), py::arg("v_cache"), py::arg("batch"),
+       py::arg("hkv"), py::arg("dim"), py::arg("t_rows"));
+
+    m.def("kv_append",
+          [](FArray k_new, FArray v_new, IArray lens, FArray k_cache,
+             FArray v_cache, int batch, int hkv, int dim, int t_rows) {
+        if (k_new.size() != (py::ssize_t)batch * hkv * dim ||
+            v_new.size() != k_new.size() ||
+            lens.size() != (py::ssize_t)batch ||
+            k_cache.size() != (py::ssize_t)batch * hkv * t_rows * dim ||
+            v_cache.size() != k_cache.size())
+            throw std::invalid_argument("kv append operand size mismatch");
+        const size_t cache_bytes = (size_t)batch * hkv * t_rows * dim * 4;
+        DevBuf dk_new(k_new.size() * 4), dv_new(v_new.size() * 4),
+              dl((size_t)batch * 4), dkc(cache_bytes), dvc(cache_bytes);
+        h2d(dk_new.get(), k_new.data(), k_new.size() * 4);
+        h2d(dv_new.get(), v_new.data(), v_new.size() * 4);
+        h2d(dl.get(), lens.data(), (size_t)batch * 4);
+        h2d(dkc.get(), k_cache.data(), cache_bytes);
+        h2d(dvc.get(), v_cache.data(), cache_bytes);
+        ft::kv_append_launch(dk_new.fget(), dv_new.fget(),
+                             static_cast<const int*>(dl.get()), dkc.fget(),
+                             dvc.fget(), batch, hkv, dim, t_rows);
+        d2h(k_cache.mutable_data(), dkc.get(), cache_bytes);
+        d2h(v_cache.mutable_data(), dvc.get(), cache_bytes);
+        sync_device("kv append kernel");
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("lens"),
+       py::arg("k_cache"), py::arg("v_cache"), py::arg("batch"),
+       py::arg("hkv"), py::arg("dim"), py::arg("t_rows"));
+
+    m.def("kv_append_launch",
+          [](py::int_ k_new, py::int_ v_new, py::int_ lens, py::int_ k_cache,
+             py::int_ v_cache, int batch, int hkv, int dim, int t_rows,
+             std::uintptr_t stream) {
+        ft::kv_append_launch(df(k_new), df(v_new),
+                             reinterpret_cast<const int*>((uintptr_t)lens),
+                             dfm(k_cache), dfm(v_cache), batch, hkv, dim,
+                             t_rows, stream);
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("lens"),
+       py::arg("k_cache"), py::arg("v_cache"), py::arg("batch"),
+       py::arg("hkv"), py::arg("dim"), py::arg("t_rows"),
+       py::arg("stream") = 0);
+
+    m.def("kv_append_launch_bf16",
+          [](py::int_ k_new, py::int_ v_new, py::int_ lens, py::int_ k_cache,
+             py::int_ v_cache, int batch, int hkv, int dim, int t_rows,
+             std::uintptr_t stream) {
+        ft::kv_append_launch_bf16(
+            reinterpret_cast<const void*>((uintptr_t)k_new),
+            reinterpret_cast<const void*>((uintptr_t)v_new),
+            reinterpret_cast<const int*>((uintptr_t)lens),
+            reinterpret_cast<void*>((uintptr_t)k_cache),
+            reinterpret_cast<void*>((uintptr_t)v_cache),
+            batch, hkv, dim, t_rows, stream);
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("lens"),
+       py::arg("k_cache"), py::arg("v_cache"), py::arg("batch"),
+       py::arg("hkv"), py::arg("dim"), py::arg("t_rows"),
+       py::arg("stream") = 0);
+
+    m.def("kv_append_launch_fp16",
+          [](py::int_ k_new, py::int_ v_new, py::int_ lens, py::int_ k_cache,
+             py::int_ v_cache, int batch, int hkv, int dim, int t_rows,
+             std::uintptr_t stream) {
+        ft::kv_append_launch_fp16(
+            reinterpret_cast<const void*>((uintptr_t)k_new),
+            reinterpret_cast<const void*>((uintptr_t)v_new),
+            reinterpret_cast<const int*>((uintptr_t)lens),
+            reinterpret_cast<void*>((uintptr_t)k_cache),
+            reinterpret_cast<void*>((uintptr_t)v_cache),
+            batch, hkv, dim, t_rows, stream);
+    }, py::arg("k_new"), py::arg("v_new"), py::arg("lens"),
+       py::arg("k_cache"), py::arg("v_cache"), py::arg("batch"),
+       py::arg("hkv"), py::arg("dim"), py::arg("t_rows"),
+       py::arg("stream") = 0);
 
     m.def("attention_prefill_cpu", [](FArray q, FArray k, FArray v,
                                       int batch, int hq, int hkv, int seq,

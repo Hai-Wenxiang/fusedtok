@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 __all__ = [
     "cuda_available",
@@ -57,6 +57,7 @@ __all__ = [
     "topp",
     "sample_topp",
     "sample_topk",
+    "sample_minp",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -64,6 +65,7 @@ __all__ = [
     "qgemm_perchannel",
     "decode_step",
     "attention_decode",
+    "kv_append",
     "attention_decode_paged",
     "attention_prefill",
     "kv_append_paged",
@@ -120,6 +122,13 @@ def _check_contiguous(t, name):
 
 
 def _check_torch_f32(t, name):
+    # the zero-copy helpers only ever run on the torch-cuda path, where
+    # EVERY tensor operand must live on the GPU - a host pointer handed
+    # to a kernel is an asynchronous illegal access that poisons the
+    # CUDA context for every later call, so reject it here
+    if not t.is_cuda:
+        raise TypeError(f"{name} must be a CUDA tensor (got a CPU tensor "
+                        "on the zero-copy path)")
     if t.dtype is not torch.float32:
         raise TypeError(f"{name} must be float32, got {t.dtype} "
                         "(convert with .to(torch.float32))")
@@ -128,6 +137,9 @@ def _check_torch_f32(t, name):
 
 def _check_torch_float(t, name):
     """Accept float32 or bfloat16 (the two dtypes with CUDA kernels)."""
+    if not t.is_cuda:
+        raise TypeError(f"{name} must be a CUDA tensor (got a CPU tensor "
+                        "on the zero-copy path)")
     if t.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(f"{name} must be float32 or bfloat16, got {t.dtype} "
                         "(convert with .to(torch.float32))")
@@ -138,6 +150,9 @@ def _check_torch_att(t, name):
     """Accept the three attention storage dtypes: float32, bfloat16,
     float16 (attention kernels are templated on the storage dtype and
     compute in float32)."""
+    if not t.is_cuda:
+        raise TypeError(f"{name} must be a CUDA tensor (got a CPU tensor "
+                        "on the zero-copy path)")
     if t.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise TypeError(f"{name} must be float32, bfloat16 or float16, "
                         f"got {t.dtype} (convert with .to(torch.float32))")
@@ -904,6 +919,82 @@ def kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens,
     return None
 
 
+def kv_append(k_cache, v_cache, k_new, v_new, lens, *, cuda=False):
+    """Append ONE fresh token's k/v rows per sequence into the
+    contiguous kv-cache (in place - the write side of the decode loop):
+
+    sequence b's new rows ``k_new[b]``/``v_new[b]`` (each [Hkv, D]) land
+    at cache row ``lens[b]`` of ``k_cache[b]`` / ``v_cache[b]``.
+
+    k_cache / v_cache: [B, Hkv, T, D]; k_new / v_new: [B, Hkv, D]; lens
+    [B] (REQUIRED - the write position is each sequence's current
+    length). The contiguous twin of :func:`kv_append_paged`: the typical
+    loop appends at ``lens[b]`` and then decodes with ``lens + 1``.
+
+    CUDA caches may be float32, bfloat16 or float16 (rows copied in the
+    storage dtype; k_new must match the cache dtype). Host-origin lens
+    values are validated in ``[0, T)`` before the upload;
+    device-resident tensors are trusted (same trust boundary as
+    :func:`attention_decode`). Host paths require float32 C-contiguous
+    caches (in-place op; a conversion would drop the writes). Returns
+    None; the caches are mutated in place.
+    """
+    path = _device_path(k_cache, cuda)
+    if path == "torch-cuda":
+        for name, t in (("k_cache", k_cache), ("v_cache", v_cache),
+                        ("k_new", k_new), ("v_new", v_new)):
+            _check_torch_att(t, name)
+        for name, t in (("v_cache", v_cache), ("k_new", k_new),
+                        ("v_new", v_new)):
+            if t.dtype is not k_cache.dtype:
+                raise TypeError(f"{name} must have the cache dtype")
+        if k_cache.ndim != 4 or v_cache.ndim != 4:
+            raise ValueError("caches must be [B, Hkv, T, D]")
+        if k_new.ndim != 3 or v_new.ndim != 3:
+            raise ValueError("k_new/v_new must be [B, Hkv, D]")
+        b, hkv, t_rows, d = k_cache.shape
+        b2, hkv2, d2 = k_new.shape
+        if (b2, hkv2, d2) != (b, hkv, d) \
+                or v_cache.shape != k_cache.shape \
+                or v_new.shape != k_new.shape:
+            raise ValueError("k/v operands must match the cache layout")
+        if b == 0:
+            return None
+        lt = _lens_arg(lens, b, t_rows, k_cache.device,
+                       upper_inclusive=False)
+        _att_launch_fn(k_cache, "kv_append_launch")(
+            k_new.data_ptr(), v_new.data_ptr(), lt.data_ptr(),
+            k_cache.data_ptr(), v_cache.data_ptr(),
+            b, hkv, d, t_rows, _cuda_stream())
+        return None
+    # in-place op: a dtype/layout conversion would silently drop the
+    # mutation (numpy would view a converted copy), so caches must
+    # already be float32 C-contiguous on the host paths
+    for name, arr in (("k_cache", k_cache), ("v_cache", v_cache)):
+        raw = arr.numpy() if _is_torch(arr) else arr
+        if not isinstance(raw, np.ndarray) or raw.dtype != np.float32 \
+                or not raw.flags["C_CONTIGUOUS"]:
+            raise TypeError(f"{name} must be a float32 C-contiguous array "
+                            "(in-place op; conversion would drop writes)")
+    arr_kc = _as_numpy(k_cache, "k_cache")
+    arr_vc = _as_numpy(v_cache, "v_cache")
+    arr_kn = _as_numpy(k_new, "k_new")
+    arr_vn = _as_numpy(v_new, "v_new")
+    arr_l = np.ascontiguousarray(np.asarray(lens, dtype=np.int32))
+    if arr_kc.ndim != 4 or arr_kn.ndim != 3:
+        raise ValueError("caches [B,Hkv,T,D]; k_new [B,Hkv,D]")
+    b, hkv, t_rows, d = arr_kc.shape
+    if arr_l.shape != (arr_kn.shape[0],):
+        raise ValueError("lens must have one entry per sequence")
+    if path == "staged":
+        _fusedtok.kv_append(arr_kn, arr_vn, arr_l, arr_kc, arr_vc,
+                            b, hkv, d, t_rows)
+    else:
+        _fusedtok.kv_append_cpu(arr_kn, arr_vn, arr_l, arr_kc, arr_vc,
+                                b, hkv, d, t_rows)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # sampling / logits post-processing
 # ---------------------------------------------------------------------------
@@ -1267,6 +1358,41 @@ def sample_topk(logits, k, *, temperature=1.0, seed=0, cuda=False):
     call = (_fusedtok.sample_topk if path == "staged"
             else _fusedtok.sample_topk_cpu)
     return int(call(arr, k, temperature, seed))
+
+
+def sample_minp(logits, min_p, *, temperature=1.0, seed=0, cuda=False):
+    """Fused min-p sampling: one GPU round trip from raw logits to a token.
+
+    Pipeline: softmax of ``logits / temperature`` -> keep every token
+    whose probability is at least ``min_p`` times the MAXIMUM
+    probability -> renormalize within that nucleus -> inverse-CDF draw
+    using a hash-uniform of ``seed``. Deterministic per seed; the RNG
+    is a splitmix-style hash (reproducible, NOT cryptographically
+    secure).
+
+    Returns the sampled token id (int). ``min_p`` in (0, 1]
+    (1.0 collapses to greedy among the max-probability tokens),
+    temperature > 0.
+    """
+    if not 0.0 < min_p <= 1.0:
+        raise ValueError("min_p must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_minp_launch(logits.data_ptr(),
+                                                logits.numel(), min_p,
+                                                temperature, seed,
+                                                _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_minp if path == "staged"
+            else _fusedtok.sample_minp_cpu)
+    return int(call(arr, min_p, temperature, seed))
 
 
 def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,
