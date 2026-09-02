@@ -411,12 +411,12 @@ struct QgConfig {
 constexpr QgConfig kQgCands[3] = {
     {64, kQgSlabDefault, kQgBlockSmall, 2, 1},   // default small tile
     {64, kQgSlabWide, kQgBlockSmall, 2, 1},      // small tile, wide slab
-    {128, kQgSlabDefault, kQgBlockLarge, 2, 2},  // DRAM-intensity tile
+    {kQgTileLarge, kQgSlabDefault, kQgBlockLarge, 2, 2},  // DRAM-intensity tile
 };
 
 int qgemm_smem_for(const QgConfig& cfg) {
     if (cfg.tile == 128)
-        return qgemm_smem_bytes<128, 128, 64>();
+        return qgemm_smem_bytes<kQgTileLarge, kQgTileLarge, 64>();
     if (cfg.slab == 128)
         return qgemm_smem_bytes<64, 64, 128>();
     return qgemm_smem_bytes<64, 64, 64>();
@@ -430,10 +430,10 @@ void qgemm_launch_config(const QgConfig& cfg, bool pc,
     const int smem = qgemm_smem_for(cfg);
     if (cfg.tile == 128) {
         if (pc)
-            qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, true>
+            qgemm_pipe_kernel<kQgTileLarge, kQgTileLarge, 64, 2, 2, kQgBlockLarge, true>
                 <<<grid, cfg.block, smem, cs>>>(aq, bq, sb_vec, y, m, n, k, scale);
         else
-            qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, false>
+            qgemm_pipe_kernel<kQgTileLarge, kQgTileLarge, 64, 2, 2, kQgBlockLarge, false>
                 <<<grid, cfg.block, smem, cs>>>(aq, bq, nullptr, y, m, n, k, scale);
     } else if (cfg.slab == 128) {
         if (pc)
@@ -475,8 +475,8 @@ int qgemm_pick_config(const signed char* aq, const signed char* bq,
             // opt-in dynamic smem above the 48 KB static ceiling; safe to
             // repeat. Never executed during a capture (tuning is skipped).
             if (cudaFuncSetAttribute(
-                    (pc ? qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, true>
-                        : qgemm_pipe_kernel<128, 128, 64, 2, 2, 512, false>),
+                    (pc ? qgemm_pipe_kernel<kQgTileLarge, kQgTileLarge, 64, 2, 2, kQgBlockLarge, true>
+                        : qgemm_pipe_kernel<kQgTileLarge, kQgTileLarge, 64, 2, 2, kQgBlockLarge, false>),
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     qgemm_smem_for(cfg)) != cudaSuccess) {
                 cudaGetLastError();

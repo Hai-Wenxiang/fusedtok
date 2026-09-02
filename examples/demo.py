@@ -87,6 +87,7 @@ def main():
     print(SEP)
     print("rope: interleaved + NeoX, with kv-cache offset")
     q = rng.standard_normal((2, 8)).astype(np.float32)
+    ref_neox = None
     for neox in (False, True):
         q2, _ = fusedtok.rope(q, None, neox=neox, pos_offset=5)
         j = np.arange(4)
@@ -96,17 +97,20 @@ def main():
             ref = np.zeros_like(q)
             ref[:, :4] = q[:, :4] * c - q[:, 4:] * sn
             ref[:, 4:] = q[:, :4] * sn + q[:, 4:] * c
+            ref_neox = ref
         else:
             ref = np.zeros_like(q)
             ref[:, 0::2] = q[:, 0::2] * c - q[:, 1::2] * sn
             ref[:, 1::2] = q[:, 0::2] * sn + q[:, 1::2] * c
         check(f"{'neox' if neox else 'interleaved'} cpu", q2, ref, tol=1e-4)
     if have_cuda and HAS_TORCH:
-        q2, k2 = fusedtok.rope(torch.from_numpy(q).cuda(),
-                               torch.from_numpy(q).cuda(), neox=True, pos_offset=5)
+        qt, kt = torch.from_numpy(q).cuda(), torch.from_numpy(q).cuda()
+        q2, k2 = fusedtok.rope(qt, kt, neox=True, pos_offset=5)
         torch.cuda.synchronize()
-        print(f"  {'torch cuda zero-copy':<26} PASS (q', k' shapes "
-              f"{tuple(q2.shape)}, {tuple(k2.shape)})")
+        # value check (not just shapes): the neox reference is already
+        # computed in the loop above - reuse it
+        check("torch cuda zero-copy", q2.cpu().numpy(), ref_neox, tol=1e-4)
+        check("torch cuda zero-copy k", k2.cpu().numpy(), ref_neox, tol=1e-4)
 
     print(SEP)
     print("activations: silu / gelu / relu / tanh / sigmoid / gelu_tanh")
@@ -119,10 +123,12 @@ def main():
         "sigmoid": 1 / (1 + np.exp(-x)),
     }
     for name, ref in checks.items():
-        got = getattr(fusedtok, name)(x)
+        # verify BOTH paths where a GPU is present: the CPU result is
+        # the parity anchor, the staged result is the kernel
+        check(f"{name} cpu", getattr(fusedtok, name)(x), ref, tol=1e-5)
         if have_cuda:
-            got = getattr(fusedtok, name)(x, cuda=True)
-        check(name, got, ref, tol=1e-5)
+            check(f"{name} cuda", getattr(fusedtok, name)(x, cuda=True),
+                  ref, tol=1e-5)
     inner = 0.7978845608028654 * (x + 0.044715 * x ** 3)
     check("gelu_tanh", fusedtok.gelu_tanh(x, cuda=True) if have_cuda else fusedtok.gelu_tanh(x),
           0.5 * x * (1 + np.tanh(inner)), tol=1e-5)
@@ -210,7 +216,6 @@ def main():
         zt = torch.from_numpy(rng.standard_normal(512).astype(np.float32)).cuda()
         qz, sz = fusedtok.quantize_int8(zt)
         qy, sy = fusedtok.qadd_int8(tq, float(ts), qz, float(sz))
-        ref, sref = fusedtok.quantize_int8(back * 0 + (x + zt.cpu().numpy()).astype(np.float32))
         dqy = qy.float().cpu().numpy() * float(sy)
         ok = np.abs(dqy - np.asarray(x + zt.cpu().numpy())).max() <= float(sy) * 1.01
         print(f"  {'fused qadd within one step':<26} {'PASS' if ok else 'FAIL'}")

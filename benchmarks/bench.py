@@ -107,7 +107,6 @@ def main():
     dev_name = torch.cuda.get_device_name(0)
     print(f"fusedtok {fusedtok.__version__} | torch {torch.__version__} | {dev_name}\n")
 
-    rng = np.random.default_rng(0)
     # torch's global RNG drives the sampling logits; seeding it keeps the
     # DRAWS identical across runs/machines so JSON numbers stay comparable
     # (unseeded, the peaked-row nucleus width varies per run and swings
@@ -121,33 +120,39 @@ def main():
         w = torch.rand(hidden, device="cuda") + 0.5
         b = torch.zeros(hidden, device="cuda")
         shape = f"[{batch}x{hidden}]"
-        io_bytes = (x.numel() * 4) * (2 if r is not None else 1) + x.numel() * 4
+        f32 = x.numel() * 4
+        # honest bytes per op: rmsnorm+res and swiglu stream three
+        # tensors (x, r/x2, y); layernorm/softmax/silu/gelu only two
+        # (x in, y out) - the 1.2.0 suite billed all of them for three
+        # and over-reported their GB/s by 1.5x
+        io3 = 3 * f32
+        io2 = 2 * f32
 
         record("rmsnorm+res", shape,
                lambda: fusedtok.rmsnorm(x, w, residual=r),
                lambda: (lambda v: v * torch.rsqrt(
                    v.pow(2).mean(-1, keepdim=True)) * w)(x + r),
-               iters, bytes_moved=io_bytes)
+               iters, bytes_moved=io3)
 
         record("layernorm", shape,
                lambda: fusedtok.layernorm(x, w, b),
                lambda: torch.nn.functional.layer_norm(x, (hidden,), w, b),
-               iters, bytes_moved=io_bytes)
+               iters, bytes_moved=io2)
 
         record("softmax", shape,
                lambda: fusedtok.softmax(x),
                lambda: torch.softmax(x, -1),
-               iters, bytes_moved=io_bytes)
+               iters, bytes_moved=io2)
 
         record("silu", shape,
                lambda: fusedtok.silu(x),
                lambda: torch.nn.functional.silu(x),
-               iters, bytes_moved=io_bytes)
+               iters, bytes_moved=io2)
 
         record("gelu(erf)", shape,
                lambda: fusedtok.gelu(x),
                lambda: torch.nn.functional.gelu(x),
-               iters, bytes_moved=io_bytes)
+               iters, bytes_moved=io2)
 
         record("swiglu", shape,
                lambda: fusedtok.swiglu(x, r),

@@ -1,13 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
-project(fusedtok VERSION 1.2.0 LANGUAGES CXX CUDA)
+project(fusedtok VERSION 1.2.1 LANGUAGES CXX CUDA)
 
 # C++17 for host code; CUDA follows via nvcc default
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Target GPU architectures: native sm_80 (A100) and sm_86 (RTX 30) cubins
-# plus a compute_86 PTX embed so newer architectures (RTX 40/50, sm_89+) can
-# JIT the kernels with their drivers.
+# Target GPU architectures: explicit sm_80 (A100) and sm_86 (RTX 30)
+# cubins plus a compute_86 PTX embed so newer architectures (RTX 40/50,
+# H100, sm_89+) JIT the kernels with their drivers (Hopper has no native
+# cubin here; it JITs the sm_86 PTX like the rest).
 # Set unconditionally (not only when undefined): build frontends may inject
 # an empty CMAKE_CUDA_ARCHITECTURES that would otherwise fall back to the
 # compiler default. Override with -DFUSEDTOK_CUDA_ARCHITECTURES="..." if
@@ -49,15 +50,24 @@ if(SKBUILD)
     install(TARGETS _fusedtok LIBRARY DESTINATION fusedtok)
 endif()
 
-# Suppress C4819 (codepage warning) on MSVC hosts, and force the conforming
-# preprocessor (CCCL / cooperative_groups headers refuse the traditional one).
-# Options must be routed per-language: nvcc rejects a bare "/Zc:..." or
-# "/wd4819" on a CUDA source as a stray input file, so CUDA sources get them
-# wrapped in -Xcompiler, CXX sources get them directly.
+# Host-compiler warnings: MSVC /W3, GCC/Clang -Wall -Wextra (routed per
+# language, CUDA host code via -Xcompiler). Kept visible but not fatal -
+# third-party headers (pybind11, CCCL) are the noise floor; the first-
+# party sources must compile warning-clean under these levels (any new
+# warning from our own code is treated as a build smell).
+# C4819 (codepage) is suppressed on MSVC hosts, and the conforming
+# preprocessor is forced (CCCL / cooperative_groups headers refuse the
+# traditional one).
 if(MSVC)
     target_compile_options(_fusedtok PRIVATE
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4819>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>"
         "$<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>"
-        "$<$<COMPILE_LANGUAGE:CXX>:/wd4819>")
+        "$<$<COMPILE_LANGUAGE:CXX>:/wd4819>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/W3>")
+else()
+    target_compile_options(_fusedtok PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>"
+        "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra>")
 endif()

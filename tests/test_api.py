@@ -78,9 +78,7 @@ def test_no_public_leaks_beyond_all():
     # starts with an underscore
     public = {n for n in vars(fusedtok)
               if not n.startswith("_") and callable(getattr(fusedtok, n))}
-    leaked = public - FROZEN_API - {"_fusedtok"}
-    # _fusedtok is the compiled extension module object; it is not a
-    # callable, the filter above keeps it only defensively
+    leaked = public - FROZEN_API
     assert not leaked, f"undocumented public callables: {sorted(leaked)}"
 
 

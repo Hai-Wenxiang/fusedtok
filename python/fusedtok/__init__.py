@@ -10,9 +10,11 @@ The Python layer dispatches between three execution paths:
 - numpy / torch CPU (default) -> the C++ CPU reference implementation
                          (ground truth; runs on machines without a GPU).
 
-All functions accept float32 numpy arrays or torch tensors (any dtype is
-accepted and converted to float32 with a copy; outputs are float32).
-Row-wise ops accept 1-D (one row) or 2-D contiguous arrays.
+All functions accept float32 numpy arrays or torch tensors (other dtypes
+are converted to float32 with a copy when needed; outputs are float32).
+CUDA torch tensors keep their native storage dtype where kernels support
+it (bfloat16 everywhere data moves, float16 on attention). Row-wise ops
+accept 1-D (one row) or 2-D contiguous arrays.
 """
 
 import numpy as np
@@ -30,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 __all__ = [
     "cuda_available",
@@ -87,8 +89,9 @@ def _torch_to_numpy(t, name):
     the tensor already is float32/contiguous)."""
     if t.is_cuda:
         raise TypeError(
-            f"{name} is a CUDA tensor; call with cuda=True or keep it on GPU "
-            "(the zero-copy path is selected automatically)"
+            f"{name} is a CUDA tensor while another input is host-side; "
+            "move all inputs to the same device (CUDA tensors select the "
+            "zero-copy path automatically, host inputs the CPU reference)"
         )
     if t.dtype is not torch.float32:
         t = t.to(torch.float32)
@@ -97,17 +100,30 @@ def _torch_to_numpy(t, name):
     return t.detach().numpy()
 
 
-def _numpy_to_torch_like(arr, ref):
+def _numpy_to_torch_like(arr):
     """Fresh numpy array -> torch tensor sharing its memory."""
     return torch.from_numpy(arr)
+
+
+def _require_cuda(t, name):
+    """Device-family guard for secondary operands: once the primary input
+    picked the zero-copy path, every tensor operand must live on the same
+    GPU (a host copy would silently diverge from the kernel's view)."""
+    if not (_is_torch(t) and t.is_cuda):
+        raise TypeError(f"{name} must be a CUDA tensor when the primary "
+                        "input is on CUDA")
+
+
+def _check_contiguous(t, name):
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
 
 
 def _check_torch_f32(t, name):
     if t.dtype is not torch.float32:
         raise TypeError(f"{name} must be float32, got {t.dtype} "
                         "(convert with .to(torch.float32))")
-    if not t.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    _check_contiguous(t, name)
 
 
 def _check_torch_float(t, name):
@@ -115,8 +131,7 @@ def _check_torch_float(t, name):
     if t.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(f"{name} must be float32 or bfloat16, got {t.dtype} "
                         "(convert with .to(torch.float32))")
-    if not t.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    _check_contiguous(t, name)
 
 
 def _check_torch_att(t, name):
@@ -126,21 +141,27 @@ def _check_torch_att(t, name):
     if t.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise TypeError(f"{name} must be float32, bfloat16 or float16, "
                         f"got {t.dtype} (convert with .to(torch.float32))")
-    if not t.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    _check_contiguous(t, name)
 
 
-def _att_launch_fn(t, base):
-    """The bindings entry point for t's storage dtype ('_launch' suffix
-    style: attention_decode_launch / ..._bf16 / ..._fp16)."""
-    if t.dtype is torch.bfloat16:
+def _launch_for_dtype(dtype, base, fp16=False):
+    """Bindings entry point for a storage dtype. Suffix convention:
+    ``base`` = float32 kernel, ``base + '_bf16'`` / ``base + '_fp16'``
+    = the half-precision instantiations (fp16 exists for attention
+    only)."""
+    if dtype is torch.bfloat16:
         return getattr(_fusedtok, base + "_bf16")
-    if t.dtype is torch.float16:
+    if fp16 and dtype is torch.float16:
         return getattr(_fusedtok, base + "_fp16")
     return getattr(_fusedtok, base)
 
 
-def _norm_weight_f32(weight, ref):
+def _att_launch_fn(t, base):
+    """The attention launcher for t's storage dtype."""
+    return _launch_for_dtype(t.dtype, base, fp16=True)
+
+
+def _norm_weight_f32(weight):
     """Norm weights must reach the kernel as float32 (they commonly are in
     checkpoints, and the bf16 kernels read them as float). Small [cols]
     upcast copy when the caller hands us bf16."""
@@ -157,6 +178,103 @@ def _cuda_stream():
     surrounding torch work and makes them CUDA-graph capturable.
     """
     return torch.cuda.current_stream().cuda_stream
+
+
+def _host_int_array(t):
+    """Host-origin value (list / numpy / CPU tensor) -> int numpy array,
+    or None when t is a device-resident tensor."""
+    if _is_torch(t):
+        if t.is_cuda:
+            return None
+        return t.detach().cpu().numpy()
+    return np.asarray(t)
+
+
+def _i32_cuda_arg(t, device):
+    """Coerce a host-side value / torch tensor to a contiguous int32 CUDA
+    tensor (lens, block tables). Device-resident tensors pass through
+    with at most a device-side dtype/contiguity fixup - their VALUES are
+    never read back: a readback would sync the stream (breaking the
+    zero-copy contract and CUDA-graph capture), the same trust boundary
+    as a raw pointer. Host-origin values ARE validated by the callers
+    (via _host_int_array) before the upload."""
+    host = _host_int_array(t)
+    if host is not None:
+        return torch.from_numpy(
+            np.ascontiguousarray(host, dtype=np.int32)).to(device)
+    tt = t
+    if tt.dtype is not torch.int32:
+        tt = tt.to(torch.int32)
+    if not tt.is_contiguous():
+        tt = tt.contiguous()
+    return tt
+
+
+def _lens_arg(lens, batch, limit, device, upper_inclusive=True):
+    """Validated lens tensor for the attention kernels: 1-D int32 with
+    batch entries, values in [0, limit] (or [0, limit) when the caller
+    marks the upper bound exclusive - kv_append writes AT lens[b], so
+    lens[b] itself must be a mapped position). Device-resident lens
+    tensors are trusted; host-origin values are checked before upload."""
+    host = _host_int_array(lens)
+    if host is not None:
+        host = np.ascontiguousarray(host, dtype=np.int32)
+        if host.ndim != 1 or host.shape[0] != batch:
+            raise ValueError("lens must be 1-D with batch entries")
+        bracket = "]" if upper_inclusive else ")"
+        if host.size and (host.min() < 0 or host.max() > limit
+                          or (not upper_inclusive and host.max() == limit)):
+            raise ValueError(f"lens entries must be in [0, {limit}{bracket}")
+        return torch.from_numpy(host).to(device)
+    lt = _i32_cuda_arg(lens, device)
+    if lt.ndim != 1 or lt.numel() != batch:
+        raise ValueError("lens must be 1-D with batch entries")
+    return lt
+
+
+def _table_arg(table, batch, nblocks, device):
+    """Validated block_table tensor: [B, S] int32, host-origin values in
+    [0, nblocks). Device-resident tables are trusted (see
+    _i32_cuda_arg for the trust boundary)."""
+    host = _host_int_array(table)
+    if host is not None:
+        host = np.ascontiguousarray(host, dtype=np.int32)
+        if host.ndim != 2 or host.shape[0] != batch:
+            raise ValueError("block_table must be [B, S] with batch rows")
+        if host.size and (host.min() < 0 or host.max() >= nblocks):
+            raise ValueError(f"block_table entries must be in [0, {nblocks})")
+        return torch.from_numpy(host).to(device)
+    bt = _i32_cuda_arg(table, device)
+    if bt.ndim != 2 or bt.shape[0] != batch:
+        raise ValueError("block_table must be [B, S] with batch rows")
+    return bt
+
+
+def _ids_arg(ids, vocab, device, name):
+    """Coerced token-id tensor for the penalty kernels: 1-D int64 on
+    `device`. Host-origin values are validated against [0, vocab) before
+    the upload; a device-resident tensor is trusted (no stream sync -
+    same boundary as _i32_cuda_arg)."""
+    if _is_torch(ids) and ids.is_cuda:
+        it = ids
+        if it.dtype is not torch.int64:
+            it = it.to(torch.int64)
+        if not it.is_contiguous():
+            it = it.contiguous()
+        if it.ndim != 1:
+            raise ValueError(f"{name} must be 1-D")
+        return it
+    if _is_torch(ids):
+        host = np.ascontiguousarray(ids.detach().cpu().numpy(),
+                                    dtype=np.int64)
+        if host.ndim != 1:
+            raise ValueError(f"{name} must be 1-D")
+    else:
+        host = np.ascontiguousarray(np.asarray(ids),
+                                    dtype=np.int64).ravel()
+    if host.size and (host.min() < 0 or host.max() >= vocab):
+        raise ValueError("token id out of range")
+    return torch.from_numpy(host).to(device)
 
 
 def _as_numpy(x, name):
@@ -188,61 +306,60 @@ def _device_path(x, cuda):
 # ---------------------------------------------------------------------------
 
 
-def _unary(x, cuda, staged, cpu, launch, launch_bf16=None):
+def _unary(x, cuda, name):
+    """Unary elementwise op dispatch: `name` selects the staged/cpu
+    bindings and the launcher family (`name`/`name + '_cpu'`/
+    `name + '_launch'[_bf16]`)."""
     path = _device_path(x, cuda)
     if path == "torch-cuda":
         _check_torch_float(x, "x")
         out = torch.empty_like(x)
-        if x.dtype is torch.bfloat16 and launch_bf16 is not None:
-            launch_bf16(x.data_ptr(), out.data_ptr(), x.numel(), _cuda_stream())
-        else:
-            launch(x.data_ptr(), out.data_ptr(), x.numel(), _cuda_stream())
+        _launch_for_dtype(x.dtype, name + "_launch")(
+            x.data_ptr(), out.data_ptr(), x.numel(), _cuda_stream())
         return out
     arr = _as_numpy(x, "x")
-    res = staged(arr) if path == "staged" else cpu(arr)
-    return _numpy_to_torch_like(res, x) if _is_torch(x) else res
+    if path == "staged":
+        res = getattr(_fusedtok, name)(arr)
+    else:
+        res = getattr(_fusedtok, name + "_cpu")(arr)
+    return _numpy_to_torch_like(res) if _is_torch(x) else res
 
 
 def silu(x, *, cuda=False):
     """SiLU / Swish activation: ``v * sigmoid(v)``."""
-    return _unary(x, cuda, _fusedtok.silu, _fusedtok.silu_cpu,
-                  _fusedtok.silu_launch, _fusedtok.silu_launch_bf16)
+    return _unary(x, cuda, "silu")
 
 
 def gelu(x, *, cuda=False):
     """GeLU activation, exact erf form: ``0.5 v (1 + erf(v / sqrt(2)))``."""
-    return _unary(x, cuda, _fusedtok.gelu, _fusedtok.gelu_cpu,
-                  _fusedtok.gelu_launch, _fusedtok.gelu_launch_bf16)
+    return _unary(x, cuda, "gelu")
 
 
 def gelu_tanh(x, *, cuda=False):
     """GeLU activation, tanh approximation (BERT/GPT checkpoint variant)."""
-    return _unary(x, cuda, _fusedtok.gelu_tanh, _fusedtok.gelu_tanh_cpu,
-                  _fusedtok.gelu_tanh_launch, _fusedtok.gelu_tanh_launch_bf16)
+    return _unary(x, cuda, "gelu_tanh")
 
 
 def relu(x, *, cuda=False):
     """ReLU activation: ``max(v, 0)``."""
-    return _unary(x, cuda, _fusedtok.relu, _fusedtok.relu_cpu,
-                  _fusedtok.relu_launch, _fusedtok.relu_launch_bf16)
+    return _unary(x, cuda, "relu")
 
 
 def tanh(x, *, cuda=False):
     """Hyperbolic tangent activation."""
-    return _unary(x, cuda, _fusedtok.tanh, _fusedtok.tanh_cpu,
-                  _fusedtok.tanh_launch, _fusedtok.tanh_launch_bf16)
+    return _unary(x, cuda, "tanh")
 
 
 def sigmoid(x, *, cuda=False):
     """Logistic sigmoid: ``1 / (1 + exp(-v))``."""
-    return _unary(x, cuda, _fusedtok.sigmoid, _fusedtok.sigmoid_cpu,
-                  _fusedtok.sigmoid_launch, _fusedtok.sigmoid_launch_bf16)
+    return _unary(x, cuda, "sigmoid")
 
 
 def temperature(x, t, *, cuda=False):
     """Logit temperature scaling: ``x / t`` with ``t > 0``.
 
-    ``t < 1`` sharpens the distribution, ``t > 1`` flattens it.
+    ``t < 1`` sharpens the distribution, ``t > 1`` flattens it. The CUDA
+    path is float32-only (logits are float32 by convention).
     """
     if not t > 0.0:
         raise ValueError("temperature must be > 0")
@@ -250,24 +367,33 @@ def temperature(x, t, *, cuda=False):
     if path == "torch-cuda":
         _check_torch_f32(x, "x")
         out = torch.empty_like(x)
-        _fusedtok.temperature_launch(x.data_ptr(), out.data_ptr(), x.numel(), t, _cuda_stream())
+        _fusedtok.temperature_launch(x.data_ptr(), out.data_ptr(),
+                                     x.numel(), t, _cuda_stream())
         return out
     arr = _as_numpy(x, "x")
-    res = _fusedtok.temperature(arr, t) if path == "staged" else _fusedtok.temperature_cpu(arr, t)
-    return _numpy_to_torch_like(res, x) if _is_torch(x) else res
+    if path == "staged":
+        res = _fusedtok.temperature(arr, t)
+    else:
+        res = _fusedtok.temperature_cpu(arr, t)
+    return _numpy_to_torch_like(res) if _is_torch(x) else res
 
 
 def axpy(x, a=1.0, b=0.0, *, cuda=False):
-    """Skeleton demo op: ``y = a * x + b`` elementwise."""
+    """Skeleton demo op: ``y = a * x + b`` elementwise (float32 CUDA
+    path)."""
     path = _device_path(x, cuda)
     if path == "torch-cuda":
         _check_torch_f32(x, "x")
         out = torch.empty_like(x)
-        _fusedtok.axpy_launch(x.data_ptr(), out.data_ptr(), x.numel(), a, b, _cuda_stream())
+        _fusedtok.axpy_launch(x.data_ptr(), out.data_ptr(),
+                              x.numel(), a, b, _cuda_stream())
         return out
     arr = _as_numpy(x, "x")
-    res = _fusedtok.axpy(arr, a, b) if path == "staged" else _fusedtok.axpy_cpu(arr, a, b)
-    return _numpy_to_torch_like(res, x) if _is_torch(x) else res
+    if path == "staged":
+        res = _fusedtok.axpy(arr, a, b)
+    else:
+        res = _fusedtok.axpy_cpu(arr, a, b)
+    return _numpy_to_torch_like(res) if _is_torch(x) else res
 
 
 # ---------------------------------------------------------------------------
@@ -275,46 +401,48 @@ def axpy(x, a=1.0, b=0.0, *, cuda=False):
 # ---------------------------------------------------------------------------
 
 
-def _binary(a, b, cuda, staged, cpu, launch, name, launch_bf16=None):
+def _binary(a, b, cuda, name):
+    """Binary elementwise op dispatch (same naming convention as _unary).
+    The operand names keep validation errors honest about WHICH input
+    failed."""
+    name_a, name_b = ("gate", "up") if name == "swiglu" else ("a", "b")
     if _is_torch(a) and a.is_cuda:
-        if not (_is_torch(b) and b.is_cuda):
-            raise TypeError("both inputs must be CUDA tensors")
-        _check_torch_float(a, name)
-        _check_torch_float(b, name)
+        _require_cuda(b, name_b)
+        _check_torch_float(a, name_a)
+        _check_torch_float(b, name_b)
         if a.dtype is not b.dtype:
             raise TypeError("inputs must have the same dtype")
         if a.shape != b.shape:
             raise ValueError("inputs must have the same shape")
         out = torch.empty_like(a)
-        if a.dtype is torch.bfloat16 and launch_bf16 is not None:
-            launch_bf16(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel(), _cuda_stream())
-        else:
-            launch(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel(), _cuda_stream())
+        _launch_for_dtype(a.dtype, name + "_launch")(
+            a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel(),
+            _cuda_stream())
         return out
-    arr_a = _as_numpy(a, name)
-    arr_b = _as_numpy(b, name)
+    arr_a = _as_numpy(a, name_a)
+    arr_b = _as_numpy(b, name_b)
     if arr_a.shape != arr_b.shape:
         raise ValueError("inputs must have the same shape")
-    res = staged(arr_a, arr_b) if cuda else cpu(arr_a, arr_b)
-    return _numpy_to_torch_like(res, a) if _is_torch(a) else res
+    if cuda:
+        res = getattr(_fusedtok, name)(arr_a, arr_b)
+    else:
+        res = getattr(_fusedtok, name + "_cpu")(arr_a, arr_b)
+    return _numpy_to_torch_like(res) if _is_torch(a) else res
 
 
 def add(a, b, *, cuda=False):
     """Elementwise ``a + b`` (the fused add + residual pattern)."""
-    return _binary(a, b, cuda, _fusedtok.add, _fusedtok.add_cpu,
-                   _fusedtok.add_launch, "a", _fusedtok.add_launch_bf16)
+    return _binary(a, b, cuda, "add")
 
 
 def mul(a, b, *, cuda=False):
     """Elementwise ``a * b``."""
-    return _binary(a, b, cuda, _fusedtok.mul, _fusedtok.mul_cpu,
-                   _fusedtok.mul_launch, "a", _fusedtok.mul_launch_bf16)
+    return _binary(a, b, cuda, "mul")
 
 
 def swiglu(gate, up, *, cuda=False):
     """SwiGLU activation: ``silu(gate) * up``."""
-    return _binary(gate, up, cuda, _fusedtok.swiglu, _fusedtok.swiglu_cpu,
-                   _fusedtok.swiglu_launch, "gate", _fusedtok.swiglu_launch_bf16)
+    return _binary(gate, up, cuda, "swiglu")
 
 
 # ---------------------------------------------------------------------------
@@ -332,13 +460,11 @@ def rmsnorm(x, weight, *, residual=None, eps=1e-6, cuda=False):
     path = _device_path(x, cuda)
     if path == "torch-cuda":
         _check_torch_float(x, "x")
-        if not (_is_torch(weight) and weight.is_cuda):
-            raise TypeError("weight must be a CUDA tensor when x is on CUDA")
-        weight = _norm_weight_f32(weight, x)
+        _require_cuda(weight, "weight")
+        weight = _norm_weight_f32(weight)
         r_ptr = None
         if residual is not None:
-            if not (_is_torch(residual) and residual.is_cuda):
-                raise TypeError("residual must be a CUDA tensor when x is on CUDA")
+            _require_cuda(residual, "residual")
             _check_torch_float(residual, "residual")
             if residual.dtype is not x.dtype:
                 raise TypeError("residual must have the same dtype as x")
@@ -347,26 +473,19 @@ def rmsnorm(x, weight, *, residual=None, eps=1e-6, cuda=False):
             r_ptr = residual.data_ptr()
         rows, cols = _shape_rows_cols(x)
         out = torch.empty_like(x)
-        if x.dtype is torch.bfloat16:
-            _fusedtok.rmsnorm_launch_bf16(x.data_ptr(), weight.data_ptr(),
-                                          r_ptr, out.data_ptr(), rows, cols, eps,
-                                          _cuda_stream())
-        else:
-            _fusedtok.rmsnorm_launch(x.data_ptr(), weight.data_ptr(), r_ptr,
-                                     out.data_ptr(), rows, cols, eps,
-                                     _cuda_stream())
+        _launch_for_dtype(x.dtype, "rmsnorm_launch")(
+            x.data_ptr(), weight.data_ptr(), r_ptr, out.data_ptr(),
+            rows, cols, eps, _cuda_stream())
         return out
     arr_x = _as_numpy(x, "x")
-    res = (
-        _fusedtok.rmsnorm(arr_x, _as_numpy(weight, "weight"),
-                          None if residual is None else _as_numpy(residual, "residual"),
-                          eps)
-        if path == "staged"
-        else _fusedtok.rmsnorm_cpu(arr_x, _as_numpy(weight, "weight"),
-                                   None if residual is None else _as_numpy(residual, "residual"),
-                                   eps)
-    )
-    return _numpy_to_torch_like(res, x) if _is_torch(x) else res
+    args = (arr_x, _as_numpy(weight, "weight"),
+            None if residual is None else _as_numpy(residual, "residual"),
+            eps)
+    if path == "staged":
+        res = _fusedtok.rmsnorm(*args)
+    else:
+        res = _fusedtok.rmsnorm_cpu(*args)
+    return _numpy_to_torch_like(res) if _is_torch(x) else res
 
 
 def _shape_rows_cols(t):
@@ -388,25 +507,22 @@ def layernorm(x, weight, bias, *, eps=1e-6, cuda=False):
     if path == "torch-cuda":
         _check_torch_float(x, "x")
         for name, tv in (("weight", weight), ("bias", bias)):
-            if not (_is_torch(tv) and tv.is_cuda):
-                raise TypeError(f"{name} must be a CUDA tensor when x is on CUDA")
-        weight = _norm_weight_f32(weight, x)
-        bias = _norm_weight_f32(bias, x)
+            _require_cuda(tv, name)
+        weight = _norm_weight_f32(weight)
+        bias = _norm_weight_f32(bias)
         rows, cols = _shape_rows_cols(x)
         out = torch.empty_like(x)
-        if x.dtype is torch.bfloat16:
-            _fusedtok.layernorm_launch_bf16(x.data_ptr(), weight.data_ptr(),
-                                            bias.data_ptr(), out.data_ptr(),
-                                            rows, cols, eps, _cuda_stream())
-        else:
-            _fusedtok.layernorm_launch(x.data_ptr(), weight.data_ptr(),
-                                       bias.data_ptr(), out.data_ptr(),
-                                       rows, cols, eps, _cuda_stream())
+        _launch_for_dtype(x.dtype, "layernorm_launch")(
+            x.data_ptr(), weight.data_ptr(), bias.data_ptr(),
+            out.data_ptr(), rows, cols, eps, _cuda_stream())
         return out
     arr_x = _as_numpy(x, "x")
     args = (arr_x, _as_numpy(weight, "weight"), _as_numpy(bias, "bias"), eps)
-    res = _fusedtok.layernorm(*args) if path == "staged" else _fusedtok.layernorm_cpu(*args)
-    return _numpy_to_torch_like(res, x) if _is_torch(x) else res
+    if path == "staged":
+        res = _fusedtok.layernorm(*args)
+    else:
+        res = _fusedtok.layernorm_cpu(*args)
+    return _numpy_to_torch_like(res) if _is_torch(x) else res
 
 
 def softmax(x, *, cuda=False):
@@ -416,14 +532,15 @@ def softmax(x, *, cuda=False):
         _check_torch_float(x, "x")
         rows, cols = _shape_rows_cols(x)
         out = torch.empty_like(x)
-        if x.dtype is torch.bfloat16:
-            _fusedtok.softmax_launch_bf16(x.data_ptr(), out.data_ptr(), rows, cols, _cuda_stream())
-        else:
-            _fusedtok.softmax_launch(x.data_ptr(), out.data_ptr(), rows, cols, _cuda_stream())
+        _launch_for_dtype(x.dtype, "softmax_launch")(
+            x.data_ptr(), out.data_ptr(), rows, cols, _cuda_stream())
         return out
     arr_x = _as_numpy(x, "x")
-    res = _fusedtok.softmax(arr_x) if path == "staged" else _fusedtok.softmax_cpu(arr_x)
-    return _numpy_to_torch_like(res, x) if _is_torch(x) else res
+    if path == "staged":
+        res = _fusedtok.softmax(arr_x)
+    else:
+        res = _fusedtok.softmax_cpu(arr_x)
+    return _numpy_to_torch_like(res) if _is_torch(x) else res
 
 
 # ---------------------------------------------------------------------------
@@ -457,37 +574,37 @@ def rope(q, k=None, *, theta=10000.0, pos_offset=0, neox=False, cuda=False):
         q_out = torch.empty_like(q)
         k_out = None
         if k is not None:
-            if not (_is_torch(k) and k.is_cuda):
-                raise TypeError("k must be a CUDA tensor when q is on CUDA")
+            _require_cuda(k, "k")
             _check_torch_float(k, "k")
             if k.dtype is not q.dtype:
                 raise TypeError("k must have the same dtype as q")
             if k.shape != q.shape:
                 raise ValueError("k must have the same shape as q")
             k_out = torch.empty_like(k)
+        # float32 ships one bool-dispatch binding; bf16 has per-layout
+        # kernels (the suffix convention cannot express the bool flag)
         if q.dtype is torch.bfloat16:
-            def _launch_rope(neox_flag, src, dst, s, d, th, off):
-                if neox_flag:
-                    _fusedtok.rope_neox_launch_bf16(src, dst, s, d, th, off, _cuda_stream())
-                else:
-                    _fusedtok.rope_launch_bf16(src, dst, s, d, th, off, _cuda_stream())
+            def _rot(src, dst):
+                launch = (_fusedtok.rope_neox_launch_bf16 if neox
+                          else _fusedtok.rope_launch_bf16)
+                launch(src, dst, seq, dim, theta, pos_offset,
+                       _cuda_stream())
         else:
-            def _launch_rope(neox_flag, src, dst, s, d, th, off):
-                _fusedtok.rope_launch(neox_flag, src, dst, s, d, th, off, _cuda_stream())
-        _launch_rope(neox, q.data_ptr(), q_out.data_ptr(), seq, dim,
-                     theta, pos_offset)
+            def _rot(src, dst):
+                _fusedtok.rope_launch(neox, src, dst, seq, dim, theta,
+                                      pos_offset, _cuda_stream())
+        _rot(q.data_ptr(), q_out.data_ptr())
         if k_out is not None:
-            _launch_rope(neox, k.data_ptr(), k_out.data_ptr(), seq, dim,
-                         theta, pos_offset)
+            _rot(k.data_ptr(), k_out.data_ptr())
         return q_out, k_out
     arr_q = _as_numpy(q, "q")
     arr_k = None if k is None else _as_numpy(k, "k")
     call = _fusedtok.rope if path == "staged" else _fusedtok.rope_cpu
     q_res, k_res = call(neox, arr_q, arr_k, theta, pos_offset)
     if _is_torch(q):
-        q_res = _numpy_to_torch_like(q_res, q)
+        q_res = _numpy_to_torch_like(q_res)
         if k_res is not None:
-            k_res = _numpy_to_torch_like(k_res, k)
+            k_res = _numpy_to_torch_like(k_res)
     return q_res, k_res
 
 
@@ -514,8 +631,14 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
     half-precision paths halve the kv-cache bytes (the decode-step
     bottleneck) without changing the softmax numerics. Non-CUDA inputs
     run the float32 CPU reference (numpy has no bf16/fp16).
+
+    ``lens`` values are validated for host-side inputs (lists, numpy,
+    CPU tensors) before the upload; a CUDA lens tensor is trusted as-is
+    - reading it back would sync the stream and break CUDA-graph
+    capture (the same trust boundary as raw device pointers).
     """
-    if _device_path(q, cuda) == "torch-cuda":
+    path = _device_path(q, cuda)
+    if path == "torch-cuda":
         for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
             _check_torch_att(t, name)
         for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
@@ -531,20 +654,7 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
             raise ValueError("q heads must be a multiple of kv heads")
         lens_ptr = None
         if lens is not None:
-            if _is_torch(lens):
-                lt = lens
-                if not lt.is_cuda:
-                    lt = lt.to(q.device)
-                if lt.dtype is not torch.int32:
-                    lt = lt.to(torch.int32)
-                lt = lt.contiguous()
-            else:
-                lt = torch.as_tensor(lens, dtype=torch.int32,
-                                     device=q.device)
-            if lt.ndim != 1 or lt.numel() != b:
-                raise ValueError("lens must be 1-D with batch entries")
-            if lt.numel() and (int(lt.min()) < 0 or int(lt.max()) > t_rows):
-                raise ValueError("lens entries must be in [0, T]")
+            lt = _lens_arg(lens, b, t_rows, q.device)
             lens_ptr = lt.data_ptr()
         out = torch.empty((b, hq, d), dtype=q.dtype, device=q.device)
         if b * hq > 0:
@@ -562,12 +672,14 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
     b2, hkv, t_rows, d2 = arr_k.shape
     if (b2, d2) != (b, d) or arr_v.shape != arr_k.shape:
         raise ValueError("k_cache/v_cache must match q's batch and dim")
+    if hq % hkv:
+        raise ValueError("q heads must be a multiple of kv heads")
     arr_lens = None if lens is None else np.ascontiguousarray(
         np.asarray(lens, dtype=np.int32))
-    call = (_fusedtok.attention_decode if _device_path(q, cuda) == "staged"
+    call = (_fusedtok.attention_decode if path == "staged"
             else _fusedtok.attention_decode_cpu)
     res = call(arr_q, arr_k, arr_v, arr_lens, b, hq, hkv, t_rows, d)
-    return _numpy_to_torch_like(res, q) if _is_torch(q) else res
+    return _numpy_to_torch_like(res) if _is_torch(q) else res
 
 
 def attention_prefill(q, k, v, causal=True, *, cuda=False):
@@ -588,7 +700,8 @@ def attention_prefill(q, k, v, causal=True, *, cuda=False):
     prefill still belongs to SDPA/FlashAttention). Non-CUDA inputs run
     the float32 CPU reference.
     """
-    if _device_path(q, cuda) == "torch-cuda":
+    path = _device_path(q, cuda)
+    if path == "torch-cuda":
         for name, t in (("q", q), ("k", k), ("v", v)):
             _check_torch_att(t, name)
         for name, t in (("k", k), ("v", v)):
@@ -617,10 +730,12 @@ def attention_prefill(q, k, v, causal=True, *, cuda=False):
     b2, hkv, s2, d2 = arr_k.shape
     if (b2, s2, d2) != (b, s, d) or arr_v.shape != arr_k.shape:
         raise ValueError("k/v must match q's batch, seq and dim")
-    call = (_fusedtok.attention_prefill if _device_path(q, cuda) == "staged"
+    if hq % hkv:
+        raise ValueError("q heads must be a multiple of kv heads")
+    call = (_fusedtok.attention_prefill if path == "staged"
             else _fusedtok.attention_prefill_cpu)
     res = call(arr_q, arr_k, arr_v, b, hq, hkv, s, d, bool(causal))
-    return _numpy_to_torch_like(res, q) if _is_torch(q) else res
+    return _numpy_to_torch_like(res) if _is_torch(q) else res
 
 
 def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
@@ -648,7 +763,8 @@ def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
     shape up once outside the capture (the split workspace must
     pre-exist).
     """
-    if _device_path(q, cuda) == "torch-cuda":
+    path = _device_path(q, cuda)
+    if path == "torch-cuda":
         for name, t in (("q", q), ("k_pool", k_pool), ("v_pool", v_pool)):
             _check_torch_att(t, name)
         for name, t in (("k_pool", k_pool), ("v_pool", v_pool)):
@@ -665,36 +781,11 @@ def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
         if hq // hkv not in (1, 2, 4, 8, 16):
             raise ValueError("paged decode supports GQA group sizes "
                              "1/2/4/8/16 (use attention_decode otherwise)")
-        if _is_torch(block_table):
-            bt = block_table
-            if not bt.is_cuda:
-                bt = bt.to(q.device)
-            if bt.dtype is not torch.int32:
-                bt = bt.to(torch.int32)
-            bt = bt.contiguous()
-        else:
-            bt = torch.as_tensor(block_table, dtype=torch.int32,
-                                 device=q.device)
-        if bt.ndim != 2 or bt.shape[0] != b:
-            raise ValueError("block_table must be [B, S] with batch rows")
+        bt = _table_arg(block_table, b, nb, q.device)
         s_width = bt.shape[1]
         lens_ptr = None
         if lens is not None:
-            if _is_torch(lens):
-                lt = lens
-                if not lt.is_cuda:
-                    lt = lt.to(q.device)
-                if lt.dtype is not torch.int32:
-                    lt = lt.to(torch.int32)
-                lt = lt.contiguous()
-            else:
-                lt = torch.as_tensor(lens, dtype=torch.int32,
-                                     device=q.device)
-            if lt.ndim != 1 or lt.numel() != b:
-                raise ValueError("lens must be 1-D with batch entries")
-            if lt.numel() and (int(lt.min()) < 0 or
-                               int(lt.max()) > s_width * page):
-                raise ValueError("lens entries must be in [0, S * P]")
+            lt = _lens_arg(lens, b, s_width * page, q.device)
             lens_ptr = lt.data_ptr()
         out = torch.empty((b, hq, d), dtype=q.dtype, device=q.device)
         if b * hq > 0:
@@ -717,16 +808,19 @@ def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
         raise ValueError("pools must match q's dim and each other")
     if hq % hkv:
         raise ValueError("q heads must be a multiple of kv heads")
+    if hq // hkv not in (1, 2, 4, 8, 16):
+        raise ValueError("paged decode supports GQA group sizes "
+                         "1/2/4/8/16 (use attention_decode otherwise)")
     if arr_t.shape[0] != b:
         raise ValueError("block_table must have one row per sequence")
     arr_lens = None if lens is None else np.ascontiguousarray(
         np.asarray(lens, dtype=np.int32))
     call = (_fusedtok.attention_decode_paged
-            if _device_path(q, cuda) == "staged"
+            if path == "staged"
             else _fusedtok.attention_decode_paged_cpu)
     res = call(arr_q, arr_k, arr_v, arr_t, arr_lens, b, hq, hkv, page,
                arr_t.shape[1], nb, d)
-    return _numpy_to_torch_like(res, q) if _is_torch(q) else res
+    return _numpy_to_torch_like(res) if _is_torch(q) else res
 
 
 def kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens,
@@ -744,12 +838,14 @@ def kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens,
     entries (a position in an unmapped block is invalid input).
 
     CUDA pools may be float32, bfloat16 or float16 (rows copied in the
-    storage dtype; k_new must match the pool dtype). Table/lens values
-    are validated on CPU/staged paths and trusted on the zero-copy path
-    (same trust boundary as attention_decode_paged). Returns None; the
-    pools are mutated in place.
+    storage dtype; k_new must match the pool dtype). Host-origin
+    table/lens values are validated before the upload; device-resident
+    tensors are trusted (same trust boundary as
+    attention_decode_paged). Returns None; the pools are mutated in
+    place.
     """
-    if _device_path(k_pool, cuda) == "torch-cuda":
+    path = _device_path(k_pool, cuda)
+    if path == "torch-cuda":
         for name, t in (("k_pool", k_pool), ("v_pool", v_pool),
                         ("k_new", k_new), ("v_new", v_new)):
             _check_torch_att(t, name)
@@ -768,30 +864,9 @@ def kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens,
             raise ValueError("k/v operands must match the pool layout")
         if b == 0:
             return None
-        if _is_torch(block_table):
-            bt = block_table
-            if not bt.is_cuda:
-                bt = bt.to(k_pool.device)
-            if bt.dtype is not torch.int32:
-                bt = bt.to(torch.int32)
-            bt = bt.contiguous()
-        else:
-            bt = torch.as_tensor(block_table, dtype=torch.int32,
-                                 device=k_pool.device)
-        if bt.ndim != 2 or bt.shape[0] != b:
-            raise ValueError("block_table must be [B, S] with batch rows")
-        if _is_torch(lens):
-            lt = lens
-            if not lt.is_cuda:
-                lt = lt.to(k_pool.device)
-            if lt.dtype is not torch.int32:
-                lt = lt.to(torch.int32)
-            lt = lt.contiguous()
-        else:
-            lt = torch.as_tensor(lens, dtype=torch.int32,
-                                 device=k_pool.device)
-        if lt.ndim != 1 or lt.numel() != b:
-            raise ValueError("lens must be 1-D with batch entries")
+        bt = _table_arg(block_table, b, nb, k_pool.device)
+        lt = _lens_arg(lens, b, bt.shape[1] * page, k_pool.device,
+                       upper_inclusive=False)
         _att_launch_fn(k_pool, "kv_append_paged_launch")(
             k_new.data_ptr(), v_new.data_ptr(), bt.data_ptr(),
             lt.data_ptr(), k_pool.data_ptr(), v_pool.data_ptr(),
@@ -818,7 +893,7 @@ def kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens,
     b = arr_kn.shape[0]
     if arr_t.shape[0] != b or arr_l.shape != (b,):
         raise ValueError("block_table rows / lens must match the batch")
-    if _device_path(k_pool, cuda) == "staged":
+    if path == "staged":
         _fusedtok.kv_append_paged(arr_kn, arr_vn, arr_t, arr_l, arr_kp,
                                   arr_vp, b, hkv, d, page, arr_t.shape[1],
                                   nb)
@@ -840,14 +915,20 @@ def argmax(x, *, cuda=False):
     if path == "torch-cuda":
         _check_torch_f32(x, "x")
         if x.ndim != 1:
-            raise ValueError("argmax expects 1-D input")
+            raise ValueError("x must be 1-D for argmax")
+        if x.numel() == 0:
+            # the GPU launcher skips empty inputs without writing the
+            # output slot - raise here to match the CPU reference
+            raise ValueError("argmax of empty input")
         out = torch.empty(1, dtype=torch.int32, device=x.device)
-        _fusedtok.argmax_launch(x.data_ptr(), out.data_ptr(), x.numel(), _cuda_stream())
+        _fusedtok.argmax_launch(x.data_ptr(), out.data_ptr(),
+                                x.numel(), _cuda_stream())
         return int(out.item())
     arr = _as_numpy(x, "x")
     if arr.ndim != 1:
-        raise ValueError("argmax expects 1-D input")
-    return int(_fusedtok.argmax(arr) if path == "staged" else _fusedtok.argmax_cpu(arr))
+        raise ValueError("x must be 1-D for argmax")
+    call = _fusedtok.argmax if path == "staged" else _fusedtok.argmax_cpu
+    return int(call(arr))
 
 
 def topk(x, k, *, cuda=False):
@@ -857,7 +938,7 @@ def topk(x, k, *, cuda=False):
     if path == "torch-cuda":
         _check_torch_f32(x, "x")
         if x.ndim != 1:
-            raise ValueError("topk expects 1-D input")
+            raise ValueError("x must be 1-D for topk")
         n = x.numel()
         if not 0 <= k <= n:
             raise ValueError("k must be in [0, n]")
@@ -869,11 +950,11 @@ def topk(x, k, *, cuda=False):
         return vals, idxs
     arr = _as_numpy(x, "x")
     if arr.ndim != 1:
-        raise ValueError("topk expects 1-D input")
+        raise ValueError("x must be 1-D for topk")
     call = _fusedtok.topk if path == "staged" else _fusedtok.topk_cpu
     vals, idxs = call(arr, k)
     if _is_torch(x):
-        vals = _numpy_to_torch_like(vals, x)
+        vals = _numpy_to_torch_like(vals)
         idxs = torch.from_numpy(idxs)
     return vals, idxs
 
@@ -888,7 +969,7 @@ def topp(probs, p, *, cuda=False):
     if path == "torch-cuda":
         _check_torch_f32(probs, "probs")
         if probs.ndim != 1:
-            raise ValueError("topp expects 1-D input")
+            raise ValueError("probs must be 1-D for topp")
         n = probs.numel()
         if n == 0:
             return (torch.empty(0, dtype=torch.float32, device=probs.device),
@@ -903,11 +984,11 @@ def topp(probs, p, *, cuda=False):
         return vals[:c], idxs[:c]
     arr = _as_numpy(probs, "probs")
     if arr.ndim != 1:
-        raise ValueError("topp expects 1-D input")
+        raise ValueError("probs must be 1-D for topp")
     call = _fusedtok.topp if path == "staged" else _fusedtok.topp_cpu
     vals, idxs = call(arr, p)
     if _is_torch(probs):
-        vals = _numpy_to_torch_like(vals, probs)
+        vals = _numpy_to_torch_like(vals)
         idxs = torch.from_numpy(idxs)
     return vals, idxs
 
@@ -919,6 +1000,9 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
     ``logit /= penalty`` if positive, ``logit *= penalty`` if negative.
 
     logits: 1-D [vocab]; token_ids: 1-D ints; penalty > 0 (1.0 = disabled).
+    Host-side token id values are validated against the vocab; a CUDA
+    ids tensor is trusted (no stream sync - see the lens note in
+    :func:`attention_decode`).
     """
     if not penalty > 0.0:
         raise ValueError("penalty must be > 0")
@@ -928,17 +1012,7 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
         if logits.ndim != 1:
             raise ValueError("logits must be 1-D")
         n = logits.numel()
-        if _is_torch(token_ids):
-            ids = token_ids
-        else:
-            ids = torch.as_tensor(token_ids, dtype=torch.int64)
-        if ids.ndim != 1:
-            raise ValueError("token_ids must be 1-D")
-        if ids.numel() and (ids.min() < 0 or ids.max() >= n):
-            raise ValueError("token id out of range")
-        if not ids.is_cuda:
-            ids = ids.to(logits.device)
-        ids = ids.to(torch.int64).contiguous()
+        ids = _ids_arg(token_ids, n, logits.device, "token_ids")
         out = torch.empty_like(logits)
         _fusedtok.repetition_penalty_launch(
             logits.data_ptr(), ids.data_ptr(), out.data_ptr(),
@@ -949,15 +1023,18 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
     call = (_fusedtok.repetition_penalty if path == "staged"
             else _fusedtok.repetition_penalty_cpu)
     res = call(arr, ids, penalty)
-    return _numpy_to_torch_like(res, logits) if _is_torch(logits) else res
+    return _numpy_to_torch_like(res) if _is_torch(logits) else res
 
 
 def quantize_int8(x):
     """Symmetric per-tensor INT8 quantization (storage path).
 
     ``scale = max(|x|) / 127``; ``q = clamp(round(x / scale), -127, 127)``.
-    Returns ``(q, scale)`` where q is an int8 array/tensor matching the
-    input family. CUDA tensors run the zero-copy launcher (f32 in).
+    Returns ``(q, scale)`` where q matches the input family and scale is
+    a Python float on EVERY path (reading the scale back is inherent to
+    returning a host value; every consumer - dequantize, qgemm - takes a
+    host float, so a device-resident scale would just defer the same
+    readback with an inconsistent return type).
     """
     path = _device_path(x, cuda=False)
     if path == "torch-cuda":
@@ -967,7 +1044,7 @@ def quantize_int8(x):
         _fusedtok.quantize_launch(x.data_ptr(), q.data_ptr(),
                                   scale.data_ptr(), x.numel(),
                                   _cuda_stream())
-        return q, scale
+        return q, float(scale)
     arr = _as_numpy(x, "x")
     q, s = _fusedtok.quantize_int8_cpu(arr)
     if _is_torch(x):
@@ -976,11 +1053,17 @@ def quantize_int8(x):
 
 
 def dequantize_int8(q, scale):
-    """Dequantize int8 to float32: ``x = q * scale``. Accepts the tuple
-    from :func:`quantize_int8` or separate (q, scale) values. CUDA int8
-    tensors take the zero-copy launcher; numpy and CPU tensors take the
-    C++ CPU reference."""
+    """Dequantize int8 to float32: ``x = q * scale``.
+
+    Accepts the UNPACKED pair from :func:`quantize_int8`:
+    ``dequantize_int8(*quantize_int8(x))`` - passing the tuple itself is
+    not valid. The CUDA path requires an int8 C-contiguous tensor (a
+    wrong dtype or layout would be read as raw bytes); numpy and CPU
+    tensors take the C++ CPU reference."""
     if _device_path(q, cuda=False) == "torch-cuda":
+        if q.dtype is not torch.int8:
+            raise TypeError(f"q must be int8, got {q.dtype}")
+        _check_contiguous(q, "q")
         x = torch.empty(q.shape, dtype=torch.float32, device=q.device)
         _fusedtok.dequantize_launch(q.data_ptr(), x.data_ptr(),
                                     float(scale), q.numel(),
@@ -988,18 +1071,21 @@ def dequantize_int8(q, scale):
         return x
     arr = np.asarray(q)
     out = _fusedtok.dequantize_int8_cpu(arr, float(scale))
-    return _numpy_to_torch_like(out, q) if _is_torch(q) else out
+    return _numpy_to_torch_like(out) if _is_torch(q) else out
 
 
 def qadd_int8(qa, sa, qb, sb):
     """Fused dequant-add-requant for int8 tensors: computes
     ``qa*sa + qb*sb`` in float32 and requantizes with the output's own
-    per-tensor scale. Returns ``(qy, out_scale)``. One device pass instead
-    of dequant -> add -> quant round trips."""
-    if not (_is_torch(qa) and qa.is_cuda and _is_torch(qb) and qb.is_cuda):
-        raise TypeError("qadd_int8 requires CUDA int8 tensors")
+    per-tensor scale. Returns ``(qy, out_scale)`` with out_scale a
+    Python float (same readback note as :func:`quantize_int8`). One
+    device pass instead of dequant -> add -> quant round trips."""
+    _require_cuda(qa, "qa")
+    _require_cuda(qb, "qb")
     if qa.dtype is not torch.int8 or qb.dtype is not torch.int8:
         raise TypeError("inputs must be int8")
+    _check_contiguous(qa, "qa")
+    _check_contiguous(qb, "qb")
     if qa.shape != qb.shape:
         raise ValueError("inputs must have the same shape")
     qy = torch.empty(qa.shape, dtype=torch.int8, device=qa.device)
@@ -1007,7 +1093,26 @@ def qadd_int8(qa, sa, qb, sb):
     _fusedtok.qadd_launch(qa.data_ptr(), qb.data_ptr(), float(sa), float(sb),
                           qy.data_ptr(), out_scale.data_ptr(), qa.numel(),
                           _cuda_stream())
-    return qy, out_scale
+    return qy, float(out_scale)
+
+
+def _qgemm_operands(a_q, b_q):
+    """Shared CUDA-path validation for qgemm / qgemm_perchannel: both
+    int8, both 2-D row-major-along-K, inner dims matching. Returns
+    (m, n, k)."""
+    if not (_is_torch(b_q) and b_q.is_cuda):
+        raise TypeError("both operands must be CUDA int8 tensors")
+    if a_q.dtype is not torch.int8 or b_q.dtype is not torch.int8:
+        raise TypeError("operands must be int8")
+    _check_contiguous(a_q, "a_q")
+    _check_contiguous(b_q, "b_q")
+    if a_q.ndim != 2 or b_q.ndim != 2:
+        raise ValueError("operands must be 2-D [rows, K]")
+    m, k = a_q.shape
+    n, k2 = b_q.shape
+    if k != k2:
+        raise ValueError("inner dimensions must match")
+    return m, n, k
 
 
 def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
@@ -1022,16 +1127,7 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
     exact and the combined scale applies once at the store.
     """
     if _device_path(a_q, cuda=False) == "torch-cuda":
-        if not (_is_torch(b_q) and b_q.is_cuda):
-            raise TypeError("both operands must be CUDA int8 tensors")
-        if a_q.dtype is not torch.int8 or b_q.dtype is not torch.int8:
-            raise TypeError("operands must be int8")
-        if a_q.ndim != 2 or b_q.ndim != 2:
-            raise ValueError("operands must be 2-D [rows, K]")
-        m, k = a_q.shape
-        n, k2 = b_q.shape
-        if k != k2:
-            raise ValueError("inner dimensions must match")
+        m, n, k = _qgemm_operands(a_q, b_q)
         y = torch.empty((m, n), dtype=torch.float32, device=a_q.device)
         # the launcher no-ops empty operands and zero-fills K == 0
         if m > 0 and n > 0:
@@ -1050,7 +1146,7 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
         raise ValueError("inner dimensions must match")
     call = (_fusedtok.qgemm if cuda else _fusedtok.qgemm_cpu)
     res = call(a, b, m, n, k, float(a_scale), float(b_scale))
-    return _numpy_to_torch_like(res, a_q) if _is_torch(a_q) else res
+    return _numpy_to_torch_like(res) if _is_torch(a_q) else res
 
 
 def qgemm_perchannel(a_q, a_scale, b_q, b_scales, *, cuda=False):
@@ -1071,16 +1167,7 @@ def qgemm_perchannel(a_q, a_scale, b_q, b_scales, *, cuda=False):
     BIT-IDENTICAL. ``M == 1`` dispatches to the warp-per-row GEMV.
     """
     if _device_path(a_q, cuda=False) == "torch-cuda":
-        if not (_is_torch(b_q) and b_q.is_cuda):
-            raise TypeError("both operands must be CUDA int8 tensors")
-        if a_q.dtype is not torch.int8 or b_q.dtype is not torch.int8:
-            raise TypeError("operands must be int8")
-        if a_q.ndim != 2 or b_q.ndim != 2:
-            raise ValueError("operands must be 2-D [rows, K]")
-        m, k = a_q.shape
-        n, k2 = b_q.shape
-        if k != k2:
-            raise ValueError("inner dimensions must match")
+        m, n, k = _qgemm_operands(a_q, b_q)
         if not _is_torch(b_scales):
             b_scales = torch.as_tensor(b_scales, dtype=torch.float32,
                                        device=a_q.device)
@@ -1113,7 +1200,7 @@ def qgemm_perchannel(a_q, a_scale, b_q, b_scales, *, cuda=False):
     call = (_fusedtok.qgemm_perchannel if cuda
             else _fusedtok.qgemm_perchannel_cpu)
     res = call(a, b, sb, m, n, k, float(a_scale))
-    return _numpy_to_torch_like(res, a_q) if _is_torch(a_q) else res
+    return _numpy_to_torch_like(res) if _is_torch(a_q) else res
 
 
 def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
@@ -1143,7 +1230,8 @@ def sample_topp(logits, p, *, temperature=1.0, seed=0, cuda=False):
     arr = _as_numpy(logits, "logits")
     if arr.ndim != 1:
         raise ValueError("logits must be 1-D")
-    call = _fusedtok.sample_topp if path == "staged" else _fusedtok.sample_topp_cpu
+    call = (_fusedtok.sample_topp if path == "staged"
+            else _fusedtok.sample_topp_cpu)
     return int(call(arr, p, temperature, seed))
 
 
@@ -1176,7 +1264,8 @@ def sample_topk(logits, k, *, temperature=1.0, seed=0, cuda=False):
     arr = _as_numpy(logits, "logits")
     if arr.ndim != 1:
         raise ValueError("logits must be 1-D")
-    call = _fusedtok.sample_topk if path == "staged" else _fusedtok.sample_topk_cpu
+    call = (_fusedtok.sample_topk if path == "staged"
+            else _fusedtok.sample_topk_cpu)
     return int(call(arr, k, temperature, seed))
 
 
@@ -1205,17 +1294,7 @@ def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,
         if logits.ndim != 1:
             raise ValueError("logits must be 1-D")
         n = logits.numel()
-        if _is_torch(sampled_ids):
-            ids = sampled_ids
-        else:
-            ids = torch.as_tensor(sampled_ids, dtype=torch.int64)
-        if ids.ndim != 1:
-            raise ValueError("sampled_ids must be 1-D")
-        if ids.numel() and (ids.min() < 0 or ids.max() >= n):
-            raise ValueError("token id out of range")
-        if not ids.is_cuda:
-            ids = ids.to(logits.device)
-        ids = ids.to(torch.int64).contiguous()
+        ids = _ids_arg(sampled_ids, n, logits.device, "sampled_ids")
         return int(_fusedtok.decode_step_launch(
             logits.data_ptr(), ids.data_ptr(), n, ids.numel(),
             penalty, p, temperature, seed, _cuda_stream()))

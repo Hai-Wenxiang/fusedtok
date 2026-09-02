@@ -4,6 +4,84 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-09-03
+
+Maintenance release on the frozen 1.x API: audit-driven correctness
+fixes (one real latent bug in the selection workspace, several missing
+guards on the dispatch layer), honest benchmark bookkeeping, clean
+builds under compiler warnings, and the documentation restructured
+into topic pages with a full Chinese rewrite. No API signatures
+changed; behavior notes below. 408 tests green on RTX 3060 (Windows,
+CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2); compute-sanitizer
+memcheck/racecheck clean on the touched kernels.
+
+### Fixed
+- **topk.cu selection workspace overflow past 131072-element
+  vocabularies** (latent, present since v1.0's retune): the
+  nucleus-scan scratch reserved 512 partial floats while the partials
+  grid is capped at 1024 blocks writing one float each - any
+  vocabulary above 131072 (= 512*256, coincidentally the test suite's
+  historical max) overflowed into the SelArgs block and corrupted the
+  output pointers. Qwen-scale vocabularies (152064) hit it on every
+  `topp` call. The reserve now derives from the grid cap via a named
+  constant shared by all workspace call sites. New tests pin topp /
+  sample_topp / decode_step at n=152064 against numpy references.
+- `argmax` on an empty CUDA input returned uninitialized device
+  memory instead of raising (the GPU launcher skips empty inputs
+  without writing the output slot; the CPU path already raised
+  ValueError).
+- GQA divisibility and the paged 1/2/4/8/16 group-size limit were only
+  checked on the CUDA branch - the CPU/staged reference paths silently
+  accepted misshapen head counts.
+- The zero-copy INT8 ops accepted wrong dtypes and non-contiguous
+  tensors (read as raw bytes -> silent corruption): `dequantize_int8`,
+  `qgemm`, `qgemm_perchannel` and `qadd_int8` now reject them.
+- `benchmarks/bench.py`: the bandwidth column billed layernorm /
+  softmax / silu / gelu for three tensors of traffic (rmsnorm+res's
+  count) while they stream two - their GB/s was overstated 1.5x in
+  every published JSON since the column landed. Both GPUs regenerated
+  (3-round protocol) and the README tables re-synced.
+- `quantize.cu`: blocking default-stream memcpys replaced with
+  error-checked, stream-ordered copies on the caller's stream (these
+  ops remain the one documented exception to the async-launcher
+  contract: composing pass 2 needs the reduced scale on the host).
+- softmax.cu file header described a shared-memoization kernel that
+  was replaced by the register-resident variant two releases ago;
+  several stale 2048-era comments in topk.cu corrected; a misleading
+  `inv_log2_theta` name in rope.cu renamed.
+
+### Changed
+- **lens / block_table / token-id validation moved host-side.**
+  Host-origin values (lists, numpy, CPU tensors) are validated before
+  the upload - identical errors as before. Device-resident tensors are
+  now TRUSTED (documented boundary, same as raw device pointers):
+  reading them back would sync the stream, and the old code paid two
+  syncs per attention call with `lens`, which also made CUDA-graph
+  capture with `lens` impossible. Capture now works (tested).
+- `quantize_int8` / `qadd_int8` return a Python float scale on every
+  path (the CUDA branch previously returned a device tensor that no
+  consumer could use without the same readback it now does once at the
+  source); type stubs tightened from `Any` to `float`.
+- Binary-op validation errors name the failing operand (`b` / `up`
+  were misreported as `a` / `gate`).
+- Host compiler warnings enabled (MSVC /W3, GCC/Clang -Wall -Wextra,
+  routed per language). They immediately caught and led to the fix of
+  three dead/misused constants and a signed/unsigned compare; the
+  first-party sources now compile warning-clean on both toolchains.
+- The documentation set was restructured into topic pages (quickstart,
+  execution model, attention, sampling, INT8, benchmarks, FAQ with a
+  glossary) in both languages, hubbed by the usage guides; the Chinese
+  docs received a full naturalness rewrite (stiff calques and a few
+  outright wrong word choices - e.g. "scores never hit disk" - are
+  gone). `docs/benchmarks/` JSONs carry the 1.2.1 metadata.
+
+### Added
+- `tests/test_validation.py` (23 cases: empty-input guards, GQA checks
+  on every path, host-side lens/table/id validation, device-lens graph
+  capture, dtype/contiguity rejection, consistent scale typing, honest
+  operand names) and `tests/test_big_vocab.py` (5 cases at Qwen-scale
+  152064 vocabularies).
+
 ## [1.2.0] - 2026-09-02
 
 Feature release on the frozen 1.x API: paged kv-cache attention (the
@@ -26,10 +104,10 @@ new kernels (three storage dtypes + the graph-capture path).
   Any valid table is honored (non-monotonic, sharing, holes); table
   VALUES are validated on CPU/staged paths (ValueError) and trusted on
   the zero-copy path (same trust boundary as raw pointers). GQA group
-  sizes 1/2/4/8/16. CUDA-graph capturable after a warm-up outside the
+  sizes 1/2/4/8/16.   CUDA-graph capturable after a warm-up outside the
   capture. Measured: 1.06-1.07x the contiguous op for the indirection
   (3060/5060 Ti, T=16384, 3-round means), bit-identical output on
-  matching slice schedules, **7.7x / 4.3x vs SDPA** on the
+  matching slice schedules, **7.9x / 4.3x vs SDPA** on the
   materialized reference. 13 new tests.
 - **`kv_append_paged`**: the cache-write side of the paged loop - one
   fresh token's k/v rows per sequence scattered in place into the pool
