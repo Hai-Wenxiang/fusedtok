@@ -4,6 +4,70 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-09-03
+
+Feature release on the frozen 1.x API (two new operators, additions
+only) plus a token-preserving optimization of the sampling serial
+walk. 437 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2); compute-sanitizer memcheck/racecheck clean on the
+new kernels; the sampling determinism battery is bit-identical to 1.2.1
+across both GPUs.
+
+### Added
+- **`sample_minp(logits, min_p, *, temperature, seed)`**: fused min-p
+  sampling (Min-P Sampling, Nguyen et al. 2024 - the truncation
+  llama.cpp / vLLM-style stacks deploy). The nucleus is every token
+  with probability >= min_p times the MAXIMUM probability - a value
+  threshold instead of top-p's cumulative mass, adaptive by
+  construction. In the max-normalized exp column the nucleus is the
+  prefix cut at the first element below min_p, so no global-mass
+  reduction runs at all; the serial walk is a new value-threshold
+  variant (batched, checkpointed, branch-free) feeding the shared
+  inverse-CDF walk. Window widening uses the plain x8 ladder (a mass
+  bound like top-p's jump cannot exist for a count-based nucleus);
+  `min_p = 1.0` keeps exactly the maxima (unique max = greedy). 20 new
+  tests. Measured (3-round means, n=131072, min_p=0.05): peaked
+  logits 151.6us vs 198.2us for the softmax+mask+multinomial composite
+  on a 3060 (1.31x; 60.7 vs 66.7 on a 5060 Ti); a wide ~13k nucleus on
+  plain randn honestly costs 740us vs 197 (0.27x - two ladder retries
+  plus a 64k sort; the torch boolean-mask composite never sorts).
+- **`kv_append(k_cache, v_cache, k_new, v_new, lens)`**: the
+  cache-write side of the CONTIGUOUS decode loop - the twin
+  `kv_append_paged` always had. One tiny chunk-copy kernel (f32/bf16/
+  fp16 storage, graph-capturable, in place) writing each sequence's
+  fresh k/v rows to cache row `lens[b]`. 9 new tests including an
+  append loop whose decode matches a one-shot cache on both the CPU
+  and GPU paths. 3-round probe (3060): 16.5-16.6us flat at
+  (B=1|8, Hkv=8, T=4096, D=128) vs 62-71us for the torch
+  advanced-indexing pair (3.7-4.3x).
+- Hardening found by the kv_append tests: the zero-copy dtype/
+  contiguity helpers never checked the DEVICE family, so a CPU
+  secondary operand handed a HOST POINTER to the kernel - an
+  asynchronous illegal access that poisons the CUDA context for every
+  later call (one such test failed 112 downstream tests before the
+  fix). All `_check_torch_*` helpers now reject CPU tensors up front;
+  a regression test pins the rejection and the surviving context.
+
+### Changed
+- **Sampling serial walk gains checkpoint bisection** (flat-distribution
+  worst case): walk 1 (nucleus edge / window mass) records its running
+  prefix sums at batch boundaries into shared memory; walk 2 (the
+  inverse-CDF draw) binary-searches the checkpoints and resumes from
+  the last one strictly below its target. Because both walks
+  accumulate the same values in the same order, the resumed prefix is
+  bit-identical to a full walk - every sampled token is unchanged
+  (verified: a 177-token battery across regimes x seeds x samplers is
+  bit-identical to the 1.2.1 wheel on both GPUs). Kernel-time profile
+  (3060): sample_serial_kernel flat 1497 -> 925us (-38%), midtail
+  1676 -> 1430us (-15%). Wall 3-round means: flat p=0.95 1966 ->
+  ~1460us, sample_topk full-vocab 1818 -> 1248us (~1.46x); on a 5060
+  Ti the flat probe drops to ~1025us. Scheduling lesson recorded in
+  the source: the checkpoint store must be BRANCH-FREE inside the
+  batch loop - a conditional shared write was enough for nvcc to stop
+  pipelining the loads (midtail regressed 200us in the first version).
+- Benchmarks regenerated on both GPUs with the new `sample_minp` row
+  and the faster flat rows; README tables re-synced from the JSONs.
+
 ## [1.2.1] - 2026-09-03
 
 Maintenance release on the frozen 1.x API: audit-driven correctness

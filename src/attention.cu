@@ -1546,6 +1546,87 @@ void kv_append_paged_launch_fp16(const void* k_new, const void* v_new,
                              page, tbl_width, stream);
 }
 
+// ---------------------------------------------------------------------------
+// contiguous kv-cache append (v1.3): the cache-write side of the
+// CONTIGUOUS decode loop (the paged twin lives above) - scatter one
+// fresh token's k/v rows per sequence to cache row lens[b]. Same grid
+// shape as the paged kernel (B, chunks) but no table indirection:
+// dst row = (b * Hkv + h) * T + lens[b]. Values in lens are the
+// kernel's to trust on the zero-copy path (same boundary as the
+// attention ops; host paths validate).
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void kv_append_contig_kernel(const T* __restrict__ k_new,
+                                        const T* __restrict__ v_new,
+                                        const int* __restrict__ lens,
+                                        T* __restrict__ k_cache,
+                                        T* __restrict__ v_cache,
+                                        int hkv, int dim, int t_rows) {
+    using C = AttChunk<T>;
+    const int bi = blockIdx.x;
+    const int chunks = hkv * (dim / 4);
+    const int idx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (idx >= chunks) return;
+    const int pos = lens[bi];
+    const int h = idx / (dim / 4);
+    const int c = idx % (dim / 4);
+    // cache row base of (batch, head, write position); source row base
+    // is the fresh token's (batch, head) row - both chunk-indexed by c
+    const size_t dst = ((size_t)bi * hkv + h) * t_rows + pos;
+    const size_t src = (size_t)bi * hkv + h;
+    C::stc(k_cache + dst * dim, c, C::ldc(k_new + src * dim, c));
+    C::stc(v_cache + dst * dim, c, C::ldc(v_new + src * dim, c));
+}
+
+template <typename T>
+void kv_append_launch_t(const T* k_new, const T* v_new, const int* lens,
+                        T* k_cache, T* v_cache, int batch, int hkv,
+                        int dim, int t_rows, std::uintptr_t stream) {
+    if (batch <= 0)
+        return;                        // nothing to append
+    if (dim % 4 != 0)
+        throw std::invalid_argument("dim must be a multiple of 4");
+    cudaStream_t cs = (cudaStream_t)stream;
+    const int chunks = hkv * (dim / 4);
+    dim3 grid((unsigned)batch,
+              (unsigned)((chunks + kAttBlock - 1) / kAttBlock));
+    kv_append_contig_kernel<T><<<grid, kAttBlock, 0, cs>>>(
+        k_new, v_new, lens, k_cache, v_cache, hkv, dim, t_rows);
+    check_launch("kv append kernel launch");
+}
+
+void kv_append_launch(const float* k_new, const float* v_new,
+                      const int* lens, float* k_cache, float* v_cache,
+                      int batch, int hkv, int dim, int t_rows,
+                      std::uintptr_t stream) {
+    kv_append_launch_t(k_new, v_new, lens, k_cache, v_cache, batch, hkv,
+                       dim, t_rows, stream);
+}
+
+void kv_append_launch_bf16(const void* k_new, const void* v_new,
+                           const int* lens, void* k_cache, void* v_cache,
+                           int batch, int hkv, int dim, int t_rows,
+                           std::uintptr_t stream) {
+    kv_append_launch_t(
+        static_cast<const __nv_bfloat16*>(k_new),
+        static_cast<const __nv_bfloat16*>(v_new), lens,
+        static_cast<__nv_bfloat16*>(k_cache),
+        static_cast<__nv_bfloat16*>(v_cache), batch, hkv, dim, t_rows,
+        stream);
+}
+
+void kv_append_launch_fp16(const void* k_new, const void* v_new,
+                           const int* lens, void* k_cache, void* v_cache,
+                           int batch, int hkv, int dim, int t_rows,
+                           std::uintptr_t stream) {
+    kv_append_launch_t(static_cast<const __half*>(k_new),
+                       static_cast<const __half*>(v_new), lens,
+                       static_cast<__half*>(k_cache),
+                       static_cast<__half*>(v_cache), batch, hkv, dim,
+                       t_rows, stream);
+}
+
 void kv_append_paged_cpu(const std::vector<float>& k_new,
                          const std::vector<float>& v_new,
                          const std::vector<int>& table,
@@ -1579,6 +1660,33 @@ void kv_append_paged_cpu(const std::vector<float>& k_new,
                       k_pool.begin() + dst);
             std::copy(v_new.begin() + src, v_new.begin() + src + dim,
                       v_pool.begin() + dst);
+        }
+    }
+}
+
+void kv_append_cpu(const std::vector<float>& k_new,
+                   const std::vector<float>& v_new,
+                   const std::vector<int>& lens,
+                   std::vector<float>& k_cache, std::vector<float>& v_cache,
+                   int batch, int hkv, int dim, int t_rows) {
+    if (dim % 4 != 0)
+        throw std::invalid_argument("dim must be a multiple of 4");
+    if (lens.size() < (size_t)batch ||
+        k_new.size() < (size_t)batch * hkv * dim ||
+        v_new.size() < (size_t)batch * hkv * dim)
+        throw std::invalid_argument("kv append operand size mismatch");
+    for (int bi = 0; bi < batch; ++bi) {
+        const int pos = lens[bi];
+        if (pos < 0 || pos >= t_rows)
+            throw std::invalid_argument(
+                "lens entries must be within [0, cache rows)");
+        for (int h = 0; h < hkv; ++h) {
+            const size_t dst = (((size_t)bi * hkv + h) * t_rows + pos) * dim;
+            const size_t src = ((size_t)bi * hkv + h) * dim;
+            std::copy(k_new.begin() + src, k_new.begin() + src + dim,
+                      k_cache.begin() + dst);
+            std::copy(v_new.begin() + src, v_new.begin() + src + dim,
+                      v_cache.begin() + dst);
         }
     }
 }

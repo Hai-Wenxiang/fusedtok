@@ -793,7 +793,7 @@ __global__ void exp_window_kernel(const unsigned long long* __restrict__ keys,
     }
 }
 
-// Latency-hiding helper for the contract-serial walks below (v1.2).
+// Latency-hiding helpers for the contract-serial walks below (v1.2).
 // The accumulation MUST stay strictly sequential (cum_{i+1} = cum_i +
 // e_i in index order - that exact fadd sequence IS the CPU-parity
 // determinism contract), but the LOADS are free to run ahead: a batch
@@ -805,27 +805,29 @@ __global__ void exp_window_kernel(const unsigned long long* __restrict__ keys,
 // runs memory-throughput-bound instead (~10 cycles/element).
 namespace {
 constexpr int kWalkBatch = 32;    // floats per batch = 8 x float4 loads
-// Walk 1: scan exps[0..count), return the crossing index (cum >= thr
-// first reached there) or -1; *cum_out carries the running total.
-__device__ int walk_until(const float* __restrict__ exps, int count,
-                          float thr, float* cum_out) {
-    float cum = 0.0f;
-    int i = 0;
-    // scalar prologue to a 16-byte boundary (the exps buffers are at
-    // least 4-byte aligned floats, but their word offset inside the
-    // workspace is not guaranteed even), then the vector-load body.
-    // Scheduling note: the consume side must stay BRANCH-FREE inside a
-    // batch (nvcc refuses to hoist loads above the per-element early
-    // exits, which serializes one LDG.128 per ~200 cycles - measured
-    // 12.8ms at n=131072). The adds run strictly in index order with a
-    // predicated `any` flag; on the (single) batch where the threshold
-    // is crossed the exact first index is REDONE element-by-element
-    // with the identical serial adds, so every returned index, cum and
-    // token is bit-identical to the naive scalar walk.
-    const int a = (int)(((16u - (unsigned)(uintptr_t)exps) & 15u) >> 2);
-    for (; i < a && i < count; ++i) {
-        cum += exps[i];
-        if (cum >= thr) { *cum_out = cum; return i; }
+
+// Batched walk from an arbitrary (index, cum) state. The prologue
+// aligns to 16 bytes; callers passing a checkpoint index (already
+// alignment-equivalent) may skip it via i > 0. Identical fadd order to
+// the scalar walk; on the (single) batch where the threshold is
+// crossed the exact first index is REDONE element-by-element with the
+// identical serial adds, so every returned index and cum is
+// bit-identical to the naive scalar walk.
+__device__ int walk_from(const float* __restrict__ exps, int count,
+                         float thr, int i, float cum) {
+    if (i == 0) {
+        // scalar prologue to a 16-byte boundary (the exps buffers are
+        // at least 4-byte aligned floats, but their word offset inside
+        // the workspace is not guaranteed even). Scheduling note: the
+        // consume side must stay BRANCH-FREE inside a batch (nvcc
+        // refuses to hoist loads above the per-element early exits,
+        // which serializes one LDG.128 per ~200 cycles - measured
+        // 12.8ms at n=131072 before the batched form).
+        const int a = (int)(((16u - (unsigned)(uintptr_t)exps) & 15u) >> 2);
+        for (; i < a && i < count; ++i) {
+            cum += exps[i];
+            if (cum >= thr) return i;
+        }
     }
     for (; i + kWalkBatch <= count; ) {
         const float4* q = reinterpret_cast<const float4*>(exps + i);
@@ -848,17 +850,124 @@ __device__ int walk_until(const float* __restrict__ exps, int count,
             float c = base;
             for (int k = i; k < i + kWalkBatch; ++k) {
                 c += exps[k];
-                if (c >= thr) { *cum_out = c; return k; }
+                if (c >= thr) return k;
             }
         }
         i += kWalkBatch;
     }
     for (; i < count; ++i) {                          // scalar tail
         cum += exps[i];
-        if (cum >= thr) { *cum_out = cum; return i; }
+        if (cum >= thr) return i;
+    }
+    return -1;
+}
+
+// v1.3 checkpoint machinery: walk 1 records the running cum at every
+// `stride`-th COMPLETED batch boundary into cps[0..ncp). Because walk
+// 1 and walk 2 accumulate the same values in the same index order, the
+// cum at any boundary is BIT-IDENTICAL between the two walks - so walk
+// 2 may binary-search the checkpoints and resume from the last one
+// strictly below its target, turning the average half-window scan into
+// a log(search) + one-stride-window scan. Shared-memory cap:
+// kWalkCpMax floats; stride scales to keep any window size covered.
+constexpr int kWalkCpMax = 8192;   // checkpoint slots (32 KB smem cap)
+
+__device__ int walk_until_cp(const float* __restrict__ exps, int count,
+                             float thr, float* cum_out, float* cps,
+                             int stride, int* ncp_out) {
+    float cum = 0.0f;
+    int i = 0;
+    int ncp = 0;
+    int batch = 0;                   // full batches completed so far
+    // branch-free recording state: `until_rec` counts batches down to
+    // the next checkpoint slot. The batch loop must stay free of
+    // CONTROL FLOW for nvcc to keep the float4 loads pipelined (the
+    // same scheduling constraint the `any`-flag crossing trick exists
+    // for) - so the checkpoint store is unconditional and the slot
+    // index advances predicated. Unrecorded slots are simply
+    // overwritten by the next record.
+    int until_rec = stride;
+    const int a = (int)(((16u - (unsigned)(uintptr_t)exps) & 15u) >> 2);
+    for (; i < a && i < count; ++i) {
+        cum += exps[i];
+        if (cum >= thr) { *cum_out = cum; *ncp_out = ncp; return i; }
+    }
+    for (; i + kWalkBatch <= count; ) {
+        const float4* q = reinterpret_cast<const float4*>(exps + i);
+        float4 r[kWalkBatch / 4];
+        #pragma unroll
+        for (int j = 0; j < kWalkBatch / 4; ++j) r[j] = q[j];
+        const float base = cum;
+        bool any = false;
+        #pragma unroll
+        for (int j = 0; j < kWalkBatch / 4; ++j) {
+            cum += r[j].x; any |= (cum >= thr);
+            cum += r[j].y; any |= (cum >= thr);
+            cum += r[j].z; any |= (cum >= thr);
+            cum += r[j].w; any |= (cum >= thr);
+        }
+        if (any) {
+            float c = base;
+            for (int k = i; k < i + kWalkBatch; ++k) {
+                c += exps[k];
+                if (c >= thr) { *cum_out = c; *ncp_out = ncp; return k; }
+            }
+        }
+        // batch completed without crossing: record a strided
+        // checkpoint (batch indices 0, stride, 2*stride, ...)
+        // branch-free, see the note above
+        --until_rec;
+        const bool rec = (until_rec == 0);
+        until_rec = rec ? stride : until_rec;
+        cps[ncp] = cum;
+        ncp += rec;
+        ++batch;
+        i += kWalkBatch;
+    }
+    for (; i < count; ++i) {
+        cum += exps[i];
+        if (cum >= thr) { *cum_out = cum; *ncp_out = ncp; return i; }
     }
     *cum_out = cum;
+    *ncp_out = ncp;
     return -1;
+}
+
+// Walk 2 with checkpoint skip: find the LAST checkpoint STRICTLY below
+// thr (strict, so the crossing cannot lie before the resume point -
+// cum_at_boundary == thr means the boundary element itself crossed),
+// then batch-walk from there. Bit-identical to a full walk by the
+// identical-prefix argument above.
+__device__ int walk_from_cp(const float* __restrict__ exps, int count,
+                            float thr, const float* cps, int ncp,
+                            int stride) {
+    if (ncp == 0 || cps[0] >= thr)
+        return walk_from(exps, count, thr, 0, 0.0f);
+    int l = 0, h = ncp - 1, j = 0;
+    while (l <= h) {                 // last j with cps[j] < thr
+        const int mid = (l + h) >> 1;
+        if (cps[mid] < thr) { j = mid; l = mid + 1; }
+        else h = mid - 1;
+    }
+    // only the found checkpoint is guaranteed < thr; resume strictly
+    // after its boundary (cps[j] covers elements < boundary; a later
+    // checkpoint >= thr bounds the crossing inside this window)
+    const int a = (int)(((16u - (unsigned)(uintptr_t)exps) & 15u) >> 2);
+    const int i0 = a + (j * stride + 1) * kWalkBatch;
+    return walk_from(exps, count, thr, i0, cps[j]);
+}
+
+// checkpoint-array sizing for a window of `count` elements: the batch
+// count, thinned by stride so the slots stay within kWalkCpMax
+__host__ __device__ inline int walk_cp_slots(int count) {
+    const int nb = (count + kWalkBatch - 1) / kWalkBatch;
+    const int stride = (nb + kWalkCpMax - 1) / kWalkCpMax;
+    const int ncp = (nb + stride - 1) / stride;
+    return ncp;
+}
+__host__ __device__ inline int walk_cp_stride(int count) {
+    const int nb = (count + kWalkBatch - 1) / kWalkBatch;
+    return (nb + kWalkCpMax - 1) / kWalkCpMax;
 }
 } // namespace
 
@@ -867,9 +976,12 @@ __device__ int walk_until(const float* __restrict__ exps, int count,
 // serial walk is what keeps per-seed CPU/GPU token parity stable; big
 // windows only occur for flat distributions (the host widening loop).
 // `exps` carries the precomputed exp column (exp_window_kernel); the
-// walk is two sequential passes - total mass, then inverse-CDF - both
-// batched by walk_until (load pipelining only; the fadd order is
-// untouched, so every token is bit-identical to the scalar walk).
+// walk is two sequential passes - nucleus edge, then inverse-CDF - both
+// batched for load pipelining (v1.2; the fadd order is untouched). Since
+// v1.3 walk 1 records prefix-sum checkpoints in shared memory and walk 2
+// resumes from a binary search over them - the resumed prefix is
+// bit-identical (see walk_until_cp), so every token stays bit-identical
+// to the scalar walk.
 __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys,
                                      const float* __restrict__ exps,
                                      unsigned long long* __restrict__ ws,
@@ -877,6 +989,8 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
                                      unsigned long long seed,
                                      int* token_out, int* count_out) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    extern __shared__ float cps[];   // walk checkpoints (walk_cp_slots)
+    const int stride = walk_cp_stride(k);
     // threshold against the GLOBAL softmax total (exptotal_kernel) so a
     // window that cannot contain the nucleus reports "not covered"
     // instead of silently renormalizing (see exptotal_kernel note).
@@ -885,7 +999,9 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     // reference, which compares an identical serial accumulation).
     const float total = *reinterpret_cast<const float*>(&ws[kWsTotal]);
     float cum = 0.0f;
-    const int edge = walk_until(exps, k, p_stop * total, &cum);
+    int ncp = 0;
+    const int edge = walk_until_cp(exps, k, p_stop * total, &cum, cps,
+                                   stride, &ncp);
     if (edge < 0) {
         if (k < n) {              // window too small; host retries wider -
             // leave the window's whole cum mass for the host's
@@ -895,8 +1011,9 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
         }
     }
     const int nucleus = (edge < 0) ? k : edge + 1;
-    // walk_until reports cum AT the crossing (covers the edge < 0 case
-    // too: full-window cum, exactly what the forced-coverage path used)
+    // walk_until_cp reports cum AT the crossing (covers the edge < 0
+    // case too: full-window cum, exactly what the forced-coverage path
+    // used)
     const float nucleus_mass = cum;
     unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -904,8 +1021,7 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     z ^= z >> 31;
     const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
     const float target = u * nucleus_mass;
-    cum = 0.0f;
-    const int hit = walk_until(exps, nucleus, target, &cum);
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
     if (hit >= 0)
         *token_out = (int)(0xFFFFFFFFu -
                            (unsigned)(keys[hit] & 0xFFFFFFFFu));
@@ -1439,9 +1555,11 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
             float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
             exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
                 bufs[cur], exps, window);
-            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], exps, ws,
-                                                   window, n, p, seed,
-                                                   token_out, nullptr);
+            sample_serial_kernel<<<1, 32,
+                                   walk_cp_slots(window) * sizeof(float),
+                                   cs>>>(
+                bufs[cur], exps, ws, window, n, p, seed,
+                token_out, nullptr);
             check_launch("sample tail launch");
         }
         cudaError_t err = cudaDeviceSynchronize();   // surface kernel faults
@@ -1557,9 +1675,11 @@ long long decode_step_launch(const float* x, const long long* ids,
             float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
             exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
                 bufs[cur], exps, window);
-            sample_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], exps, ws,
-                                                   window, n, p, seed,
-                                                   token_out, nullptr);
+            sample_serial_kernel<<<1, 32,
+                                   walk_cp_slots(window) * sizeof(float),
+                                   cs>>>(
+                bufs[cur], exps, ws, window, n, p, seed,
+                token_out, nullptr);
             check_launch("decode step tail launch");
         }
         cudaError_t err = cudaDeviceSynchronize();
@@ -1595,18 +1715,21 @@ __global__ void sample_topk_serial_kernel(
     const float* __restrict__ exps, int* __restrict__ token_out,
     int k, unsigned long long seed) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    // both walks batched by walk_until: load pipelining only, the fadd
-    // order (the CPU-parity contract) is untouched (v1.2)
+    extern __shared__ float cps[];   // walk checkpoints (walk_cp_slots)
+    const int stride = walk_cp_stride(k);
+    // both walks batched: load pipelining only, the fadd order (the
+    // CPU-parity contract) is untouched (v1.2); walk 2 resumes from a
+    // checkpoint binary search since v1.3 (bit-identical prefix)
     float window_mass = 0.0f;
-    walk_until(exps, k, INFINITY, &window_mass);   // sum without crossing
+    int ncp = 0;
+    walk_until_cp(exps, k, INFINITY, &window_mass, cps, stride, &ncp);
     unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     z ^= z >> 31;
     const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
     const float target = u * window_mass;
-    float cum = 0.0f;
-    const int hit = walk_until(exps, k, target, &cum);
+    const int hit = walk_from_cp(exps, k, target, cps, ncp, stride);
     const int idx = (hit >= 0) ? hit : k - 1;      // rounding fallback
     *token_out = (int)(0xFFFFFFFFu -
                        (unsigned)(keys[idx] & 0xFFFFFFFFu));
@@ -1664,8 +1787,9 @@ long long sample_topk_launch(const float* x, int n, int k, float t,
     float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
     exp_window_kernel<<<selection_grid(k), kSelBlock, 0, cs>>>(
         bufs[cur], exps, k);
-    sample_topk_serial_kernel<<<1, 32, 0, cs>>>(bufs[cur], exps, token_out,
-                                                k, seed);
+    sample_topk_serial_kernel<<<1, 32, walk_cp_slots(k) * sizeof(float),
+                                cs>>>(bufs[cur], exps, token_out,
+                                      k, seed);
     check_launch("sample topk tail launch");
     cudaError_t err = cudaDeviceSynchronize();    // surface kernel faults
     if (err != cudaSuccess)
@@ -1677,6 +1801,187 @@ long long sample_topk_launch(const float* x, int n, int k, float t,
     if (token < 0)
         throw std::runtime_error("sample topk produced no token");
     return token;
+}
+
+// ---------------------------------------------------------------------------
+// fused min-p sampling (v1.3): keep every token whose probability is at
+// least min_p times the MAXIMUM probability, renormalize within that
+// nucleus and inverse-CDF the seeded hash. In the max-normalized exp
+// column (exps[0] == 1.0 exactly) the nucleus is a PREFIX cut at the
+// first element with exp < min_p - a value threshold, so unlike top-p
+// no global-mass reduction is needed and the serial walk stops at the
+// cut. (CPU reference: sample_minp_cpu in sampling.cu.)
+// ---------------------------------------------------------------------------
+
+// Value-threshold walk for min-p: accumulate cum in index order until
+// the first element STRICTLY below `floor`; *cum_out carries the mass
+// of the passing prefix (the crossing element itself excluded, the
+// same order the CPU reference breaks at). Checkpoints recorded for
+// the inverse-CDF walk, branch-free like walk_until_cp.
+__device__ int walk_until_below(const float* __restrict__ exps, int count,
+                                float floor, float* cum_out, float* cps,
+                                int stride, int* ncp_out) {
+    float cum = 0.0f;
+    int i = 0;
+    int ncp = 0;
+    int until_rec = stride;
+    const int a = (int)(((16u - (unsigned)(uintptr_t)exps) & 15u) >> 2);
+    for (; i < a && i < count; ++i) {
+        if (exps[i] < floor) { *cum_out = cum; *ncp_out = ncp; return i; }
+        cum += exps[i];
+    }
+    for (; i + kWalkBatch <= count; ) {
+        const float4* q = reinterpret_cast<const float4*>(exps + i);
+        float4 r[kWalkBatch / 4];
+        #pragma unroll
+        for (int j = 0; j < kWalkBatch / 4; ++j) r[j] = q[j];
+        const float base = cum;
+        bool any = false;
+        #pragma unroll
+        for (int j = 0; j < kWalkBatch / 4; ++j) {
+            cum += r[j].x; any |= (r[j].x < floor);
+            cum += r[j].y; any |= (r[j].y < floor);
+            cum += r[j].z; any |= (r[j].z < floor);
+            cum += r[j].w; any |= (r[j].w < floor);
+        }
+        if (any) {
+            // a below-floor element is in THIS batch: replay the 32
+            // adds in order to pin the exact cut (adds before the cut
+            // are identical; the cut element is NOT accumulated)
+            float c = base;
+            for (int k = i; k < i + kWalkBatch; ++k) {
+                if (exps[k] < floor) { *cum_out = c; *ncp_out = ncp; return k; }
+                c += exps[k];
+            }
+        }
+        --until_rec;                 // branch-free checkpoint record
+        const bool rec = (until_rec == 0);
+        until_rec = rec ? stride : until_rec;
+        cps[ncp] = cum;
+        ncp += rec;
+        i += kWalkBatch;
+    }
+    for (; i < count; ++i) {
+        if (exps[i] < floor) { *cum_out = cum; *ncp_out = ncp; return i; }
+        cum += exps[i];
+    }
+    *cum_out = cum;
+    *ncp_out = ncp;
+    return -1;
+}
+
+__global__ void sample_minp_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    int* __restrict__ token_out,
+    int k, int n, float min_p, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    extern __shared__ float cps[];   // walk checkpoints (walk_cp_slots)
+    const int stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, min_p, &nucleus_mass, cps,
+                                      stride, &ncp);
+    if (edge < 0 && k < n)
+        return;   // every window element passes: nucleus extends past
+                  // the window - the host retries wider (token stays -1)
+    const int nucleus = (edge < 0) ? k : edge;
+    // exps[0] == 1.0 >= min_p for a valid min_p, so the nucleus is
+    // never empty and nucleus_mass > 0
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
+    if (hit >= 0)
+        *token_out = (int)(0xFFFFFFFFu -
+                           (unsigned)(keys[hit] & 0xFFFFFFFFu));
+}
+
+long long sample_minp_launch(const float* x, int n, float min_p, float t,
+                             unsigned long long seed, std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(min_p > 0.0f && min_p <= 1.0f))
+        throw std::invalid_argument("min_p must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    // Window strategy: min-p nuclei are typically tiny (a handful of
+    // tokens), so the first 1024-window covers them; flat-tail cases
+    // widen on the plain x8 ladder. A mass bound like top-p's adaptive
+    // jump cannot exist here - the nucleus width is a value-threshold
+    // COUNT, not derivable from the window's mass - so the ladder is
+    // the honest schedule (max 3 retries at 131k vocab).
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;                // sort pad size
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        cudaStream_t cs2 = cs;
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs2);
+        cudaMemcpyAsync(token_out, &token, sizeof(int),
+                        cudaMemcpyHostToDevice, cs2);
+        ship_args(cs2, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        // full-vocabulary fast path: every key survives the radix
+        // rounds when window == n, so emit's k==n parallel pack alone
+        // is the whole "selection"
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs2>>>(
+                    dargs, ws, n, level, (unsigned long long)window,
+                    inv_t, kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs2>>>(
+                dargs, ws, n, inv_t, kNoPen);
+        }
+        emit_kernel<<<grid, kSelBlock, 0, cs2>>>(dargs, ws, n, window,
+                                                 inv_t, kNoPen);
+        check_launch("minp selection launch");
+        chunk_sort_kernel<<<(int)((m + kSelSortChunk - 1) / kSelSortChunk),
+                            kSelBlock, 0, cs2>>>(ws + kWsKeys, window, m);
+        unsigned long long* bufs[2] = {ws + kWsKeys,
+                                       ws + kWsKeys + (size_t)m};
+        int cur = 0;
+        for (int run = kSelSortChunk; run < m; run <<= 1) {
+            const long long ntiles = m / kSelMergeTile;
+            const int gmerge = (int)std::max<long long>(
+                1LL, std::min<long long>(ntiles, kMaxGrid));
+            merge_level_kernel<<<gmerge, kSelBlock, 0, cs2>>>(
+                bufs[cur], bufs[cur ^ 1], m, run);
+            cur ^= 1;
+        }
+        float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs2>>>(
+            bufs[cur], exps, window);
+        sample_minp_serial_kernel<<<1, 32,
+                                    walk_cp_slots(window) * sizeof(float),
+                                    cs2>>>(
+            bufs[cur], exps, token_out, window, n, min_p, seed);
+        check_launch("minp tail launch");
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("min-p kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("min-p readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("min-p nucleus not covered");
+        window = std::min(n, window * 8);
+    }
 }
 
 // ---------------------------------------------------------------------------

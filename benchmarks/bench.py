@@ -212,9 +212,23 @@ def main():
             v, i = torch.topk(logits, 50)
             return i[torch.multinomial(torch.softmax(v, -1), 1)]
         record("sample_topk k=50", f"[{vocab}]",
-               lambda: fusedtok.sample_topk(logits, 50),
-               torch_sample_topk,
-               max(20, iters // 4))
+                lambda: fusedtok.sample_topk(logits, 50),
+                torch_sample_topk,
+                max(20, iters // 4))
+
+        # fused min-p sampling (v1.3) vs the composite an inference loop
+        # would write (softmax + boolean mask + renormalize + multinomial;
+        # same RNG caveat as the topk row). min_p=0.05 on plain randn
+        # keeps a mid-sized value-threshold nucleus - the typical
+        # creative-generation setting.
+        def torch_sample_minp():
+            probs = torch.softmax(logits, -1)
+            sel = probs >= 0.05 * probs.max()
+            return torch.multinomial(probs * sel, 1)
+        record("sample_minp p=0.05", f"[{vocab}]",
+                lambda: fusedtok.sample_minp(logits, 0.05),
+                torch_sample_minp,
+                max(20, iters // 4))
 
         def torch_sample_topp_flat(src):
             probs = torch.softmax(src, -1)

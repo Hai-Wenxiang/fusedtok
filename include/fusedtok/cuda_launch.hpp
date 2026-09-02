@@ -78,6 +78,15 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
 long long sample_topk_launch(const float* x, int n, int k, float t,
                              unsigned long long seed,
                              std::uintptr_t stream = 0);
+
+// Fused min-p sampling (v1.3): temperature, keep every token with
+// probability >= min_p * p_max, renormalize within the nucleus,
+// inverse-CDF draw. Deterministic per seed (same RNG). No global-mass
+// reduction - the nucleus is a value-threshold prefix.
+long long sample_minp_launch(const float* x, int n, float min_p, float t,
+                             unsigned long long seed,
+                             std::uintptr_t stream = 0);
+
 // Fused decode step: repetition penalty over the sampled ids (vocab
 // bitmap), temperature, then nucleus sampling - one call, one readback.
 // Returns the sampled token id.
@@ -235,6 +244,28 @@ void kv_append_paged_cpu(const std::vector<float>& k_new,
                          std::vector<float>& k_pool,
                          std::vector<float>& v_pool, int batch, int hkv,
                          int dim, int page, int tbl_width, int num_blocks);
+
+// Contiguous-cache twin (v1.3): scatter ONE fresh token's k/v rows per
+// sequence to cache row lens[b] of the [B, Hkv, T, D] caches. Same
+// conventions as the paged op (in-place, lens required and trusted on
+// the zero-copy path, one tiny capturable kernel).
+void kv_append_launch(const float* k_new, const float* v_new,
+                      const int* lens, float* k_cache, float* v_cache,
+                      int batch, int hkv, int dim, int t_rows,
+                      std::uintptr_t stream = 0);
+void kv_append_launch_bf16(const void* k_new, const void* v_new,
+                           const int* lens, void* k_cache, void* v_cache,
+                           int batch, int hkv, int dim, int t_rows,
+                           std::uintptr_t stream = 0);
+void kv_append_launch_fp16(const void* k_new, const void* v_new,
+                           const int* lens, void* k_cache, void* v_cache,
+                           int batch, int hkv, int dim, int t_rows,
+                           std::uintptr_t stream = 0);
+void kv_append_cpu(const std::vector<float>& k_new,
+                   const std::vector<float>& v_new,
+                   const std::vector<int>& lens,
+                   std::vector<float>& k_cache, std::vector<float>& v_cache,
+                   int batch, int hkv, int dim, int t_rows);
 
 // --- bf16 variants: float32 compute, bf16 storage ---------------------------
 // Weight/bias parameters stay float32 (norm weights are commonly kept fp32

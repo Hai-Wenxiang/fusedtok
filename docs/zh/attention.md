@@ -10,6 +10,7 @@ fusedtok 提供四个注意力入口：解码步主力 `attention_decode`、
 - [attention_decode——解码步](#attention_decode解码步)
 - [attention_decode_paged——vLLM 式块池 cache](#attention_decode_pagedvllm-式块池-cache)
 - [kv_append_paged——往池里写入新 token](#kv_append_paged往池里写入新-token)
+- [kv_append——往连续 cache 写入新 token（v1.3）](#kv_append往连续-cache-写入新-tokenv13)
 - [attention_prefill——新序列](#attention_prefill新序列)
 - [性能定位](#性能定位)
 
@@ -100,6 +101,35 @@ for step in range(n_steps):
                              k_new, v_new, lens)          # 写在 lens 处
     out = fusedtok.attention_decode_paged(q, k_pool, v_pool,
                                           block_table, lens + 1)
+    lens += 1
+    # ……下一个 token 的 k_new/v_new 由模型给出
+```
+
+## kv_append——往连续 cache 写入新 token（v1.3）
+
+```python
+fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
+```
+
+连续解码循环的 cache 写入侧（`kv_append_paged` 的孪生兄弟）：序列
+`b` 的新行 `k_new[b]` / `v_new[b]`（各 `[Hkv, D]`）写到
+`k_cache[b]` / `v_cache[b]` 的第 `lens[b]` 行。
+
+- **原地写**（返回 `None`）；`lens` 必填（写入位置就是各序列的当前
+  长度）。
+- 主机路径要求 float32 且 C 连续的 cache——dtype/布局转换会看到一个
+  副本、静默丢掉写入，所以直接 `TypeError` 拒绝。torch 路径支持
+  f32/bf16/fp16。
+- 一个微型 kernel、流序、可 CUDA graph 捕获。
+- 主机侧来源的 `lens` 取值在 `[0, T)` 内校验；设备上的张量直接信任
+  （标准零拷贝信任边界）。
+
+典型循环与分页版一致：在 `lens[b]` 处 append，再以 `lens + 1` 解码：
+
+```python
+for step in range(n_steps):
+    fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
+    out = fusedtok.attention_decode(q, k_cache, v_cache, lens + 1)
     lens += 1
     # ……下一个 token 的 k_new/v_new 由模型给出
 ```
