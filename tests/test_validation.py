@@ -15,7 +15,15 @@ Every test here pins a fix from the 1.2.1 audit:
   or a strided view would otherwise be read as raw bytes),
 - consistent return types: quantize_int8 / qadd_int8 return a Python
   float scale on EVERY path,
-- honest operand names in binary-op validation errors.
+- honest operand names in binary-op validation errors,
+- staged-upload value checks (1.3.1): the staged bindings receive host
+  lens/block-table arrays directly - their VALUES are now validated in
+  the Python wrapper before the upload, so a bad entry can no longer
+  become a silent GPU out-of-bounds access (the in-place kv_append ops
+  would have corrupted the cache permanently),
+- integral host ints only (1.3.1): float lens/ids used to be silently
+  truncated by the int32/int64 casts; 2-D id arrays used to be silently
+  ravelled flat - both are now rejected.
 """
 
 import numpy as np
@@ -370,3 +378,166 @@ def test_cpu_operand_on_zero_copy_path_rejected_everywhere():
     # the CUDA context must still be healthy after all the rejections
     out = fusedtok.attention_decode(q, k, k.clone())
     assert out.shape == q.shape
+
+
+# ---------------------------------------------------------------------------
+# staged-upload value validation (1.3.1: the staged bindings got host
+# lens/table arrays whose VALUES were unchecked - a bad entry became a
+# silent GPU out-of-bounds access, and the in-place kv_append ops would
+# have corrupted the cache permanently; the docstrings claimed the
+# validation existed)
+# ---------------------------------------------------------------------------
+
+
+def _host_cache(t_rows=8):
+    k = np.zeros((2, 2, t_rows, 4), dtype=np.float32)
+    v = np.zeros_like(k)
+    kn = np.ones((2, 2, 4), dtype=np.float32)
+    vn = np.zeros_like(kn)
+    return k, v, kn, vn
+
+
+@needs_gpu
+def test_kv_append_staged_lens_out_of_range_rejected():
+    # lens[b] == T writes one row past sequence b's cache rows
+    k, v, kn, vn = _host_cache(t_rows=8)
+    with pytest.raises(ValueError):
+        fusedtok.kv_append(k, v, kn, vn, [8, 0], cuda=True)
+    with pytest.raises(ValueError):
+        fusedtok.kv_append(k, v, kn, vn, [0, -1], cuda=True)
+    # the CPU reference path validates in C++ - same contract
+    with pytest.raises(ValueError):
+        fusedtok.kv_append(k, v, kn, vn, [8, 0])
+
+
+def test_kv_append_staged_valid_lens_still_work():
+    # regression guard: valid staged lens must keep round-tripping
+    k, v, kn, vn = _host_cache(t_rows=8)
+    fusedtok.kv_append(k, v, kn, vn, [3, 5])
+    assert np.allclose(k[0, :, 3, :], 1.0)
+    assert np.allclose(k[1, :, 5, :], 1.0)
+    assert np.allclose(k[0, :, 0, :], 0.0)  # untouched rows stay zero
+
+
+def test_kv_append_empty_batch_lens_still_accepted():
+    # empty batch passes lens=[] - and np.asarray([]) is FLOAT64, so the
+    # new integral-dtype rejection must not fire on empty input
+    k = np.zeros((0, 2, 8, 4), dtype=np.float32)
+    kn = np.zeros((0, 2, 4), dtype=np.float32)
+    assert fusedtok.kv_append(k, k.copy(), kn, kn.copy(), []) is None
+
+
+@needs_gpu
+def test_kv_append_paged_staged_bad_table_rejected():
+    pool = np.zeros((4, 2, 4, 4), dtype=np.float32)
+    kn = np.zeros((2, 2, 4), dtype=np.float32)
+    table = np.zeros((2, 3), dtype=np.int32)
+    table[1, 0] = 4  # only blocks [0, 4) exist
+    with pytest.raises(ValueError):
+        fusedtok.kv_append_paged(pool, pool.copy(), table, kn, kn.copy(),
+                                 [0, 0], cuda=True)
+    table[1, 0] = -1
+    with pytest.raises(ValueError):
+        fusedtok.kv_append_paged(pool, pool.copy(), table, kn, kn.copy(),
+                                 [0, 0], cuda=True)
+
+
+@needs_gpu
+def test_kv_append_paged_staged_lens_out_of_range_rejected():
+    pool = np.zeros((4, 2, 4, 4), dtype=np.float32)
+    kn = np.zeros((2, 2, 4), dtype=np.float32)
+    table = np.zeros((2, 3), dtype=np.int32)
+    # span = 3 pages * 4 rows = 12; lens 12 is one past the last row
+    with pytest.raises(ValueError):
+        fusedtok.kv_append_paged(pool, pool.copy(), table, kn, kn.copy(),
+                                 [12, 0], cuda=True)
+
+
+@needs_gpu
+def test_attention_decode_staged_lens_out_of_range_rejected():
+    q = np.zeros((1, 4, 8), dtype=np.float32)
+    k = np.zeros((1, 2, 8, 8), dtype=np.float32)
+    with pytest.raises(ValueError):
+        fusedtok.attention_decode(q, k, k.copy(), [9], cuda=True)
+    with pytest.raises(ValueError):
+        fusedtok.attention_decode(q, k, k.copy(), [-1], cuda=True)
+
+
+@needs_gpu
+def test_attention_decode_paged_staged_bad_table_rejected():
+    # the staged paged-decode binding also validates in C++; the Python
+    # check fires first with the same error family - pinned either way
+    q = np.zeros((1, 4, 8), dtype=np.float32)
+    pool = np.zeros((4, 2, 4, 8), dtype=np.float32)
+    table = np.zeros((1, 3), dtype=np.int32)
+    table[0, 2] = 99
+    with pytest.raises(ValueError):
+        fusedtok.attention_decode_paged(q, pool, pool.copy(), table,
+                                        [4], cuda=True)
+
+
+def test_kv_append_host_v_shape_mismatch_rejected():
+    # same TOTAL size, different shape: without the shape check the
+    # binding's size-only guard would alias the write into v
+    k = np.zeros((1, 2, 8, 4), dtype=np.float32)
+    v = np.zeros((1, 2, 4, 8), dtype=np.float32)
+    kn = np.zeros((1, 2, 4), dtype=np.float32)
+    vn = np.zeros((1, 2, 8), dtype=np.float32)
+    with pytest.raises(ValueError):
+        fusedtok.kv_append(k, v, kn, vn, [0])
+    with pytest.raises(ValueError):
+        fusedtok.kv_append(k, k.copy(), kn, vn, [0])
+
+
+def test_kv_append_paged_host_v_shape_mismatch_rejected():
+    pool = np.zeros((4, 2, 4, 4), dtype=np.float32)
+    vpool = np.zeros((2, 2, 4, 8), dtype=np.float32)  # same total size
+    kn = np.zeros((2, 2, 4), dtype=np.float32)
+    table = np.zeros((2, 3), dtype=np.int32)
+    with pytest.raises(ValueError):
+        fusedtok.kv_append_paged(pool, vpool, table, kn, kn.copy(),
+                                 [0, 0])
+
+
+# ---------------------------------------------------------------------------
+# integral host ints + 1-D ids (1.3.1: float lens/ids were silently
+# truncated by the int casts; 2-D id arrays were silently ravelled flat)
+# ---------------------------------------------------------------------------
+
+
+@needs_gpu
+def test_attention_decode_cuda_float_lens_rejected():
+    q = torch.zeros((1, 4, 8), device="cuda")
+    k = torch.zeros((1, 2, 8, 8), device="cuda")
+    with pytest.raises(TypeError):
+        fusedtok.attention_decode(q, k, k.clone(), [1.5])
+
+
+def test_kv_append_host_float_lens_rejected():
+    k, v, kn, vn = _host_cache(t_rows=8)
+    with pytest.raises(TypeError):
+        fusedtok.kv_append(k, v, kn, vn, [1.5, 0])
+
+
+def test_repetition_penalty_host_2d_ids_rejected():
+    logits = np.zeros(16, dtype=np.float32)
+    with pytest.raises(ValueError):
+        fusedtok.repetition_penalty(logits, [[1, 2], [3, 4]], 1.2)
+
+
+def test_decode_step_host_2d_ids_rejected():
+    logits = np.zeros(16, dtype=np.float32)
+    with pytest.raises(ValueError):
+        fusedtok.decode_step(logits, [[1, 2], [3, 4]])
+
+
+def test_decode_step_host_float_ids_rejected():
+    logits = np.zeros(16, dtype=np.float32)
+    with pytest.raises(TypeError):
+        fusedtok.decode_step(logits, [1.5, 2])
+
+
+def test_decode_step_host_ids_range_message_names_parameter():
+    logits = np.zeros(16, dtype=np.float32)
+    with pytest.raises(ValueError, match="sampled_ids"):
+        fusedtok.decode_step(logits, [16])

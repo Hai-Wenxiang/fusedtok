@@ -534,10 +534,17 @@ __global__ void attn_reduce_kernel(const float* __restrict__ ws_ml,
             C::st(oraw + c * 4, zero);
         return;
     }
-    j = 0;
-    for (int c = lane; c < chunks; c += 32, ++j)
-        C::st(oraw + c * 4, make_float4(o[j].x / l, o[j].y / l,
-                                        o[j].z / l, o[j].w / l));
+    // every warp folds the same per-lane chunks (L1-broadcast reads -
+    // deliberately redundant compute); only warp 0 needs to emit the
+    // final stores, cutting 8x duplicated write traffic on the split
+    // decode path (the values are identical across warps by
+    // construction, so the extra stores were a benign same-value race)
+    if (threadIdx.x < 32) {
+        j = 0;
+        for (int c = lane; c < chunks; c += 32, ++j)
+            C::st(oraw + c * 4, make_float4(o[j].x / l, o[j].y / l,
+                                            o[j].z / l, o[j].w / l));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +911,10 @@ int att_choose_slices(int batch, int hkv, int t_seq, int sm_count) {
     return std::min(slices, kAttMaxSlices);
 }
 
+// fallback SM count when the device query fails (between the shipped
+// RTX 3060's 28 and the 5060 Ti's 36 - only skews the slice heuristic)
+constexpr int kDefaultSMCount = 28;
+
 int sm_multi_processor_count() {
     static int cached = [] {
         int dev = 0, n = 0;
@@ -911,7 +922,7 @@ int sm_multi_processor_count() {
             cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev)
                 != cudaSuccess) {
             cudaGetLastError();
-            return 28;                     // sane default if the query fails
+            return kDefaultSMCount;
         }
         return n;
     }();
@@ -1269,23 +1280,35 @@ void attention_prefill_launch_t(const T* q, const T* k, const T* v, T* out,
     // kernel handles tiny heads correctly through its zero-padded
     // staging and per-lane bounds guards, in every storage dtype - the
     // dedicated fallback miscompiled under dtype templating and bought
-    // nothing but a second code path.
-    int qtile, kvtile, lpr;
-    if (dim <= 128) { qtile = 64; kvtile = 16; lpr = 4; }
-    else if (dim <= 256) { qtile = 32; kvtile = 8; lpr = 8; }
-    else { qtile = 16; kvtile = 4; lpr = 16; }
+    // nothing but a second code path. One table feeds the smem sizing,
+    // the dispatch and the template instantiations, so they cannot
+    // drift apart: {qtile, kvtile, lanes-per-row} per dim band.
+    static constexpr int kPrefBands[3][3] = {
+        {64, 16, 4},    // dim <= 128
+        {32, 8, 8},     // dim <= 256
+        {16, 4, 16},    // dim <= 512
+    };
+    const int band = (dim <= 128) ? 0 : (dim <= 256) ? 1 : 2;
+    const int qtile = kPrefBands[band][0];
+    const int kvtile = kPrefBands[band][1];
     const int smem = (qtile + 2 * kvtile) * dim * (int)sizeof(float);
     const int tiles = (seq + qtile - 1) / qtile;
     dim3 grid((unsigned)(batch * hq * tiles));
-    if (lpr == 4)
-        attn_prefill_kernel<64, 16, 4, T><<<grid, kAttBlock, smem, cs>>>(
-            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
-    else if (lpr == 8)
-        attn_prefill_kernel<32, 8, 8, T><<<grid, kAttBlock, smem, cs>>>(
-            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
+    if (band == 0)
+        attn_prefill_kernel<kPrefBands[0][0], kPrefBands[0][1],
+                            kPrefBands[0][2], T>
+            <<<grid, kAttBlock, smem, cs>>>(
+                q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
+    else if (band == 1)
+        attn_prefill_kernel<kPrefBands[1][0], kPrefBands[1][1],
+                            kPrefBands[1][2], T>
+            <<<grid, kAttBlock, smem, cs>>>(
+                q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
     else
-        attn_prefill_kernel<16, 4, 16, T><<<grid, kAttBlock, smem, cs>>>(
-            q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
+        attn_prefill_kernel<kPrefBands[2][0], kPrefBands[2][1],
+                            kPrefBands[2][2], T>
+            <<<grid, kAttBlock, smem, cs>>>(
+                q, k, v, out, hq, hkv, seq, dim, tiles, causal ? 1 : 0);
     check_launch("attention prefill kernel launch");
 }
 
@@ -1322,38 +1345,46 @@ void attention_prefill_launch_fp16(const void* q, const void* k,
 }
 
 // ---------------------------------------------------------------------------
-// paged kv-cache append (v1.2): scatter ONE fresh token's k/v rows per
-// sequence into the block pool - the cache-write side of the paged
-// decode loop (the scheduler owns the block table; this writes data
-// into already-mapped blocks at position lens[b]). Grid (B, chunks):
-// every thread copies one 4-element chunk of one head's row.
+// kv-cache append (v1.2 paged, v1.3 contiguous): scatter ONE fresh
+// token's k/v rows per sequence - the cache-write side of the decode
+// loop (the scheduler owns the block table; this writes data into
+// already-mapped blocks at position lens[b]). Grid (B, chunks): every
+// thread copies one 4-element chunk of one head's row. The two cache
+// layouts differ ONLY in the destination-row mapping, so one kernel
+// template carries both: PAGED resolves the row through the block
+// table (token t -> pool[table[b, t / page], t % page]), the
+// contiguous variant writes straight to (b * Hkv + h) * T + lens[b]
+// (`rows` is the page size / cache row count respectively).
 // ---------------------------------------------------------------------------
-
-template <typename T>
-__global__ void kv_append_paged_kernel(const T* __restrict__ k_new,
-                                       const T* __restrict__ v_new,
-                                       const int* __restrict__ table,
-                                       const int* __restrict__ lens,
-                                       T* __restrict__ k_pool,
-                                       T* __restrict__ v_pool,
-                                       int hkv, int dim, int page,
-                                       int tbl_stride) {
+template <bool PAGED, typename T>
+__global__ void kv_append_kernel(const T* __restrict__ k_new,
+                                 const T* __restrict__ v_new,
+                                 const int* __restrict__ table,
+                                 const int* __restrict__ lens,
+                                 T* __restrict__ k_dst,
+                                 T* __restrict__ v_dst,
+                                 int hkv, int dim, int rows,
+                                 int tbl_stride) {
     using C = AttChunk<T>;
     const int bi = blockIdx.x;
     const int chunks = hkv * (dim / 4);
     const int idx = blockIdx.y * blockDim.x + threadIdx.x;
     if (idx >= chunks) return;
     const int pos = lens[bi];
-    const int blk = table[(size_t)bi * tbl_stride + pos / page];
-    const int off = pos % page;
     const int h = idx / (dim / 4);
     const int c = idx % (dim / 4);
-    // pool row base of (block, head, in-page offset); source row base
-    // is the fresh token's (batch, head) row - both chunk-indexed by c
-    const size_t dst = ((size_t)blk * hkv + h) * page + off;
+    size_t dst;
+    if constexpr (PAGED) {
+        const int blk = table[(size_t)bi * tbl_stride + pos / rows];
+        dst = ((size_t)blk * hkv + h) * rows + pos % rows;
+    } else {
+        dst = ((size_t)bi * hkv + h) * rows + pos;
+    }
+    // source row base is the fresh token's (batch, head) row - both
+    // sides chunk-indexed by c
     const size_t src = (size_t)bi * hkv + h;
-    C::stc(k_pool + dst * dim, c, C::ldc(k_new + src * dim, c));
-    C::stc(v_pool + dst * dim, c, C::ldc(v_new + src * dim, c));
+    C::stc(k_dst + dst * dim, c, C::ldc(k_new + src * dim, c));
+    C::stc(v_dst + dst * dim, c, C::ldc(v_new + src * dim, c));
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,7 +1537,7 @@ void kv_append_paged_launch_t(const T* k_new, const T* v_new,
     const int chunks = hkv * (dim / 4);
     dim3 grid((unsigned)batch,
               (unsigned)((chunks + kAttBlock - 1) / kAttBlock));
-    kv_append_paged_kernel<T><<<grid, kAttBlock, 0, cs>>>(
+    kv_append_kernel<true, T><<<grid, kAttBlock, 0, cs>>>(
         k_new, v_new, table, lens, k_pool, v_pool, hkv, dim, page,
         tbl_width);
     check_launch("kv append paged kernel launch");
@@ -1547,37 +1578,12 @@ void kv_append_paged_launch_fp16(const void* k_new, const void* v_new,
 }
 
 // ---------------------------------------------------------------------------
-// contiguous kv-cache append (v1.3): the cache-write side of the
-// CONTIGUOUS decode loop (the paged twin lives above) - scatter one
-// fresh token's k/v rows per sequence to cache row lens[b]. Same grid
-// shape as the paged kernel (B, chunks) but no table indirection:
-// dst row = (b * Hkv + h) * T + lens[b]. Values in lens are the
-// kernel's to trust on the zero-copy path (same boundary as the
-// attention ops; host paths validate).
+// contiguous kv-cache append launcher (v1.3): the cache-write side of
+// the contiguous decode loop (the paged twin lives above) - one kernel
+// template covers both layouts (see kv_append_kernel). Values in lens
+// are the kernel's to trust on the zero-copy path (same boundary as
+// the attention ops; host paths validate).
 // ---------------------------------------------------------------------------
-
-template <typename T>
-__global__ void kv_append_contig_kernel(const T* __restrict__ k_new,
-                                        const T* __restrict__ v_new,
-                                        const int* __restrict__ lens,
-                                        T* __restrict__ k_cache,
-                                        T* __restrict__ v_cache,
-                                        int hkv, int dim, int t_rows) {
-    using C = AttChunk<T>;
-    const int bi = blockIdx.x;
-    const int chunks = hkv * (dim / 4);
-    const int idx = blockIdx.y * blockDim.x + threadIdx.x;
-    if (idx >= chunks) return;
-    const int pos = lens[bi];
-    const int h = idx / (dim / 4);
-    const int c = idx % (dim / 4);
-    // cache row base of (batch, head, write position); source row base
-    // is the fresh token's (batch, head) row - both chunk-indexed by c
-    const size_t dst = ((size_t)bi * hkv + h) * t_rows + pos;
-    const size_t src = (size_t)bi * hkv + h;
-    C::stc(k_cache + dst * dim, c, C::ldc(k_new + src * dim, c));
-    C::stc(v_cache + dst * dim, c, C::ldc(v_new + src * dim, c));
-}
 
 template <typename T>
 void kv_append_launch_t(const T* k_new, const T* v_new, const int* lens,
@@ -1591,8 +1597,9 @@ void kv_append_launch_t(const T* k_new, const T* v_new, const int* lens,
     const int chunks = hkv * (dim / 4);
     dim3 grid((unsigned)batch,
               (unsigned)((chunks + kAttBlock - 1) / kAttBlock));
-    kv_append_contig_kernel<T><<<grid, kAttBlock, 0, cs>>>(
-        k_new, v_new, lens, k_cache, v_cache, hkv, dim, t_rows);
+    kv_append_kernel<false, T><<<grid, kAttBlock, 0, cs>>>(
+        k_new, v_new, nullptr, lens, k_cache, v_cache, hkv, dim, t_rows,
+        0);
     check_launch("kv append kernel launch");
 }
 

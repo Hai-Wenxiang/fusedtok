@@ -31,6 +31,30 @@ constexpr int kBlock = 256;
 inline long long grid_for(long long n) { return (n + kBlock - 1) / kBlock; }
 
 // ---------------------------------------------------------------------------
+// Shared sampler RNG: splitmix64 finalized to a float uniform in [0, 1).
+// Every fused sampler (device) and every CPU reference (host) draws
+// through these twins so both sides produce identical bits per seed.
+// Reproducible, NOT cryptographically secure (documented contract).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float splitmix_uniform_device(
+        unsigned long long seed) {
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    return (float)((z >> 11) * (1.0 / 9007199254740992.0));
+}
+
+inline float splitmix_uniform_host(unsigned long long seed) {
+    // identical hash chain and float conversion to the device twin
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    return (float)((z >> 11) * (1.0 / 9007199254740992.0));
+}
+
+// ---------------------------------------------------------------------------
 // Warp / block reductions (deterministic: fixed shuffle order per warp)
 // ---------------------------------------------------------------------------
 
@@ -128,6 +152,8 @@ __device__ __forceinline__ void st_f(__nv_bfloat16* p, long long i, float v) {
 // Runtime block-size autotuning (v0.4.1)
 // ---------------------------------------------------------------------------
 
+constexpr int kDefaultTuneBlock = 256;   // fallback when tuning is skipped
+
 // One-time per (tag, shape key) micro-benchmark: every candidate block
 // runs the REAL kernel on the caller's own buffers (full size - a
 // truncated problem misleads the choice, see the op files) for a few
@@ -136,12 +162,16 @@ __device__ __forceinline__ void st_f(__nv_bfloat16* p, long long i, float v) {
 // static cache means each op file keeps its own table - no cross-op
 // contention. Callers must skip tuning while a stream capture is active
 // (events and syncs are illegal mid-capture) and fall back to the
-// default block. Structurally unlaunchable candidates (register
-// pressure at 1024 threads on register-heavy kernels) score as slow
-// instead of failing the call.
+// default block. `max_block` caps the candidate set: register-resident
+// kernels sitting at the per-SM register ceiling pass 512 so the
+// 1024-thread candidate is never even tried (under profilers and
+// compute-sanitizer instrumentation it crosses the launch limit and,
+// although the tuner would score it as slow by design, the reported
+// cudaErrorLaunchOutOfResources pollutes sanitizer gates).
 inline int autotune_block(const char* tag, long long shape_key,
                           const std::function<void(int block)>& launch,
-                          cudaStream_t cs, int min_block = 1) {
+                          cudaStream_t cs, int min_block = 1,
+                          int max_block = 1024) {
     static std::mutex mu;
     static std::map<std::pair<const char*, long long>, int> cache;
     std::lock_guard<std::mutex> lock(mu);
@@ -151,12 +181,22 @@ inline int autotune_block(const char* tag, long long shape_key,
         return it->second;
     static const int cands[4] = {128, 256, 512, 1024};
     cudaEvent_t s = nullptr, e = nullptr;
-    cudaEventCreate(&s);
-    cudaEventCreate(&e);
+    if (cudaEventCreate(&s) != cudaSuccess ||
+        cudaEventCreate(&e) != cudaSuccess) {
+        // cannot time anything: clean up, clear the sticky error and
+        // fall back to the default block (clamped into the window)
+        cudaEventDestroy(s);
+        cudaGetLastError();
+        int fallback = kDefaultTuneBlock;
+        if (fallback < min_block) fallback = min_block;
+        if (fallback > max_block) fallback = max_block;
+        cache.emplace(key, fallback);
+        return fallback;
+    }
     float best_ms = 1e30f;
     int best_block = 256;
     for (int b : cands) {
-        if (b < min_block)
+        if (b < min_block || b > max_block)
             continue;               // e.g. coverage floors from the caller
         // A candidate can be structurally unlaunchable (e.g. register
         // pressure at 1024 threads); score those as infinitely slow
@@ -171,13 +211,17 @@ inline int autotune_block(const char* tag, long long shape_key,
         }
         if (!ok)
             continue;
+        float ms = 0.0f;
         cudaEventRecord(s, cs);
         for (int i = 0; i < 8; ++i)
             launch(b);
         cudaEventRecord(e, cs);
-        cudaEventSynchronize(e);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, s, e);
+        if (cudaEventSynchronize(e) != cudaSuccess ||
+            cudaEventElapsedTime(&ms, s, e) != cudaSuccess) {
+            // timing broken for this candidate: skip it, clear residue
+            cudaGetLastError();
+            continue;
+        }
         if (ms < best_ms) {
             best_ms = ms;
             best_block = b;

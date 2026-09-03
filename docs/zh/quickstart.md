@@ -65,21 +65,21 @@ v_cache = torch.randn(1, 8, 16384, 128, device="cuda")
 lens = torch.tensor([16384], dtype=torch.int32, device="cuda")
 out = fusedtok.attention_decode(q, k_cache, v_cache, lens)
 
-# 整个解码步的采样链路合成一次调用、一次回读
+# 整个解码步的采样链路合并成一次调用、一次回读
 logits = torch.randn(131072, device="cuda")
 token = fusedtok.decode_step(logits, [], penalty=1.1,
                              p=0.9, temperature=0.8, seed=0)
 ```
 
-仓库里的 `examples/demo.py` 会把每个算子都巡览一遍并做闭式校验，
-本身就是一份可执行的文档。
+仓库里的 `examples/demo.py` 会把每个算子都逐个演示一遍并与解析
+参考对拍，本身就是一份可执行的文档。
 
 ## 接下来读什么
 
 - [执行模型](execution.md) —— 三条执行路径、dtype 规则、流与
   CUDA graph、错误契约
-- [注意力算子](attention.md) —— 解码注意力、分页 cache、prefill
-- [采样与选择](sampling.md) —— top-k / top-p、融合采样器、确定性契约
+- [注意力算子](attention.md) —— 解码注意力、连续与分页 append 写侧、prefill
+- [采样与选择](sampling.md) —— top-k / top-p / min-p、融合采样器、确定性契约
 - [INT8 路径](int8.md) —— 量化工具与整数精确矩阵乘
 - [基准测试](benchmarks.md) —— 数字怎么测的、表格怎么读
 - [常见问题](faq.md) —— 排错与词汇表

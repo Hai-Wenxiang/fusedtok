@@ -45,7 +45,7 @@ CPU 参考实现是正确性的基准：它实现的是同一套算法（在需�
 | 算子家族 | numpy | CUDA torch |
 |---|---|---|
 | 逐元素、激活、归一化、RoPE | float32 | float32、bfloat16 |
-| `attention_decode`、`attention_decode_paged`、`attention_prefill`、`kv_append_paged` | float32 | float32、bfloat16、float16 |
+| `attention_decode`、`attention_decode_paged`、`attention_prefill`、`kv_append`、`kv_append_paged` | float32 | float32、bfloat16、float16 |
 | 选择与采样（`topk`、`sample_*` 等） | float32 | float32 |
 | INT8 算子（`qgemm` 等） | int8 操作数、float32 scale/输出 | 同左 |
 
@@ -58,7 +58,8 @@ CPU 参考实现是正确性的基准：它实现的是同一套算法（在需�
 - **输出 dtype 跟随输入**：bf16 进 bf16 出；attention 额外支持
   fp16 的往返。
 - 归一化的权重（`weight`、`bias`、`residual`）在激活为半精度时
-  自动升到 float32——检查点通常本来就是按 fp32 存这些参数的。
+  自动升到 float32——模型权重（checkpoint）通常本来就是按 fp32
+  存这些参数的。
 - CPU / 暂存路径恒为 float32（numpy 没有 bf16/fp16）。
 - 其他 dtype（float64 等）在 CPU / 暂存路径会被拷贝转换成
   float32；零拷贝路径直接报 `TypeError` 拒绝。
@@ -109,8 +110,8 @@ g.replay()                                  # 整批一次 replay
 
 | 异常 | 触发场景 | 例子 |
 |---|---|---|
-| `ValueError` | 形状与取值范围 | `k` 超出 `[0, n]`、`p` 超出 `(0, 1]`、负的 `pos_offset`、`lens` 超过 cache 长度、形状不匹配、主机侧来源的 `lens`/`block_table` 取值越界 |
-| `TypeError` | dtype / 设备族问题 | 零拷贝路径收到 float64、主输入在 CUDA 而某个操作数在 CPU、q/k/v dtype 不一致、kernel 直读裸指针的算子收到非连续张量 |
+| `ValueError` | 形状与取值范围 | `k` 超出 `[0, n]`、`p` 超出 `(0, 1]`、负的 `pos_offset`、`lens` 超过 cache 长度、形状不匹配、主机侧来源的 `lens`/`block_table` 取值越界、非连续张量（见下） |
+| `TypeError` | dtype / 设备族问题 | 零拷贝路径收到 float64、主输入在 CUDA 而某个操作数在 CPU、q/k/v dtype 不一致 |
 | `RuntimeError` | CUDA 执行失败 | kernel 启动错误、驱动错误、拷贝失败 |
 
 注意连续性规则：零拷贝 kernel 直接按地址访问显存，非连续张量

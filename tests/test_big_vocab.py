@@ -126,3 +126,36 @@ def test_decode_step_at_qwen_vocab():
     penalized = fusedtok.repetition_penalty(host, history, 1.3)
     ref = fusedtok.sample_topp(penalized, p=0.9, temperature=0.8, seed=5)
     assert tok == ref
+
+
+# ---------------------------------------------------------------------------
+# stride >= 2 checkpoint walks (1.3.1 fix). walk_cp_stride scales the
+# checkpoint recording so the shared-memory slot array stays within
+# kWalkCpMax = 8192 entries: a window of more than 8192 * 32 = 262144
+# elements records every SECOND batch boundary (stride 2), and the
+# walk_from_cp resume index used to sit (stride - 1) batches BEFORE the
+# checkpoint boundary - those elements were counted twice (once in the
+# checkpoint, once re-walked), inflating the cum and drawing a token
+# (stride - 1) * 32 ranks early. Latent until v1.3.1 because no real
+# vocabulary exceeded 262144.
+# ---------------------------------------------------------------------------
+
+N_WIDE = 300000      # > 262144 -> walk_cp_stride == 2 on the full window
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+@needs_gpu
+def test_sample_topp_stride2_checkpoints_match_cpu(seed):
+    # all-zero logits: every exp is EXACTLY 1.0 on both sides (std::exp
+    # and __expf agree at 0), and with n = 300000 < 2**24 the serial
+    # CDF is exact integer arithmetic - so CPU and GPU tokens must be
+    # bit-identical, with zero rounding-drift margin. p=0.9 widens the
+    # window to the full vocabulary (stride 2); the pre-1.3.1 resume
+    # bug shifted the GPU token exactly (stride - 1) * 32 = 32 ranks.
+    logits = np.zeros(N_WIDE, dtype=np.float32)
+    dev = torch.from_numpy(logits).cuda()
+    tok_cpu = fusedtok.sample_topp(logits, 0.9, seed=seed)
+    tok_gpu = fusedtok.sample_topp(dev, 0.9, seed=seed)
+    assert tok_gpu == tok_cpu
+    # per-seed stability on the same build
+    assert fusedtok.sample_topp(dev, 0.9, seed=seed) == tok_gpu

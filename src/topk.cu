@@ -127,8 +127,9 @@ constexpr int kWsExpMax = 264;      // global logit max, fkey bits (sample)
 constexpr int kWsTotal = 265;       // global softmax total (float, sample)
 // cumulated softmax mass of the whole (failed) sampling window: written
 // by the sampling tail whenever the nucleus is not covered, read by the
-// host to sharpen the widening jump (widen_window). Lives next to
-// kWsTotal so one 8-byte readback fetches both.
+// host to sharpen the widening jump (widen_window). Each of kWsTotal /
+// kWsCumW holds its float in the LOW half of its own u64 word; one
+// 16-byte readback of the two words fetches both.
 constexpr int kWsCumW = 266;        // window cum mass (sample, float)
 constexpr int kWsLevelDone = 267;   // level of the last completed round
 // argmax-dedicated slots (NOT shared with the selection pipeline): the
@@ -173,7 +174,11 @@ unsigned long long* selection_workspace(size_t extra_words) {
         // call after a (re)allocation. One synchronous memset per growth
         // event only; selection calls keep their own per-call head memset
         // and never depend on this.
-        cudaMemset(nb, 0, words * sizeof(unsigned long long));
+        if (cudaMemset(nb, 0, words * sizeof(unsigned long long)) !=
+            cudaSuccess)
+            throw std::runtime_error(
+                std::string("selection workspace zeroing failed: ") +
+                cudaGetErrorString(cudaGetLastError()));
         if (buf) cudaFree(buf);
         buf = nb;
         capacity = words;
@@ -295,8 +300,15 @@ void ship_args(cudaStream_t cs, SelArgs* dargs, const float* x,
     a.idxs = idxs;
     a.count_out = count_out;
     a.p_stop = p_stop;
-    cudaMemcpyAsync(dargs, &a, sizeof(SelArgs), cudaMemcpyHostToDevice, cs);
-    cudaEventRecord(ring.ev[i], cs);   // fences the copy for the next reuse
+    // a failed enqueue (bad pointer etc.) would leave the device args
+    // stale and the kernel reading the PREVIOUS call's pointers - both
+    // the copy and its fence must succeed
+    if (cudaMemcpyAsync(dargs, &a, sizeof(SelArgs), cudaMemcpyHostToDevice,
+                        cs) != cudaSuccess ||
+        cudaEventRecord(ring.ev[i], cs) != cudaSuccess)
+        throw std::runtime_error(
+            std::string("selection args upload failed: ") +
+            cudaGetErrorString(cudaGetLastError()));
 }
 
 // Descending shared-memory bitonic sort over `len` (power of two) keys.
@@ -583,11 +595,7 @@ __global__ void emit_finish_kernel(const SelArgs* __restrict__ a,
             nucleus_mass = cum;
         }
         // splitmix64-finalized uniform in [0, 1): deterministic per seed
-        unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-        z ^= z >> 31;
-        const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+        const float u = splitmix_uniform_device(seed);
         const float target = u * nucleus_mass;
         cum = 0.0f;
         for (int i = 0; i < nucleus; ++i) {
@@ -878,7 +886,6 @@ __device__ int walk_until_cp(const float* __restrict__ exps, int count,
     float cum = 0.0f;
     int i = 0;
     int ncp = 0;
-    int batch = 0;                   // full batches completed so far
     // branch-free recording state: `until_rec` counts batches down to
     // the next checkpoint slot. The batch loop must stay free of
     // CONTROL FLOW for nvcc to keep the float4 loads pipelined (the
@@ -921,7 +928,6 @@ __device__ int walk_until_cp(const float* __restrict__ exps, int count,
         until_rec = rec ? stride : until_rec;
         cps[ncp] = cum;
         ncp += rec;
-        ++batch;
         i += kWalkBatch;
     }
     for (; i < count; ++i) {
@@ -950,10 +956,14 @@ __device__ int walk_from_cp(const float* __restrict__ exps, int count,
         else h = mid - 1;
     }
     // only the found checkpoint is guaranteed < thr; resume strictly
-    // after its boundary (cps[j] covers elements < boundary; a later
-    // checkpoint >= thr bounds the crossing inside this window)
+    // AFTER its boundary: checkpoint j is recorded once batches
+    // 0..(j+1)*stride-1 have completed, so it covers elements up to
+    // (exclusive) a + (j+1)*stride*kWalkBatch - starting any earlier
+    // would count the batches between the resume point and the
+    // boundary twice (once in cps[j], once re-walked). stride == 1
+    // reduces to the original one-past formula.
     const int a = (int)(((16u - (unsigned)(uintptr_t)exps) & 15u) >> 2);
-    const int i0 = a + (j * stride + 1) * kWalkBatch;
+    const int i0 = a + (j + 1) * stride * kWalkBatch;
     return walk_from(exps, count, thr, i0, cps[j]);
 }
 
@@ -968,6 +978,40 @@ __host__ __device__ inline int walk_cp_slots(int count) {
 __host__ __device__ inline int walk_cp_stride(int count) {
     const int nb = (count + kWalkBatch - 1) / kWalkBatch;
     return (nb + kWalkCpMax - 1) / kWalkCpMax;
+}
+
+// chunk sort + merge-ladder over the paired m-word key buffers in the
+// selection workspace: sorts the first `count` keys of buffer A (the
+// ladder ping-pongs between the halves) and returns the buffer holding
+// the fully sorted keys. The other half (sort_keys_mate) is free
+// scratch once the sort is done - the samplers stage their exp column
+// there. Shared by topk / topp / sample_topp / decode_step / minp.
+unsigned long long* sort_keys(unsigned long long* ws, int count, int m,
+                              cudaStream_t cs) {
+    chunk_sort_kernel<<<(int)((m + kSelSortChunk - 1) / kSelSortChunk),
+                        kSelBlock, 0, cs>>>(ws + kWsKeys, count, m);
+    check_launch("selection chunk sort launch");
+    unsigned long long* bufs[2] = {ws + kWsKeys,
+                                   ws + kWsKeys + (size_t)m};
+    int cur = 0;
+    for (int run = kSelSortChunk; run < m; run <<= 1) {
+        const long long ntiles = m / kSelMergeTile;
+        const int gmerge = (int)std::max<long long>(
+            1LL, std::min<long long>(ntiles, kMaxGrid));
+        merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
+                                                         bufs[cur ^ 1],
+                                                         m, run);
+        check_launch("selection merge launch");
+        cur ^= 1;
+    }
+    return bufs[cur];
+}
+
+// the other half of the key area - free scratch once the sort is done
+inline unsigned long long* sort_keys_mate(unsigned long long* ws, int m,
+                                          const unsigned long long* sorted) {
+    return (sorted == ws + kWsKeys) ? ws + kWsKeys + (size_t)m
+                                    : ws + kWsKeys;
 }
 } // namespace
 
@@ -1015,11 +1059,7 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     // case too: full-window cum, exactly what the forced-coverage path
     // used)
     const float nucleus_mass = cum;
-    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z ^= z >> 31;
-    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+    const float u = splitmix_uniform_device(seed);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
     if (hit >= 0)
@@ -1224,23 +1264,8 @@ void select_raw_pipeline(const SelArgs* dargs, unsigned long long* ws,
     }
 
     emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, k, 1.0f, pen);
-    chunk_sort_kernel<<<(int)((m + kSelSortChunk - 1) / kSelSortChunk),
-                        kSelBlock, 0, cs>>>(ws + kWsKeys, k, m);
-    check_launch("selection chunk sort launch");
-    unsigned long long* bufs[2] = {ws + kWsKeys,
-                                   ws + kWsKeys + (size_t)m};
-    int cur = 0;
-    for (int run = kSelSortChunk; run < m; run <<= 1) {
-        const long long ntiles = m / kSelMergeTile;
-        const int gmerge = (int)std::max<long long>(
-            1LL, std::min<long long>(ntiles, kMaxGrid));
-        merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
-                                                         bufs[cur ^ 1],
-                                                         m, run);
-        check_launch("selection merge launch");
-        cur ^= 1;
-    }
-    decode_kernel<<<selection_grid(k), kSelBlock, 0, cs>>>(dargs, bufs[cur],
+    unsigned long long* sorted = sort_keys(ws, k, m, cs);
+    decode_kernel<<<selection_grid(k), kSelBlock, 0, cs>>>(dargs, sorted,
                                                            k);
     check_launch("selection decode launch");
 
@@ -1251,9 +1276,9 @@ void select_raw_pipeline(const SelArgs* dargs, unsigned long long* ws,
             1LL, std::min<long long>((k + kSelBlock - 1) / kSelBlock,
                                      kMaxGrid));
         const int per = (k + gsum - 1) / gsum;
-        topp_partial_kernel<<<gsum, kSelBlock, 0, cs>>>(bufs[cur], partials,
+        topp_partial_kernel<<<gsum, kSelBlock, 0, cs>>>(sorted, partials,
                                                         k, per);
-        topp_crossing_kernel<<<1, kSelBlock, 0, cs>>>(dargs, bufs[cur],
+        topp_crossing_kernel<<<1, kSelBlock, 0, cs>>>(dargs, sorted,
                                                       partials, k, per,
                                                       gsum);
         check_launch("selection nucleus count launch");
@@ -1390,7 +1415,8 @@ topk_cpu(const std::vector<float>& x, int k) {
     return {std::move(vals), std::move(idxs)};
 }
 
-void topk_launch(const float* x, float* vals, long long* idxs, int n, int k, std::uintptr_t stream) {
+void topk_launch(const float* x, float* vals, long long* idxs,
+                 int n, int k, std::uintptr_t stream) {
     if (k <= 0 || n <= 0) return;
     select_common(x, vals, idxs, nullptr, n, k, 0.0f, stream);
 }
@@ -1416,8 +1442,16 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
                         int n, float p, int* count_out, std::uintptr_t stream) {
     if (n <= 0) {
         if (count_out) {
-            int zero = 0;
-            cudaMemcpy(count_out, &zero, sizeof(int), cudaMemcpyHostToDevice);
+            // stream-ordered zero (a blocking cudaMemcpy would run on
+            // the NULL stream and sync the device, ignoring the
+            // caller's stream - the tail of the 1.0 fast path)
+            static const int zero = 0;
+            if (cudaMemcpyAsync(count_out, &zero, sizeof(int),
+                                cudaMemcpyHostToDevice,
+                                (cudaStream_t)stream) != cudaSuccess)
+                throw std::runtime_error(
+                    std::string("topp zero-count upload failed: ") +
+                    cudaGetErrorString(cudaGetLastError()));
         }
         return;
     }
@@ -1426,8 +1460,9 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
 
 // Adaptive widening jump (v1.2). After a window attempt fails to cover
 // the nucleus, two floats the attempt already produced steer the next
-// window size (one 8-byte readback of the adjacent kWsTotal/kWsCumW
-// words):
+// window size (one 16-byte readback of the kWsTotal/kWsCumW workspace
+// words - each value lives in the LOW half of its own u64 word, so
+// both words are copied and their low halves reinterpreted):
 //   T = GLOBAL softmax total (exptotal_kernel, max-normalized: the
 //       largest exp is exactly 1.0f)
 //   C = whole-window cum mass (stored by the sampling tail on failure)
@@ -1447,10 +1482,20 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
 // retry count changes, which is what this saves.
 static int widen_window(int window, int n, float p,
                         const unsigned long long* ws) {
-    float mass[2] = {0.0f, 0.0f};           // [total, window cum]
-    if (cudaMemcpy(mass, ws + kWsTotal, 2 * sizeof(float),
+    // v1.3.1: the readback copies TWO u64 words (kWsTotal, kWsCumW) and
+    // takes the low float of each - the previous 8-byte copy fetched
+    // only word 265, so mass[1] read the never-written high half and
+    // the adaptive bound below never fired (widening silently fell
+    // back to the plain ceil(p*total)+1 estimate, costing extra retry
+    // rounds on mid-tailed distributions)
+    unsigned long long massw[2] = {0ULL, 0ULL};
+    if (cudaMemcpy(massw, ws + kWsTotal, 2 * sizeof(*ws),
                    cudaMemcpyDeviceToHost) != cudaSuccess)
         throw std::runtime_error("sample mass readback failed");
+    const float mass[2] = {
+        *reinterpret_cast<const float*>(&massw[0]),   // global total
+        *reinterpret_cast<const float*>(&massw[1]),   // window cum
+    };
     const double total = (double)mass[0];
     const double cw = (double)mass[1];
     long long lb;
@@ -1488,6 +1533,7 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
     // the p*T mass bound (widen_window). Typical distributions are
     // covered by the first window.
     int window = std::min(kSelEarlyOut, n);
+    const float inv_t = 1.0f / t;
     for (;;) {
         int m = 1;
         while (m < window) m <<= 1;
@@ -1517,48 +1563,36 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
         if (!full) {
             for (int level = 7; level >= 0; --level)
                 select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
-                    dargs, ws, n, level, (unsigned long long)window, 1.0f / t,
+                    dargs, ws, n, level, (unsigned long long)window, inv_t,
                     kNoPen);
             select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n,
-                                                               1.0f / t,
+                                                               inv_t,
                                                                kNoPen);
         }
         // global softmax mass (max, then total): the nucleus threshold
         // must be global, not window-local (see exptotal_kernel)
-        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, 1.0f / t, kNoPen);
-        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, 1.0f / t, kNoPen);
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
         check_launch("sample round launch");
         if (!full && window <= kSelEarlyOut) {
             emit_finish_kernel<<<grid, kSelBlock, 0, cs>>>(
-                dargs, ws, n, window, 1.0f / t, seed, /*sample=*/1, kNoPen);
+                dargs, ws, n, window, inv_t, seed, /*sample=*/1, kNoPen);
             check_launch("sample emit+finish launch");
         } else {
             // partial window: two-level emit; full window: emit's k==n
             // branch degenerates to the parallel pack (see above)
             emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
-                                                    1.0f / t, kNoPen);
-            chunk_sort_kernel<<<(m + kSelSortChunk - 1) / kSelSortChunk,
-                                kSelBlock, 0, cs>>>(ws + kWsKeys, window, m);
-            unsigned long long* bufs[2] = {ws + kWsKeys,
-                                           ws + kWsKeys + (size_t)m};
-            int cur = 0;
-            for (int run = kSelSortChunk; run < m; run <<= 1) {
-                const long long ntiles = m / kSelMergeTile;
-                const int gmerge = (int)std::max<long long>(
-                    1LL, std::min<long long>(ntiles, kMaxGrid));
-                merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
-                                                                 bufs[cur ^ 1],
-                                                                 m, run);
-                cur ^= 1;
-            }
+                                                    inv_t, kNoPen);
+            unsigned long long* sorted = sort_keys(ws, window, m, cs);
             // parallel exp precompute; the serial walk then only adds
-            float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
+            float* exps =
+                reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
             exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
-                bufs[cur], exps, window);
+                sorted, exps, window);
             sample_serial_kernel<<<1, 32,
                                    walk_cp_slots(window) * sizeof(float),
                                    cs>>>(
-                bufs[cur], exps, ws, window, n, p, seed,
+                sorted, exps, ws, window, n, p, seed,
                 token_out, nullptr);
             check_launch("sample tail launch");
         }
@@ -1658,27 +1692,16 @@ long long decode_step_launch(const float* x, const long long* ids,
             // branch degenerates to the parallel pack
             emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
                                                     inv_t, pen);
-            chunk_sort_kernel<<<(mm + kSelSortChunk - 1) / kSelSortChunk,
-                                kSelBlock, 0, cs>>>(ws + kWsKeys, window, mm);
-            unsigned long long* bufs[2] = {ws + kWsKeys,
-                                           ws + kWsKeys + (size_t)mm};
-            int cur = 0;
-            for (int run = kSelSortChunk; run < mm; run <<= 1) {
-                const long long ntiles = mm / kSelMergeTile;
-                const int gmerge = (int)std::max<long long>(
-                    1LL, std::min<long long>(ntiles, kMaxGrid));
-                merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(
-                    bufs[cur], bufs[cur ^ 1], mm, run);
-                cur ^= 1;
-            }
+            unsigned long long* sorted = sort_keys(ws, window, mm, cs);
             // parallel exp precompute; the serial walk then only adds
-            float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
+            float* exps =
+                reinterpret_cast<float*>(sort_keys_mate(ws, mm, sorted));
             exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
-                bufs[cur], exps, window);
+                sorted, exps, window);
             sample_serial_kernel<<<1, 32,
                                    walk_cp_slots(window) * sizeof(float),
                                    cs>>>(
-                bufs[cur], exps, ws, window, n, p, seed,
+                sorted, exps, ws, window, n, p, seed,
                 token_out, nullptr);
             check_launch("decode step tail launch");
         }
@@ -1723,11 +1746,7 @@ __global__ void sample_topk_serial_kernel(
     float window_mass = 0.0f;
     int ncp = 0;
     walk_until_cp(exps, k, INFINITY, &window_mass, cps, stride, &ncp);
-    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z ^= z >> 31;
-    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+    const float u = splitmix_uniform_device(seed);
     const float target = u * window_mass;
     const int hit = walk_from_cp(exps, k, target, cps, ncp, stride);
     const int idx = (hit >= 0) ? hit : k - 1;      // rounding fallback
@@ -1769,26 +1788,14 @@ long long sample_topk_launch(const float* x, int n, int k, float t,
     // them (one or several 1024-key chunks + the merge ladder), draw.
     // No mass threshold anywhere - the window renormalizes by definition.
     emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, k, inv_t, kNoPen);
-    chunk_sort_kernel<<<(int)((mm + kSelSortChunk - 1) / kSelSortChunk),
-                        kSelBlock, 0, cs>>>(ws + kWsKeys, k, mm);
-    unsigned long long* bufs[2] = {ws + kWsKeys,
-                                   ws + kWsKeys + (size_t)mm};
-    int cur = 0;
-    for (int run = kSelSortChunk; run < mm; run <<= 1) {
-        const long long ntiles = mm / kSelMergeTile;
-        const int gmerge = (int)std::max<long long>(
-            1LL, std::min<long long>(ntiles, kMaxGrid));
-        merge_level_kernel<<<gmerge, kSelBlock, 0, cs>>>(bufs[cur],
-                                                         bufs[cur ^ 1],
-                                                         mm, run);
-        cur ^= 1;
-    }
+    unsigned long long* sorted = sort_keys(ws, k, mm, cs);
     // parallel exp precompute; the serial walk then only adds
-    float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
+    float* exps =
+        reinterpret_cast<float*>(sort_keys_mate(ws, mm, sorted));
     exp_window_kernel<<<selection_grid(k), kSelBlock, 0, cs>>>(
-        bufs[cur], exps, k);
+        sorted, exps, k);
     sample_topk_serial_kernel<<<1, 32, walk_cp_slots(k) * sizeof(float),
-                                cs>>>(bufs[cur], exps, token_out,
+                                cs>>>(sorted, exps, token_out,
                                       k, seed);
     check_launch("sample topk tail launch");
     cudaError_t err = cudaDeviceSynchronize();    // surface kernel faults
@@ -1888,11 +1895,7 @@ __global__ void sample_minp_serial_kernel(
     const int nucleus = (edge < 0) ? k : edge;
     // exps[0] == 1.0 >= min_p for a valid min_p, so the nucleus is
     // never empty and nucleus_mass > 0
-    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z ^= z >> 31;
-    const float u = (float)((z >> 11) * (1.0 / 9007199254740992.0));
+    const float u = splitmix_uniform_device(seed);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
     if (hit >= 0)
@@ -1923,14 +1926,13 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
             selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
                                 kWsScanWords +
                                 sizeof(SelArgs) / sizeof(unsigned long long));
-        cudaStream_t cs2 = cs;
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs2);
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
         cudaMemcpyAsync(token_out, &token, sizeof(int),
-                        cudaMemcpyHostToDevice, cs2);
-        ship_args(cs2, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+                        cudaMemcpyHostToDevice, cs);
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
         const int grid = selection_grid(n);
         const float inv_t = 1.0f / t;
         // full-vocabulary fast path: every key survives the radix
@@ -1939,35 +1941,24 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
         const bool full = (window == n);
         if (!full) {
             for (int level = 7; level >= 0; --level)
-                select_round_kernel<<<grid, kSelBlock, 0, cs2>>>(
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
                     dargs, ws, n, level, (unsigned long long)window,
                     inv_t, kNoPen);
-            select_finalize_kernel<<<grid, kSelBlock, 0, cs2>>>(
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
                 dargs, ws, n, inv_t, kNoPen);
         }
-        emit_kernel<<<grid, kSelBlock, 0, cs2>>>(dargs, ws, n, window,
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
                                                  inv_t, kNoPen);
         check_launch("minp selection launch");
-        chunk_sort_kernel<<<(int)((m + kSelSortChunk - 1) / kSelSortChunk),
-                            kSelBlock, 0, cs2>>>(ws + kWsKeys, window, m);
-        unsigned long long* bufs[2] = {ws + kWsKeys,
-                                       ws + kWsKeys + (size_t)m};
-        int cur = 0;
-        for (int run = kSelSortChunk; run < m; run <<= 1) {
-            const long long ntiles = m / kSelMergeTile;
-            const int gmerge = (int)std::max<long long>(
-                1LL, std::min<long long>(ntiles, kMaxGrid));
-            merge_level_kernel<<<gmerge, kSelBlock, 0, cs2>>>(
-                bufs[cur], bufs[cur ^ 1], m, run);
-            cur ^= 1;
-        }
-        float* exps = reinterpret_cast<float*>(bufs[cur ^ 1]);
-        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs2>>>(
-            bufs[cur], exps, window);
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
         sample_minp_serial_kernel<<<1, 32,
                                     walk_cp_slots(window) * sizeof(float),
-                                    cs2>>>(
-            bufs[cur], exps, token_out, window, n, min_p, seed);
+                                    cs>>>(
+            sorted, exps, token_out, window, n, min_p, seed);
         check_launch("minp tail launch");
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess)

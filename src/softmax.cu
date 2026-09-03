@@ -190,18 +190,27 @@ void softmax_dispatch(const T* x, T* y, int rows, int cols, int block,
 // BLOCK * kSmPerThread elements per row, so candidates below
 // ceil(cols / kSmPerThread) would silently drop the row tail - the
 // tuner never sees them (caught on a 5060 Ti that liked 128-thread
-// blocks; the RTX 3060 never picked one there).
+// blocks; the RTX 3060 never picked one there). The register variant
+// is also capped at 512 threads: its v[32]/e[32] register slices sit
+// right at the per-SM register ceiling for 1024-thread blocks, where
+// sanitizer/profiler instrumentation tips the launch over the limit -
+// the tuner handles the failure by design, but the reported error
+// pollutes sanitizer gates (observed as 4x cudaErrorLaunchOutOfResour-
+// ces on this driver generation).
 template <typename T>
 int softmax_pick_block(const char* tag, const T* x, T* y, int rows,
                        int cols, cudaStream_t cs) {
     int min_block = 1;
-    if (cols <= kSmPerThread * kSmBlock)
+    int max_block = 1024;
+    if (cols <= kSmPerThread * kSmBlock) {
         min_block = (cols + kSmPerThread - 1) / kSmPerThread;
+        max_block = 512;
+    }
     return autotune_block(tag, ((long long)rows << 32) | (unsigned)cols,
                           [&](int b) {
                               softmax_dispatch<T>(x, y, rows, cols, b, cs);
                           },
-                          cs, min_block);
+                          cs, min_block, max_block);
 }
 
 } // namespace

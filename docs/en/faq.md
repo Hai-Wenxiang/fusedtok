@@ -19,14 +19,14 @@ are not supported.
 | 12.0 | Blackwell | RTX 50xx | PTX JIT |
 
 Check yours with `nvidia-smi`, then look the model up at
-https://developer.nvidia.com/cuda-gpus .
+https://developer.nvidia.com/cuda-gpus.
 
 ## It says "no CUDA device" but I have a GPU
 
 - `fusedtok.cuda_available()` returns False when a CUDA context cannot
-  be created: check `nvidia-smi` works, the driver is current for
-  your CUDA runtime (>= 12.0 class), and you are not on a headless
-  machine with no device visible.
+  be created: check that `nvidia-smi` works, that the driver is
+  current for your CUDA runtime (>= 12.0 class), and that a device is
+  actually visible to the machine.
 - All CPU-reference functionality works without a GPU - only the
   CUDA paths need one.
 
@@ -95,6 +95,18 @@ micro-benchmark yourself, prefer events over wall clock and expect
   shrinking and evicted sequences.
 - **Flash-decoding** - long-sequence decode strategy: split the cache
   into slices, compute partial softmaxes in parallel, then reduce.
+- **Nucleus** - the truncated candidate set a sampler draws from:
+  top-p takes the prefix whose cumulative probability mass reaches p;
+  min-p takes the prefix of probabilities at least min_p times the
+  maximum.
+- **Radix** - the selection pipeline's ordering technique: candidate
+  keys are histogrammed round by round on their high bytes (the radix
+  sort idea).
+- **SDPA** - PyTorch's `scaled_dot_product_attention`, the official
+  reference implementation this library benchmarks against.
+- **Cooperative launch** - a CUDA launch primitive that starts every
+  block at once and provides grid-wide synchronization; the selection
+  pipeline replaces it with plain launches plus arrival tickets.
 - **arrival-ticket** - the selection pipeline's cross-block ordering
   trick: the last block to arrive at a counter decides the round, so
   plain kernel launches replace grid-wide barriers.
@@ -102,7 +114,7 @@ micro-benchmark yourself, prefer events over wall clock and expect
   (fusedtok's selling point is not materializing scores/intermediates).
 - **W8A8** - INT8 inference layout: 8-bit weights with per-output-
   channel scales, 8-bit activations with per-tensor scales.
-- **WDDM** - the Windows display driver model; adds submission latency
-  versus Linux's TGM mode.
+- **WDDM** - the Windows display driver model; adds kernel submission
+  latency that Linux's driver model does not have.
 - **Zero-copy** - kernels operate directly on torch's device buffers
   via `data_ptr()`; no staging copies, no host sync.

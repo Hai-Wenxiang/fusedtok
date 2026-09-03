@@ -4,6 +4,83 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-09-04
+
+Audit-driven hardening release (the 1.2.1 playbook applied to the 1.3
+codebase): staged-path validation holes, two latent sampling-walk bugs,
+a sanitizer-gate fix, a cleanup pass, and a documentation overhaul with
+every benchmark number regenerated. 456 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2);
+compute-sanitizer memcheck/racecheck clean on both platforms; the
+219-token sampling battery is bit-identical to 1.3.0 except the six
+fixed stride-2 rows (below).
+
+### Fixed
+- **Staged-path value validation holes** (all four attention-family
+  ops): the staged bindings received host `lens` / `block_table` arrays
+  whose VALUES were unchecked, so a bad entry became a silent GPU
+  out-of-bounds access - and the in-place `kv_append` ops would have
+  corrupted the cache permanently (the docstrings claimed the
+  validation existed). `kv_append` / `kv_append_paged` /
+  `attention_decode` / `attention_decode_paged` now route staged
+  uploads through the same `_host_lens_checked` / `_host_table_checked`
+  helpers the zero-copy path uses; one contract everywhere. The host
+  kv_append paths also check the v-side shapes exactly (equal-total
+  mis-shapes used to alias past the binding's size-only guard).
+- **Integer-input hardening**: float `lens`/ids were silently truncated
+  by the int32/int64 casts (now TypeError); 2-D id arrays were silently
+  ravelled flat (now ValueError); range errors name the parameter.
+- **`walk_from_cp` stride >= 2 resume bug** (latent since v1.3): the
+  checkpoint resume index was only correct for stride 1 - with
+  vocabulary windows above 262144 elements the resume sat (stride - 1)
+  batches before the checkpoint boundary and those elements were
+  counted twice, drawing the token (stride - 1) * 32 ranks early. No
+  real vocabulary reached it; pinned by a new n=300000 all-zero-logits
+  test (exact integer CDF on both sides, bit-identical CPU/GPU tokens).
+- **`widen_window` read the wrong workspace word**: the 8-byte readback
+  fetched only the kWsTotal word, so the adaptive p*T*W/C lower bound
+  never fired and widening silently fell back to the plain estimate.
+  With the 16-byte two-word readback, mid-tail sample_topp (randn,
+  p=0.99, n=131072) drops 2391.5 -> 1691.2us on a 3060 and
+  1626.1 -> 1172.7us on a 5060 Ti (3-round means, ~-28%); flat regimes
+  unchanged; sampled tokens bit-identical everywhere.
+- **softmax tuner vs sanitizer gates**: the register-resident variant's
+  1024-thread candidate sits at the per-SM register ceiling and current
+  Windows drivers' compute-sanitizer instrumentation tips it over the
+  launch limit - handled by design (scored as slow), but the reported
+  error polluted memcheck output. The tuner gained a max_block
+  parameter and the register variant now caps candidates at 512.
+
+### Changed
+- kv_append_paged_kernel + kv_append_contig_kernel collapse into one
+  `template <bool PAGED, typename T>` (the pair differed only in the
+  destination-row mapping); the split-decode reduce kernel now emits
+  its final stores from warp 0 only (all 8 warps folded identical
+  values by design - the extra stores were 8x write traffic); the
+  splitmix64 uniform x7 and the chunk-sort + merge-ladder sequence x5
+  fold into shared helpers; error checks added where convention
+  requires (workspace memset, args-ring upload + fence, tuner event
+  creation); topp's n<=0 zero-count upload is stream-ordered instead of
+  a blocking NULL-stream copy; temperature_launch n widened to long
+  long; prefill tile triplets live in one table; >100-column lines
+  swept across src/.
+- bench suite: `sample_minp peaked` and `kv_append` rows added (every
+  README prose claim is regenerable from a JSON row again), wheel-safe
+  import order, comparison parameters shared by both sides as module
+  constants, sampler timing asymmetry documented (conservative against
+  fusedtok); both GPUs' tables regenerated (headline 8.91x decode on a
+  3060).
+
+### Documentation
+- Numbers synced everywhere to the regenerated JSONs (stale 1.5-1.7x /
+  1.9x / 7.8x / 1.06-1.07x / 155 GB/s / 0.10-0.17x claims fixed en+zh);
+  the zh error-contract table listed non-contiguous tensors under the
+  wrong exception; "Linux TGM mode" never existed; attention pages said
+  "four entry points" while documenting five; Chinese de-stiffened (the
+  leftover literal-translation register), English polished (caps
+  misuse, broken TOC anchor, citation), glossary gains nucleus / radix
+  / SDPA / cooperative launch in both languages.
+
 ## [1.3.0] - 2026-09-03
 
 Feature release on the frozen 1.x API (two new operators, additions
@@ -30,9 +107,11 @@ across both GPUs.
   logits 151.6us vs 198.2us for the softmax+mask+multinomial composite
   on a 3060 (1.31x; 60.7 vs 66.7 on a 5060 Ti); a wide ~13k nucleus on
   plain randn honestly costs 740us vs 197 (0.27x - two ladder retries
-  plus a 64k sort; the torch boolean-mask composite never sorts).
+  plus a 64k sort; the torch boolean-mask composite never sorts). The
+  740us figure is the development-time probe; the regenerated
+  benchmark rows (684us vs 209, 0.31x) live in the JSONs and README.
 - **`kv_append(k_cache, v_cache, k_new, v_new, lens)`**: the
-  cache-write side of the CONTIGUOUS decode loop - the twin
+  cache-write side of the contiguous decode loop - the twin
   `kv_append_paged` always had. One tiny chunk-copy kernel (f32/bf16/
   fp16 storage, graph-capturable, in place) writing each sequence's
   fresh k/v rows to cache row `lens[b]`. 9 new tests including an
@@ -62,7 +141,7 @@ across both GPUs.
   1676 -> 1430us (-15%). Wall 3-round means: flat p=0.95 1966 ->
   ~1460us, sample_topk full-vocab 1818 -> 1248us (~1.46x); on a 5060
   Ti the flat probe drops to ~1025us. Scheduling lesson recorded in
-  the source: the checkpoint store must be BRANCH-FREE inside the
+  the source: the checkpoint store must be branch-free inside the
   batch loop - a conditional shared write was enough for nvcc to stop
   pipelining the loads (midtail regressed 200us in the first version).
 - Benchmarks regenerated on both GPUs with the new `sample_minp` row
@@ -118,7 +197,7 @@ memcheck/racecheck clean on the touched kernels.
 - **lens / block_table / token-id validation moved host-side.**
   Host-origin values (lists, numpy, CPU tensors) are validated before
   the upload - identical errors as before. Device-resident tensors are
-  now TRUSTED (documented boundary, same as raw device pointers):
+  now trusted (documented boundary, same as raw device pointers):
   reading them back would sync the stream, and the old code paid two
   syncs per attention call with `lens`, which also made CUDA-graph
   capture with `lens` impossible. Capture now works (tested).
@@ -166,9 +245,9 @@ new kernels (three storage dtypes + the graph-capture path).
   (f32/bf16/fp16 storage, f32 compute) as the contiguous op; the split
   pipeline and workspace are shared, stage 2 is the same reduce kernel.
   Any valid table is honored (non-monotonic, sharing, holes); table
-  VALUES are validated on CPU/staged paths (ValueError) and trusted on
+  values are validated on CPU/staged paths (ValueError) and trusted on
   the zero-copy path (same trust boundary as raw pointers). GQA group
-  sizes 1/2/4/8/16.   CUDA-graph capturable after a warm-up outside the
+  sizes 1/2/4/8/16. CUDA-graph capturable after a warm-up outside the
   capture. Measured: 1.06-1.07x the contiguous op for the indirection
   (3060/5060 Ti, T=16384, 3-round means), bit-identical output on
   matching slice schedules, **7.9x / 4.3x vs SDPA** on the
@@ -343,12 +422,12 @@ First feature release on the frozen 1.x API: half-precision attention (bf16/fp16
 - sampling serial scans precompute their exp column in PARALLEL
   (exp_window_kernel writes exp(v - row_max) into the idle ping-pong
   key buffer; zero extra memory) and the single-threaded walkers then
-  only add. The accumulation order of every walk is UNCHANGED, so
+  only add. The accumulation order of every walk is unchanged, so
   per-seed tokens are bit-identical to the 1.0 serial scans - only the
   expf compute left the serial path. Flat-distribution worst case:
   25.4ms -> 13.9ms at n=131072 on a 3060 (1.8x), 6.5ms -> 3.1ms at
   n=32000.
-- the dim<32 prefill fallback kernel is GONE: under dtype templating it
+- the dim<32 prefill fallback kernel is removed: under dtype templating it
   miscompiled (hq >= 2 with dim 16 produced wrong rows even in
   float32), and the tiled kernel's dim<=128 band handles tiny heads
   correctly through zero-padded staging and per-lane bounds guards -
