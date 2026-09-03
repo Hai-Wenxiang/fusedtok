@@ -21,6 +21,11 @@ computes frequencies inside the timed region, matching fusedtok (no
 precomputed cos/sin cache on either side). The attention references use
 PRE-EXPANDED heads (no repeat_interleave inside the timed region), the
 fair comparison for what fusedtok computes.
+
+Sampling rows carry a timing asymmetry that is CONSERVATIVE against
+fusedtok: its samplers return a Python int (one device synchronisation
+per call, inside the timed loop) while the torch composites return
+device tensors whose draws synchronise once per timed round.
 """
 
 import argparse
@@ -32,14 +37,25 @@ import time
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
-import fusedtok  # noqa: E402
+try:
+    import fusedtok  # noqa: E402  (an installed wheel wins, if any)
+except ImportError:
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    import fusedtok  # noqa: E402
 
 import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 RESULTS = []
+
+# one constant per parameter that appears on BOTH sides of a comparison
+# (fusedtok call and torch reference) so the two can never drift apart
+TOPK_SMALL = 50          # small-k selection / sampling window
+TOPK_MID = 4096          # mid-k chunk/merge tail
+TOPP_P = 0.9             # nucleus mass threshold
+MINP = 0.05              # min-p fraction of the max probability
 
 
 def bench(fn, iters, warmup=10, rounds=3):
@@ -87,7 +103,8 @@ def record(op, shape, ft_fn, torch_fn, iters, bytes_moved=None, ops=None):
     extra = f"  {row['bandwidth_gbs']:6.1f} GB/s" if bytes_moved else ""
     if ops:
         extra += f"  {row['fusedtok_tops']:5.1f} TOPS"
-    print(f"{op:<16} {shape:<18} fusedtok {t_ft:9.1f} us | torch {t_tr:9.1f} us"
+    print(f"{op:<16} {shape:<18} fusedtok {t_ft:9.1f} us"
+          f" | torch {t_tr:9.1f} us"
           f" | {t_tr / t_ft:5.2f}x | round spread {spread:4.1f}%{extra}")
     return row
 
@@ -96,7 +113,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--out", default=os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "docs", "benchmarks"))
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "docs", "benchmarks"))
     args = parser.parse_args()
     iters = args.iters
 
@@ -105,7 +123,8 @@ def main():
         return 1
     torch.cuda.init()
     dev_name = torch.cuda.get_device_name(0)
-    print(f"fusedtok {fusedtok.__version__} | torch {torch.__version__} | {dev_name}\n")
+    print(f"fusedtok {fusedtok.__version__} | torch {torch.__version__}"
+          f" | {dev_name}\n")
 
     # torch's global RNG drives the sampling logits; seeding it keeps the
     # DRAWS identical across runs/machines so JSON numbers stay comparable
@@ -113,7 +132,7 @@ def main():
     # the sample_topp timing 2-3x with the same code)
     torch.manual_seed(0)
 
-    # --- norms / softmax / activations over [batch, hidden] -------------------
+    # --- norms / softmax / activations over [batch, hidden] ---------------
     for batch, hidden in [(256, 4096), (1024, 4096), (4096, 4096)]:
         x = torch.randn(batch, hidden, device="cuda")
         r = torch.randn(batch, hidden, device="cuda")
@@ -164,7 +183,7 @@ def main():
                lambda: torch.add(x, r),
                iters, bytes_moved=x.numel() * 4 * 3)
 
-    # --- RoPE (NeoX layout) over [seq, hidden] --------------------------------
+    # --- RoPE (NeoX layout) over [seq, hidden] -----------------------------
     for seq, dim in [(512, 4096), (2048, 4096), (8192, 4096)]:
         q = torch.randn(seq, dim, device="cuda")
         k = torch.randn(seq, dim, device="cuda")
@@ -187,21 +206,21 @@ def main():
                lambda: torch_rope_neox(q, k, half),
                iters, bytes_moved=q.numel() * 4 * 2 * 2)
 
-    # --- sampling over vocab ----------------------------------------------------
+    # --- sampling over vocab -----------------------------------------------
     for vocab in [32000, 131072]:
         logits = torch.randn(vocab, device="cuda")
         probs = torch.softmax(torch.randn(vocab, device="cuda") * 2.5, -1)
         record("topk k=50", f"[{vocab}]",
-               lambda: fusedtok.topk(logits, 50),
-               lambda: torch.topk(logits, 50),
+               lambda: fusedtok.topk(logits, TOPK_SMALL),
+               lambda: torch.topk(logits, TOPK_SMALL),
                max(20, iters // 4))
         # the mid-k window: k large enough that the selection leaves the
         # in-block-sort path, small enough that torch's CUB select is
         # still in its fast regime - the honest comparison point for the
         # chunk/merge tail
         record("topk k=4096", f"[{vocab}]",
-               lambda: fusedtok.topk(logits, 4096),
-               lambda: torch.topk(logits, 4096),
+               lambda: fusedtok.topk(logits, TOPK_MID),
+               lambda: torch.topk(logits, TOPK_MID),
                max(20, iters // 4))
         # fused top-k sampling vs the composite an inference loop would
         # write (topk + softmax + multinomial). SEMANTICS NOTE: the torch
@@ -209,32 +228,32 @@ def main():
         # part, not the seed determinism (fusedtok is seed-reproducible,
         # the composite is not).
         def torch_sample_topk():
-            v, i = torch.topk(logits, 50)
+            v, i = torch.topk(logits, TOPK_SMALL)
             return i[torch.multinomial(torch.softmax(v, -1), 1)]
         record("sample_topk k=50", f"[{vocab}]",
-                lambda: fusedtok.sample_topk(logits, 50),
-                torch_sample_topk,
-                max(20, iters // 4))
+               lambda: fusedtok.sample_topk(logits, TOPK_SMALL),
+               torch_sample_topk,
+               max(20, iters // 4))
 
         # fused min-p sampling (v1.3) vs the composite an inference loop
         # would write (softmax + boolean mask + renormalize + multinomial;
         # same RNG caveat as the topk row). min_p=0.05 on plain randn
         # keeps a mid-sized value-threshold nucleus - the typical
         # creative-generation setting.
-        def torch_sample_minp():
-            probs = torch.softmax(logits, -1)
-            sel = probs >= 0.05 * probs.max()
-            return torch.multinomial(probs * sel, 1)
+        def torch_sample_minp(src):
+            p = torch.softmax(src, -1)
+            sel = p >= MINP * p.max()
+            return torch.multinomial(p * sel, 1)
         record("sample_minp p=0.05", f"[{vocab}]",
-                lambda: fusedtok.sample_minp(logits, 0.05),
-                torch_sample_minp,
-                max(20, iters // 4))
+               lambda: fusedtok.sample_minp(logits, MINP),
+               lambda: torch_sample_minp(logits),
+               max(20, iters // 4))
 
         def torch_sample_topp_flat(src):
             probs = torch.softmax(src, -1)
             sp, si = torch.sort(probs, descending=True)
             cum = sp.cumsum(-1)
-            sel = si[cum - sp < 0.9]
+            sel = si[cum - sp < TOPP_P]
             return sel[torch.multinomial(probs[sel], 1)]
 
         # TWO regimes, honestly labeled: PEAKED logits (a dominant token -
@@ -253,21 +272,29 @@ def main():
         peaked = torch.randn(vocab, device="cuda")
         peaked[peaked.argmax()] += 20.0
         record("sample_topp peaked", f"[{vocab}]",
-                lambda: fusedtok.sample_topp(peaked, 0.9),
-                lambda: torch_sample_topp_flat(peaked),
-                max(20, iters // 4))
+               lambda: fusedtok.sample_topp(peaked, TOPP_P),
+               lambda: torch_sample_topp_flat(peaked),
+               max(20, iters // 4))
+        # the same peaked logits through min-p: the nucleus is a handful
+        # of tokens and the value-threshold walk stops immediately - the
+        # decode-time min-p case (this is the row the README prose cites
+        # for min-p's win scenario)
+        record("sample_minp peaked", f"[{vocab}]",
+               lambda: fusedtok.sample_minp(peaked, MINP),
+               lambda: torch_sample_minp(peaked),
+               max(20, iters // 4))
         flat_logits = torch.randn(vocab, device="cuda") * 1e-3
         record("sample_topp flat (worst)", f"[{vocab}]",
-                lambda: fusedtok.sample_topp(flat_logits, 0.9),
-                lambda: torch_sample_topp_flat(flat_logits),
-                max(10, iters // 6))
+               lambda: fusedtok.sample_topp(flat_logits, TOPP_P),
+               lambda: torch_sample_topp_flat(flat_logits),
+               max(10, iters // 6))
 
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),
                lambda: int(logits.argmax()),
                max(20, iters // 2))
 
-    # --- INT8 compute: qgemm vs cuBLASLt (torch._int_mm) -----------------------
+    # --- INT8 compute: qgemm vs cuBLASLt (torch._int_mm) ------------------
     # The tensor-core path; TOPS is the metric, bandwidth is reported for
     # context. torch._int_mm is cuBLASLt's int8 GEMM - the hardest
     # possible comparison on this dtype.
@@ -300,7 +327,7 @@ def main():
                    bytes_moved=a.numel() + b.numel() + m * n * 4,
                    ops=2 * m * n * k)
 
-    # --- attention (decode step over a kv-cache; fresh-sequence prefill) ------
+    # --- attention (decode step over a kv-cache; fresh-sequence prefill) --
     # references use PRE-EXPANDED heads (repeat_interleave outside the
     # timed region) - the fair fight; fusedtok reads the GQA cache as-is.
     # bf16 rows (v1.1): half-width kv-cache = half the bytes; the SDPA
@@ -362,7 +389,32 @@ def main():
                qp, kkp, vvp, is_causal=True),
            max(10, iters // 8))
 
-    # --- outputs ------------------------------------------------------------------
+    # --- kv-cache append (v1.3): the contiguous cache-write side of the
+    # decode loop vs the advanced-indexing scatter a hand-written loop
+    # would use (index_copy_ cannot express "sequence b writes row
+    # lens[b]"). The op is tiny and launch-bound at these sizes - the
+    # point is parity-level cost per decode step, not a headline speedup.
+    ab, ahkv, arows, ad = 8, 8, 4096, 128
+    akc = torch.randn(ab, ahkv, arows, ad, device="cuda")
+    avc = torch.randn_like(akc)
+    akn = torch.randn(ab, ahkv, ad, device="cuda")
+    avn = torch.randn(ab, ahkv, ad, device="cuda")
+    alens = torch.randint(0, arows, (ab,), dtype=torch.int32,
+                          device="cuda")
+
+    def torch_kv_append():
+        bi = torch.arange(ab, device="cuda")
+        pos = alens.long()
+        akc[bi, :, pos] = akn
+        avc[bi, :, pos] = avn
+
+    record("kv_append", f"B={ab} T={arows}",
+           lambda: fusedtok.kv_append(akc, avc, akn, avn, alens),
+           torch_kv_append,
+           max(50, iters // 2),
+           bytes_moved=4 * ab * ahkv * ad * 4)
+
+    # --- outputs -----------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)
     # device-derived file slug: charts/JSONs from different GPUs never
     # overwrite each other
@@ -375,7 +427,8 @@ def main():
         "torch": torch.__version__,
         "fusedtok": fusedtok.__version__,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "timing": "mean over 3 independent timed rounds; per-round values in each row",
+        "timing": ("mean over 3 independent timed rounds; "
+                   "per-round values in each row"),
         "results": RESULTS,
     }
     with open(json_path, "w") as f:

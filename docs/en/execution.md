@@ -37,7 +37,7 @@ the reference path).
 
 The zero-copy path is what an inference loop wants. Kernels launch on
 torch's **current stream** (`torch.cuda.current_stream()`), so they
-interoperate with surrounding GPU work with ordinary stream ordering
+interoperate with surrounding GPU work under ordinary stream-ordering rules
 and no hidden transfers.
 
 The CPU reference is the ground truth: it implements the identical
@@ -50,7 +50,7 @@ machines without a GPU, and powers the parity tests.
 | Operator family | numpy | CUDA torch |
 |---|---|---|
 | elementwise, activations, norms, RoPE | float32 | float32, bfloat16 |
-| `attention_decode`, `attention_decode_paged`, `attention_prefill`, `kv_append_paged` | float32 | float32, bfloat16, float16 |
+| `attention_decode`, `attention_decode_paged`, `attention_prefill`, `kv_append`, `kv_append_paged` | float32 | float32, bfloat16, float16 |
 | selection and sampling (`topk`, `sample_*`, `decode_step`, ...) | float32 | float32 |
 | INT8 ops (`qgemm`, ...) | int8 operands, float32 scales/outputs | same |
 
@@ -83,10 +83,11 @@ practical rules:
    outside captures by design - a warm-up call gets them out of the
    way.
 2. **Captured kernels read their per-call parameters from device
-   memory.** Replays observe new tensor contents written between
-   replays; mutate-in-place + replay recomputes (tests pin this).
-   Per-call *values* that travel as kernel parameters (e.g. the
-   sampling `seed`) are baked at capture time like any kernel argument.
+   memory.** Tensor contents written between replays are picked up by
+   the next replay; mutating inputs in place and replaying recomputes
+   the result (pinned by tests). Per-call *values* that travel as
+   kernel parameters (e.g. the sampling `seed`) are baked at capture
+   time like any kernel argument.
 
 ```python
 g = torch.cuda.CUDAGraph()
@@ -111,7 +112,7 @@ Notable exceptions (by design, documented per operator):
   `block_table`, penalty token ids) are **trusted** when they arrive
   as CUDA tensors - validating their values would require a stream
   sync, which would break capture. Host-side values (lists, numpy, CPU
-  tensors) ARE validated before the upload.
+  tensors) *are* validated before the upload.
 
 ## The error contract
 

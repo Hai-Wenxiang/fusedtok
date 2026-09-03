@@ -16,15 +16,15 @@ inference deploys.
 
 ```python
 q, scale = fusedtok.quantize_int8(x)     # scale = max|x|/127, a Python
-                                         # float on EVERY path
+                                         # float on every path
 x_back = fusedtok.dequantize_int8(q, scale)
 qy, s_out = fusedtok.qadd_int8(qa, sa, qb, sb)   # fused dequant-add-requant
 ```
 
 - `quantize_int8`: symmetric per-tensor - `scale = max|x| / 127`,
-  `q = clamp(round(x / scale), -127, 127)`. The scale is read back to
-  the host once at the source (every consumer takes a host float), so
-  the return type is consistent across all execution paths.
+  `q = clamp(round(x / scale), -127, 127)`. The scale is copied back to
+  the host exactly once, at the source (every consumer takes a host
+  float), so the return type is consistent across all execution paths.
 - `dequantize_int8(q, scale)`: `x ~= q * scale`. Accepts the unpacked
   pair: `dequantize_int8(*quantize_int8(x))`. The zero-copy path
   requires int8 C-contiguous tensors (a wrong dtype would be read as
@@ -86,13 +86,14 @@ bug.
   projection and runs at full memory bandwidth - roughly 2x the fp16
   projection. This is the per-token hot path and the point of INT8
   weights.
-- The **pipelined IMMA GEMM** reaches ~39 TOPS on an RTX 3060 and ~67
+- The **pipelined IMMA GEMM** reaches ~38 TOPS on an RTX 3060 and ~67
   TOPS on an RTX 5060 Ti (2x-4x the original v0.4 kernel), but
-  cuBLASLt (`torch._int_mm`) retains roughly a 2.1-2.6x lead with
+  cuBLASLt (`torch._int_mm`) retains roughly a 2.1-2.5x lead on the
+  per-tensor rows (about 1.7-1.8x on the W8A8 rows) with
   deeper-pipelined tiles and per-arch epilogues. fusedtok's INT8 path
   is the **exact / graph-capturable / zero-copy** one, not the
   fastest one; a CUTLASS-class schedule stays on the roadmap.
 - `qgemm_perchannel`'s scale multiply is fused into the same epilogue
   at zero kernel cost - it is the composite torch reference that pays
-  for the scale broadcast separately, which is where its ratio comes
-  from.
+  for the scale broadcast separately, which is where the README's
+  0.55-0.58x rows come from.

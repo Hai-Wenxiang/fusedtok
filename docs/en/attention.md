@@ -1,9 +1,10 @@
 # Attention operators
 
-fusedtok ships four attention entry points: the decode-step workhorse
-(`attention_decode`), its paged-cache variant (v1.2, with the
-`kv_append_paged` write side), and a prefill convenience path
-(`attention_prefill`). This page covers the layouts, the GQA mapping,
+fusedtok ships five attention operators: the decode-step workhorse
+(`attention_decode`), its paged-cache variant (`attention_decode_paged`,
+v1.2), the two cache-write sides (`kv_append_paged` v1.2 and `kv_append`
+v1.3, contiguous), and a prefill convenience path (`attention_prefill`).
+This page covers the layouts, the GQA mapping,
 per-sequence lengths, and the honest performance framing.
 
 **Other languages:** [中文：注意力算子](../zh/attention.md)
@@ -34,7 +35,7 @@ layout LLaMA-style checkpoints use (a group's q heads sit next to each
 other).
 
 Constraints: `Hq % Hkv == 0`; `D` a multiple of 4 and at most 512.
-Long caches split automatically flash-decoding style: the sequence is
+Long caches split automatically flash-decoding-style: the sequence is
 cut into slices, partial results are computed in parallel, then
 reduced - one call regardless of `T`. Scores never materialize; q/K/V
 are each read exactly once.
@@ -83,8 +84,9 @@ Paged-specific rules:
   stream sync).
 - CUDA-graph capture needs one warm-up call outside the capture.
 
-Measured cost of the indirection (3060, b=1, GQA 32/8, D=128, T=16384,
-P=16): **1.06-1.07x** the contiguous op, with bit-identical output on
+The measured cost of the indirection (3060, b=1, GQA 32/8, D=128,
+T=16384, P=16) is **1.13x** the contiguous op (1.09x on the 5060 Ti;
+same protocol as the benchmark tables), with bit-identical output on
 matching slice schedules.
 
 ## kv_append_paged - writing tokens into the pool
@@ -125,12 +127,12 @@ for step in range(n_steps):
 fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
 ```
 
-The cache-write side of the CONTIGUOUS decode loop (the twin of
+The cache-write side of the contiguous decode loop (the twin of
 `kv_append_paged`): sequence `b`'s fresh rows `k_new[b]` / `v_new[b]`
 (each `[Hkv, D]`) land at cache row `lens[b]` of `k_cache[b]` /
 `v_cache[b]`.
 
-- **In place** (returns `None`); `lens` is REQUIRED (the write position
+- **In place** (returns `None`); `lens` is required (the write position
   is each sequence's current length by definition).
 - Host paths require float32 C-contiguous caches (a conversion would
   view a copy and silently drop the writes - rejected with
@@ -138,6 +140,10 @@ The cache-write side of the CONTIGUOUS decode loop (the twin of
 - One tiny kernel, stream-ordered, CUDA-graph capturable.
 - Host-origin `lens` values are validated in `[0, T)`; device-resident
   tensors are trusted (the standard zero-copy boundary).
+- Performance (benchmark tables): 16.7 us vs 88.6 us for the torch
+  advanced-indexing scatter on a 3060 (5.31x), 9.4 vs 20.8 us on a
+  5060 Ti (2.21x) - a tiny launch-bound op; the row prices the
+  fixed cost per decode step.
 
 The typical loop mirrors the paged one: append at `lens[b]`, then
 decode with `lens + 1`:
@@ -172,12 +178,12 @@ Decode attention is **bandwidth-bound**: every token streams the whole
 kv-cache once. What to expect:
 
 - f32 decode runs at effective-bandwidth parity or better vs SDPA at
-  long caches (the README tables show up to 8.79x on an RTX 3060 at
+  long caches (the README tables show up to 8.91x on an RTX 3060 at
   T=16384 - the reference pays head expansion or small-query
   inefficiency there).
 - bf16/fp16 caches halve the bytes. At batch 1 the kernel is
   latency-bound, so the absolute win is modest and grows with batch.
-- The paged indirection costs 1.06-1.07x over the contiguous op.
+- The paged indirection costs 1.09-1.13x over the contiguous op.
 - Prefill is deliberately not competitive with flash backends.
 
 See [benchmarks.md](benchmarks.md) for the measurement protocol and

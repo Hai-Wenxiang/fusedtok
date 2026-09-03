@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 __all__ = [
     "cuda_available",
@@ -185,7 +185,6 @@ def _norm_weight_f32(weight):
     return weight.to(torch.float32)
 
 
-
 def _cuda_stream():
     """Current torch CUDA stream handle (0 = legacy default stream).
 
@@ -195,14 +194,22 @@ def _cuda_stream():
     return torch.cuda.current_stream().cuda_stream
 
 
-def _host_int_array(t):
+def _host_int_array(t, name="values"):
     """Host-origin value (list / numpy / CPU tensor) -> int numpy array,
-    or None when t is a device-resident tensor."""
+    or None when t is a device-resident tensor. Non-integral host input
+    is rejected: a silent float->int truncation would corrupt the
+    position/table semantics. Empty arrays pass with any dtype
+    (np.asarray([]) yields float64)."""
     if _is_torch(t):
         if t.is_cuda:
             return None
-        return t.detach().cpu().numpy()
-    return np.asarray(t)
+        host = t.detach().cpu().numpy()
+    else:
+        host = np.asarray(t)
+    if host.size and not np.issubdtype(host.dtype, np.integer):
+        raise TypeError(f"{name} must hold integer values "
+                        f"(got dtype {host.dtype})")
+    return host
 
 
 def _i32_cuda_arg(t, device):
@@ -225,21 +232,34 @@ def _i32_cuda_arg(t, device):
     return tt
 
 
+def _host_lens_checked(lens, batch, limit, upper_inclusive=True):
+    """Validated host-origin lens values as a C-contiguous int32 array:
+    1-D with batch entries, values in [0, limit] (or [0, limit) when the
+    caller marks the upper bound exclusive - kv_append writes AT
+    lens[b], so lens[b] itself must be a mapped position). Shared by the
+    zero-copy (_lens_arg) and staged-upload paths; device-resident lens
+    tensors return None (they stay trusted - no value readback)."""
+    host = _host_int_array(lens, "lens")
+    if host is None:
+        return None
+    host = np.ascontiguousarray(host, dtype=np.int32)
+    if host.ndim != 1 or host.shape[0] != batch:
+        raise ValueError("lens must be 1-D with batch entries")
+    bracket = "]" if upper_inclusive else ")"
+    if host.size and (host.min() < 0 or host.max() > limit
+                      or (not upper_inclusive and host.max() == limit)):
+        raise ValueError(f"lens entries must be in [0, {limit}{bracket}")
+    return host
+
+
 def _lens_arg(lens, batch, limit, device, upper_inclusive=True):
     """Validated lens tensor for the attention kernels: 1-D int32 with
     batch entries, values in [0, limit] (or [0, limit) when the caller
     marks the upper bound exclusive - kv_append writes AT lens[b], so
     lens[b] itself must be a mapped position). Device-resident lens
     tensors are trusted; host-origin values are checked before upload."""
-    host = _host_int_array(lens)
+    host = _host_lens_checked(lens, batch, limit, upper_inclusive)
     if host is not None:
-        host = np.ascontiguousarray(host, dtype=np.int32)
-        if host.ndim != 1 or host.shape[0] != batch:
-            raise ValueError("lens must be 1-D with batch entries")
-        bracket = "]" if upper_inclusive else ")"
-        if host.size and (host.min() < 0 or host.max() > limit
-                          or (not upper_inclusive and host.max() == limit)):
-            raise ValueError(f"lens entries must be in [0, {limit}{bracket}")
         return torch.from_numpy(host).to(device)
     lt = _i32_cuda_arg(lens, device)
     if lt.ndim != 1 or lt.numel() != batch:
@@ -247,17 +267,28 @@ def _lens_arg(lens, batch, limit, device, upper_inclusive=True):
     return lt
 
 
+def _host_table_checked(table, batch, nblocks):
+    """Validated host-origin block-table values as a C-contiguous int32
+    array: [B, S] with batch rows, values in [0, nblocks). Shared by the
+    zero-copy (_table_arg) and staged-upload paths; device-resident
+    tables return None (trusted, no readback)."""
+    host = _host_int_array(table, "block_table")
+    if host is None:
+        return None
+    host = np.ascontiguousarray(host, dtype=np.int32)
+    if host.ndim != 2 or host.shape[0] != batch:
+        raise ValueError("block_table must be [B, S] with batch rows")
+    if host.size and (host.min() < 0 or host.max() >= nblocks):
+        raise ValueError(f"block_table entries must be in [0, {nblocks})")
+    return host
+
+
 def _table_arg(table, batch, nblocks, device):
     """Validated block_table tensor: [B, S] int32, host-origin values in
-    [0, nblocks). Device-resident tables are trusted (see
-    _i32_cuda_arg for the trust boundary)."""
-    host = _host_int_array(table)
+    [0, nblocks). Device-resident tables are trusted (see _i32_cuda_arg
+    for the trust boundary)."""
+    host = _host_table_checked(table, batch, nblocks)
     if host is not None:
-        host = np.ascontiguousarray(host, dtype=np.int32)
-        if host.ndim != 2 or host.shape[0] != batch:
-            raise ValueError("block_table must be [B, S] with batch rows")
-        if host.size and (host.min() < 0 or host.max() >= nblocks):
-            raise ValueError(f"block_table entries must be in [0, {nblocks})")
         return torch.from_numpy(host).to(device)
     bt = _i32_cuda_arg(table, device)
     if bt.ndim != 2 or bt.shape[0] != batch:
@@ -279,16 +310,13 @@ def _ids_arg(ids, vocab, device, name):
         if it.ndim != 1:
             raise ValueError(f"{name} must be 1-D")
         return it
-    if _is_torch(ids):
-        host = np.ascontiguousarray(ids.detach().cpu().numpy(),
-                                    dtype=np.int64)
-        if host.ndim != 1:
-            raise ValueError(f"{name} must be 1-D")
-    else:
-        host = np.ascontiguousarray(np.asarray(ids),
-                                    dtype=np.int64).ravel()
+    # host input: reject non-integral dtypes (a silent float->int64
+    # truncation would shift ids) and non-1-D shapes (no silent ravel)
+    host = np.ascontiguousarray(_host_int_array(ids, name), dtype=np.int64)
+    if host.ndim != 1:
+        raise ValueError(f"{name} must be 1-D")
     if host.size and (host.min() < 0 or host.max() >= vocab):
-        raise ValueError("token id out of range")
+        raise ValueError(f"{name} values must be in [0, {vocab})")
     return torch.from_numpy(host).to(device)
 
 
@@ -465,6 +493,14 @@ def swiglu(gate, up, *, cuda=False):
 # ---------------------------------------------------------------------------
 
 
+def _shape_rows_cols(t):
+    if t.ndim == 1:
+        return 1, t.shape[0]
+    if t.ndim == 2:
+        return t.shape[0], t.shape[1]
+    raise ValueError("expected a 1-D or 2-D tensor")
+
+
 def rmsnorm(x, weight, *, residual=None, eps=1e-6, cuda=False):
     """RMSNorm (LLaMA/Qwen style), optionally fused with a residual add:
 
@@ -501,14 +537,6 @@ def rmsnorm(x, weight, *, residual=None, eps=1e-6, cuda=False):
     else:
         res = _fusedtok.rmsnorm_cpu(*args)
     return _numpy_to_torch_like(res) if _is_torch(x) else res
-
-
-def _shape_rows_cols(t):
-    if t.ndim == 1:
-        return 1, t.shape[0]
-    if t.ndim == 2:
-        return t.shape[0], t.shape[1]
-    raise ValueError("expected a 1-D or 2-D tensor")
 
 
 def layernorm(x, weight, bias, *, eps=1e-6, cuda=False):
@@ -689,8 +717,15 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
         raise ValueError("k_cache/v_cache must match q's batch and dim")
     if hq % hkv:
         raise ValueError("q heads must be a multiple of kv heads")
-    arr_lens = None if lens is None else np.ascontiguousarray(
-        np.asarray(lens, dtype=np.int32))
+    # staged upload: host lens values are validated here so a bad entry
+    # cannot become a silent GPU out-of-bounds read (device tensors
+    # cannot appear - the path is host-origin by construction)
+    if lens is None:
+        arr_lens = None
+    else:
+        arr_lens = _host_lens_checked(lens, b, t_rows)
+        if arr_lens is None:
+            raise TypeError("lens must be a host array on this path")
     call = (_fusedtok.attention_decode if path == "staged"
             else _fusedtok.attention_decode_cpu)
     res = call(arr_q, arr_k, arr_v, arr_lens, b, hq, hkv, t_rows, d)
@@ -812,13 +847,16 @@ def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
     arr_q = _as_numpy(q, "q")
     arr_k = _as_numpy(k_pool, "k_pool")
     arr_v = _as_numpy(v_pool, "v_pool")
-    arr_t = np.ascontiguousarray(np.asarray(block_table, dtype=np.int32))
-    if arr_q.ndim != 3 or arr_k.ndim != 4 or arr_v.ndim != 4 \
-            or arr_t.ndim != 2:
+    if arr_q.ndim != 3 or arr_k.ndim != 4 or arr_v.ndim != 4:
         raise ValueError("q must be [B, Hq, D]; pools [Nb, Hkv, P, D]; "
                          "block_table [B, S]")
     b, hq, d = arr_q.shape
     nb, hkv, page, d2 = arr_k.shape
+    # staged upload: host table/lens values validated here (same rule as
+    # the zero-copy path - a bad block id cannot reach the kernel)
+    arr_t = _host_table_checked(block_table, b, nb)
+    if arr_t is None:
+        raise TypeError("block_table must be a host array on this path")
     if d2 != d or arr_v.shape != arr_k.shape:
         raise ValueError("pools must match q's dim and each other")
     if hq % hkv:
@@ -828,8 +866,12 @@ def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
                          "1/2/4/8/16 (use attention_decode otherwise)")
     if arr_t.shape[0] != b:
         raise ValueError("block_table must have one row per sequence")
-    arr_lens = None if lens is None else np.ascontiguousarray(
-        np.asarray(lens, dtype=np.int32))
+    if lens is None:
+        arr_lens = None
+    else:
+        arr_lens = _host_lens_checked(lens, b, arr_t.shape[1] * page)
+        if arr_lens is None:
+            raise TypeError("lens must be a host array on this path")
     call = (_fusedtok.attention_decode_paged
             if path == "staged"
             else _fusedtok.attention_decode_paged_cpu)
@@ -900,14 +942,23 @@ def kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens,
     arr_vp = _as_numpy(v_pool, "v_pool")
     arr_kn = _as_numpy(k_new, "k_new")
     arr_vn = _as_numpy(v_new, "v_new")
-    arr_t = np.ascontiguousarray(np.asarray(block_table, dtype=np.int32))
-    arr_l = np.ascontiguousarray(np.asarray(lens, dtype=np.int32))
-    if arr_kp.ndim != 4 or arr_kn.ndim != 3 or arr_t.ndim != 2:
-        raise ValueError("pools [Nb,Hkv,P,D]; k_new [B,Hkv,D]; table [B,S]")
+    if arr_kp.ndim != 4 or arr_kn.ndim != 3:
+        raise ValueError("pools [Nb,Hkv,P,D]; k_new [B,Hkv,D]")
     nb, hkv, page, d = arr_kp.shape
     b = arr_kn.shape[0]
-    if arr_t.shape[0] != b or arr_l.shape != (b,):
-        raise ValueError("block_table rows / lens must match the batch")
+    if arr_kn.shape != (b, hkv, d) or arr_vp.shape != arr_kp.shape \
+            or arr_vn.shape != arr_kn.shape:
+        raise ValueError("k/v operands must match the pool layout")
+    # staged upload: host table/lens values are validated here so a bad
+    # block id or write position cannot become a silent GPU
+    # out-of-bounds write (in-place op - the corruption would persist)
+    arr_t = _host_table_checked(block_table, b, nb)
+    if arr_t is None:
+        raise TypeError("block_table must be a host array on this path")
+    arr_l = _host_lens_checked(lens, b, arr_t.shape[1] * page,
+                               upper_inclusive=False)
+    if arr_l is None:
+        raise TypeError("lens must be a host array on this path")
     if path == "staged":
         _fusedtok.kv_append_paged(arr_kn, arr_vn, arr_t, arr_l, arr_kp,
                                   arr_vp, b, hkv, d, page, arr_t.shape[1],
@@ -980,12 +1031,18 @@ def kv_append(k_cache, v_cache, k_new, v_new, lens, *, cuda=False):
     arr_vc = _as_numpy(v_cache, "v_cache")
     arr_kn = _as_numpy(k_new, "k_new")
     arr_vn = _as_numpy(v_new, "v_new")
-    arr_l = np.ascontiguousarray(np.asarray(lens, dtype=np.int32))
     if arr_kc.ndim != 4 or arr_kn.ndim != 3:
         raise ValueError("caches [B,Hkv,T,D]; k_new [B,Hkv,D]")
     b, hkv, t_rows, d = arr_kc.shape
-    if arr_l.shape != (arr_kn.shape[0],):
-        raise ValueError("lens must have one entry per sequence")
+    if arr_kn.shape != (b, hkv, d) or arr_vc.shape != arr_kc.shape \
+            or arr_vn.shape != arr_kn.shape:
+        raise ValueError("k/v operands must match the cache layout")
+    # staged upload: host lens values are validated in [0, T) here so a
+    # bad write position cannot become a silent GPU out-of-bounds write
+    # (in-place op - the corruption would persist in the cache)
+    arr_l = _host_lens_checked(lens, b, t_rows, upper_inclusive=False)
+    if arr_l is None:
+        raise TypeError("lens must be a host array on this path")
     if path == "staged":
         _fusedtok.kv_append(arr_kn, arr_vn, arr_l, arr_kc, arr_vc,
                             b, hkv, d, t_rows)
@@ -1110,7 +1167,16 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
             n, ids.numel(), penalty, _cuda_stream())
         return out
     arr = _as_numpy(logits, "logits")
-    ids = np.asarray(token_ids, dtype=np.int64).ravel()
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    # host ids: integral dtype + 1-D (no silent ravel); value range is
+    # validated by the binding before the upload
+    ids_host = _host_int_array(token_ids, "token_ids")
+    if ids_host is None:
+        raise TypeError("token_ids must be a host array on this path")
+    ids = np.ascontiguousarray(ids_host, dtype=np.int64)
+    if ids.ndim != 1:
+        raise ValueError("token_ids must be 1-D")
     call = (_fusedtok.repetition_penalty if path == "staged"
             else _fusedtok.repetition_penalty_cpu)
     res = call(arr, ids, penalty)
@@ -1217,7 +1283,8 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
     across the CPU / staged / zero-copy paths: integer accumulation is
     exact and the combined scale applies once at the store.
     """
-    if _device_path(a_q, cuda=False) == "torch-cuda":
+    path = _device_path(a_q, cuda)
+    if path == "torch-cuda":
         m, n, k = _qgemm_operands(a_q, b_q)
         y = torch.empty((m, n), dtype=torch.float32, device=a_q.device)
         # the launcher no-ops empty operands and zero-fills K == 0
@@ -1235,7 +1302,7 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
     n, k2 = b.shape
     if k != k2:
         raise ValueError("inner dimensions must match")
-    call = (_fusedtok.qgemm if cuda else _fusedtok.qgemm_cpu)
+    call = (_fusedtok.qgemm if path == "staged" else _fusedtok.qgemm_cpu)
     res = call(a, b, m, n, k, float(a_scale), float(b_scale))
     return _numpy_to_torch_like(res) if _is_torch(a_q) else res
 
@@ -1257,7 +1324,8 @@ def qgemm_perchannel(a_q, a_scale, b_q, b_scales, *, cuda=False):
     product applies once - CPU, staged and zero-copy results are
     BIT-IDENTICAL. ``M == 1`` dispatches to the warp-per-row GEMV.
     """
-    if _device_path(a_q, cuda=False) == "torch-cuda":
+    path = _device_path(a_q, cuda)
+    if path == "torch-cuda":
         m, n, k = _qgemm_operands(a_q, b_q)
         if not _is_torch(b_scales):
             b_scales = torch.as_tensor(b_scales, dtype=torch.float32,
@@ -1288,7 +1356,7 @@ def qgemm_perchannel(a_q, a_scale, b_q, b_scales, *, cuda=False):
         raise ValueError("inner dimensions must match")
     if sb.ndim != 1 or sb.shape[0] != n:
         raise ValueError("b_scales must be 1-D with n entries")
-    call = (_fusedtok.qgemm_perchannel if cuda
+    call = (_fusedtok.qgemm_perchannel if path == "staged"
             else _fusedtok.qgemm_perchannel_cpu)
     res = call(a, b, sb, m, n, k, float(a_scale))
     return _numpy_to_torch_like(res) if _is_torch(a_q) else res
@@ -1427,9 +1495,16 @@ def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,
     arr = _as_numpy(logits, "logits")
     if arr.ndim != 1:
         raise ValueError("logits must be 1-D")
-    ids = np.asarray(sampled_ids, dtype=np.int64).ravel()
+    # host ids: integral dtype + 1-D (no silent ravel), range checked
+    # against the vocab like _ids_arg does on the zero-copy path
+    ids_host = _host_int_array(sampled_ids, "sampled_ids")
+    if ids_host is None:
+        raise TypeError("sampled_ids must be a host array on this path")
+    ids = np.ascontiguousarray(ids_host, dtype=np.int64)
+    if ids.ndim != 1:
+        raise ValueError("sampled_ids must be 1-D")
     if ids.size and (ids.min() < 0 or ids.max() >= arr.size):
-        raise ValueError("token id out of range")
+        raise ValueError(f"sampled_ids values must be in [0, {arr.size})")
     if path == "staged":
         return int(_fusedtok.decode_step(arr, ids, penalty, p, temperature,
                                          seed))

@@ -15,8 +15,8 @@ Error contract (stable since 1.0):
 
 Selection determinism (stable since 1.0): top-k / top-p / argmax resolve
 ties toward the EARLIEST index. Sampling (sample_topp / sample_topk /
-decode_step) is deterministic per seed; the RNG is a splitmix-style hash
-- reproducible, NOT cryptographically secure.
+sample_minp / decode_step) is deterministic per seed; the RNG is a
+splitmix-style hash - reproducible, NOT cryptographically secure.
 """
 
 from typing import Any, Optional, Union
@@ -65,7 +65,8 @@ __all__ = [
 ]
 
 def cuda_available() -> bool: ...
-def axpy(x: Array, a: float = 1.0, b: float = 0.0, *, cuda: bool = False) -> Array: ...
+def axpy(x: Array, a: float = 1.0, b: float = 0.0,
+         *, cuda: bool = False) -> Array: ...
 def rmsnorm(x: Array, weight: Array, *, residual: Optional[Array] = None,
             eps: float = 1e-6, cuda: bool = False) -> Array: ...
 def layernorm(x: Array, weight: Array, bias: Array, *, eps: float = 1e-6,

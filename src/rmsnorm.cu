@@ -19,7 +19,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cmath>
-#include <cmath>
 #include <stdexcept>
 
 namespace fusedtok {

@@ -437,17 +437,21 @@ void qgemm_launch_config(const QgConfig& cfg, bool pc,
                 <<<grid, cfg.block, smem, cs>>>(aq, bq, nullptr, y, m, n, k, scale);
     } else if (cfg.slab == 128) {
         if (pc)
-            qgemm_pipe_kernel<64, 64, 128, 2, 1, 256, true>
+            qgemm_pipe_kernel<kQgTileSmall, kQgTileSmall, kQgSlabWide,
+                              2, 1, kQgBlockSmall, true>
                 <<<grid, cfg.block, smem, cs>>>(aq, bq, sb_vec, y, m, n, k, scale);
         else
-            qgemm_pipe_kernel<64, 64, 128, 2, 1, 256, false>
+            qgemm_pipe_kernel<kQgTileSmall, kQgTileSmall, kQgSlabWide,
+                              2, 1, kQgBlockSmall, false>
                 <<<grid, cfg.block, smem, cs>>>(aq, bq, nullptr, y, m, n, k, scale);
     } else {
         if (pc)
-            qgemm_pipe_kernel<64, 64, 64, 2, 1, 256, true>
+            qgemm_pipe_kernel<kQgTileSmall, kQgTileSmall, kQgSlabDefault,
+                              2, 1, kQgBlockSmall, true>
                 <<<grid, cfg.block, smem, cs>>>(aq, bq, sb_vec, y, m, n, k, scale);
         else
-            qgemm_pipe_kernel<64, 64, 64, 2, 1, 256, false>
+            qgemm_pipe_kernel<kQgTileSmall, kQgTileSmall, kQgSlabDefault,
+                              2, 1, kQgBlockSmall, false>
                 <<<grid, cfg.block, smem, cs>>>(aq, bq, nullptr, y, m, n, k, scale);
     }
 }
@@ -465,8 +469,12 @@ int qgemm_pick_config(const signed char* aq, const signed char* bq,
         return it->second;                // winning candidate index
 
     cudaEvent_t ev0 = nullptr, ev1 = nullptr;
-    cudaEventCreate(&ev0);
-    cudaEventCreate(&ev1);
+    if (cudaEventCreate(&ev0) != cudaSuccess ||
+        cudaEventCreate(&ev1) != cudaSuccess) {
+        cudaEventDestroy(ev0);
+        cudaGetLastError();
+        return 0;                     // default config; tuning impossible
+    }
     float best_ms = 1e30f;
     int best_idx = 0;
     for (int ci = 0; ci < 3; ++ci) {
@@ -474,9 +482,15 @@ int qgemm_pick_config(const signed char* aq, const signed char* bq,
         if (cfg.tile == 128) {
             // opt-in dynamic smem above the 48 KB static ceiling; safe to
             // repeat. Never executed during a capture (tuning is skipped).
+            const void* kfn = pc
+                ? (const void*)qgemm_pipe_kernel<kQgTileLarge,
+                                                kQgTileLarge, 64, 2, 2,
+                                                kQgBlockLarge, true>
+                : (const void*)qgemm_pipe_kernel<kQgTileLarge,
+                                                kQgTileLarge, 64, 2, 2,
+                                                kQgBlockLarge, false>;
             if (cudaFuncSetAttribute(
-                    (pc ? qgemm_pipe_kernel<kQgTileLarge, kQgTileLarge, 64, 2, 2, kQgBlockLarge, true>
-                        : qgemm_pipe_kernel<kQgTileLarge, kQgTileLarge, 64, 2, 2, kQgBlockLarge, false>),
+                    kfn,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     qgemm_smem_for(cfg)) != cudaSuccess) {
                 cudaGetLastError();

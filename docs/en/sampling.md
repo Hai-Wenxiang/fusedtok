@@ -1,15 +1,15 @@
 # Sampling and selection
 
 The selection operators (top-k, top-p, argmax) and the fused samplers
-(`sample_topp`, `sample_topk`, `decode_step`) share one pipeline and
-one determinism contract. This page explains both, plus the exact
-boundary where CPU and GPU draws may differ.
+(`sample_topp`, `sample_topk`, `sample_minp`, `decode_step`) share one
+pipeline and one determinism contract. This page explains both, plus
+the exact boundary where CPU and GPU draws may differ.
 
 **Other languages:** [中文：采样与选择](../zh/sampling.md)
 
 - [Selection operators](#selection-operators)
 - [The fused samplers](#the-fused-samplers)
-- [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp--threshold-by-max-sampling-v13)
+- [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp---threshold-by-max-sampling-v13)
 - [The same-token guarantee](#the-same-token-guarantee)
 - [Flat distributions - the honest worst case](#flat-distributions---the-honest-worst-case)
 - [How the pipeline works](#how-the-pipeline-works)
@@ -72,23 +72,25 @@ tok = fusedtok.sample_minp(logits, min_p=0.1, temperature=0.8, seed=step)
 ```
 
 Min-p (from "Turning Up the Heat: Min-p Sampling for Creative and
-Coherent LLM Outputs", 2024 - already deployed in llama.cpp, vLLM and
-friends) truncates by a VALUE threshold relative to the peak instead
-of a cumulative mass: keep every token whose probability is at least
-``min_p`` times the maximum probability, renormalize within that
+Coherent LLM Outputs", Nguyen et al. 2024 - already deployed in
+llama.cpp and vLLM) truncates by a value threshold relative to the peak
+instead of a cumulative mass: keep every token whose probability is at
+least `min_p` times the maximum probability, renormalize within that
 nucleus, draw with the same seeded hash.
 
+- `min_p` must be in `(0, 1]` (`ValueError` otherwise); `temperature`
+  must be greater than 0.
 - Adaptive by construction: peaked decode logits get a tiny nucleus,
   near-uniform logits a wide one - no window guessing on the caller's
   side.
-- ``min_p = 1.0`` keeps only the tokens AT the maximum (unique max =
+- `min_p = 1.0` keeps only the tokens at the maximum (unique max =
   exactly greedy; tied maxima stay tied in the draw).
 - Deterministic per seed, same RNG and same-token guarantee as the
-  other samplers (CPU exact-``exp`` vs GPU ``__expf`` boundary caveat
+  other samplers (CPU exact-`exp` vs GPU `__expf` boundary caveat
   included).
 - Implementation note: the exp column is already max-normalized
-  (``exps[0] == 1.0`` exactly), so the nucleus is simply the prefix
-  cut at the first element below ``min_p`` - no global-mass reduction
+  (`exps[0] == 1.0` exactly), so the nucleus is simply the prefix
+  cut at the first element below `min_p` - no global-mass reduction
   is needed, and the serial walk inherits the v1.3 checkpoint
   bisection.
 
@@ -101,15 +103,15 @@ boundary: the CPU reference uses exact `exp`, the GPU kernels use
 boundary of the CDF can differ by one element between CPU and GPU -
 both draws are valid samples of the distribution.
 
-At very large vocabularies with near-uniform logits, every draw sits
-on that boundary at scale: the tiny per-element rounding differences
+At very large vocabularies with near-uniform logits, this boundary
+effect occurs at scale: the tiny per-element rounding differences
 accumulate along the strictly-sequential CDF walk, so CPU and GPU may
 pick tokens a small **rank window** apart (measured ~14 ranks at
 n=152064; ~1 at 32k vocabularies). The GPU result itself is always
 bit-identical per seed, and the window-widening schedule never changes
 the sampled token.
 
-Why not fix it? The strictly-sequential float adds ARE the determinism
+Why not fix it? The strictly-sequential float adds are the determinism
 contract - parallelizing the sum would change every token ever drawn
 with any given seed. The v1.2 optimization batch kept the add order
 untouched and only pipelined the loads (an 8.5x cut of the flat-case
@@ -120,7 +122,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.10-0.17x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.17-0.37x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its

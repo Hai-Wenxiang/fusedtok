@@ -83,9 +83,10 @@ closed-form checks - it doubles as executable documentation.
 
 - [The execution model](execution.md) - the three paths, dtype rules,
   streams, CUDA graphs, and the error contract
-- [Attention operators](attention.md) - decode, paged caches, prefill
-- [Sampling and selection](sampling.md) - top-k/top-p, fused samplers,
-  and the determinism contract
+- [Attention operators](attention.md) - decode, paged caches, the
+  contiguous and paged append write sides, prefill
+- [Sampling and selection](sampling.md) - top-k/top-p/min-p, fused
+  samplers, and the determinism contract
 - [The INT8 path](int8.md) - quantization and integer-exact GEMM
 - [Benchmarks](benchmarks.md) - how the numbers are measured and how to
   read them

@@ -126,7 +126,7 @@ void qgemm_perchannel_launch(const signed char* aq, const signed char* bq,
 // Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream = 0);
 // y[i] = x[i] / t.
-void temperature_launch(const float* x, float* y, int n, float t, std::uintptr_t stream = 0);
+void temperature_launch(const float* x, float* y, long long n, float t, std::uintptr_t stream = 0);
 // For each id in ids[0..m): y[id] = x[id] > 0 ? x[id]/penalty : x[id]*penalty.
 // logits/y: [n], ids: [m] unique token ids.
 void repetition_penalty_launch(const float* logits, const long long* ids,
@@ -138,8 +138,11 @@ void repetition_penalty_launch(const float* logits, const long long* ids,
 // out[B,Hq,D] = softmax(q . K^T / sqrt(D)) . V with q heads in contiguous
 // groups over kv heads (h -> h*Hkv/Hq). k/v: [B,Hkv,T,D]; lens may be null
 // (all rows valid) else per-sequence valid lengths in [0, T] (zero length
-// writes zero rows). dim: multiple of 4, at most 512. One kernel launch,
-// no allocations/syncs: stream-ordered and CUDA-graph capturable.
+// writes zero rows). dim: multiple of 4, at most 512. Short caches run as
+// one kernel launch; long caches split flash-decoding style into a slice
+// pass plus a reduce pass over a per-shape workspace (allocated outside
+// captures). Either way: no per-call syncs, stream-ordered and
+// CUDA-graph capturable.
 void attention_decode_launch(const float* q, const float* k, const float* v,
                              const int* lens, float* out,
                              int batch, int q_heads, int kv_heads,

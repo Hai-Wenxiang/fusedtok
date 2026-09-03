@@ -136,7 +136,9 @@ struct DevMax {
     float* p = nullptr;
     DevMax() {
         if (cudaMalloc(&p, sizeof(float)) != cudaSuccess)
-            throw std::runtime_error("quantize scratch alloc failed");
+            throw std::runtime_error(
+                std::string("quantize scratch alloc failed: ") +
+                cudaGetErrorString(cudaGetLastError()));
     }
     ~DevMax() { if (p) cudaFree(p); }
     DevMax(const DevMax&) = delete;

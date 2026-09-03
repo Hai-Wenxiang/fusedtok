@@ -1,9 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
-project(fusedtok VERSION 1.3.0 LANGUAGES CXX CUDA)
+project(fusedtok VERSION 1.3.1 LANGUAGES CXX CUDA)
 
-# C++17 for host code; CUDA follows via nvcc default
+# C++17 for host code and CUDA alike (nvcc defaults to C++17 on CUDA
+# 13 but pinning both keeps non-default toolchains from drifting)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Target GPU architectures: explicit sm_80 (A100) and sm_86 (RTX 30)
 # cubins plus a compute_86 PTX embed so newer architectures (RTX 40/50,
