@@ -541,3 +541,79 @@ def test_decode_step_host_ids_range_message_names_parameter():
     logits = np.zeros(16, dtype=np.float32)
     with pytest.raises(ValueError, match="sampled_ids"):
         fusedtok.decode_step(logits, [16])
+
+
+# ---------------------------------------------------------------------------
+# 1.4.1: batched-binding hardening. The Python layer derives rows/n
+# from the array shape, but _fusedtok is a supported direct surface and
+# the 1.4.0 staged trio copied rows*n floats without checking the
+# buffer (an oversized pair read past the numpy array) while the _cpu
+# trio also lacked the n <= 0 guard (an inverted pointer range is UB).
+# ---------------------------------------------------------------------------
+
+def _ft():
+    return fusedtok._fusedtok
+
+
+def test_batched_staged_shape_mismatch_rejected():
+    if not fusedtok.cuda_available():
+        pytest.skip("staged needs a GPU")
+    x = np.ones((2, 8), dtype=np.float32)
+    seeds = np.zeros(4, dtype=np.int64)
+    # rows*n = 32 would read past the 16-float buffer
+    with pytest.raises(ValueError, match="shape"):
+        _ft().sample_topp_batched(x, 4, 8, 0.9, 1.0, seeds)
+    # swapped rows/n passes the total but not the shape
+    with pytest.raises(ValueError, match="shape"):
+        _ft().sample_topk_batched(x, 8, 2, 4, 1.0, seeds)
+    with pytest.raises(ValueError, match="shape"):
+        _ft().sample_minp_batched(x, 2, 9, 0.05, 1.0,
+                                  np.zeros(2, dtype=np.int64))
+
+
+def test_batched_cpu_n_nonpositive_rejected():
+    x = np.ones((2, 8), dtype=np.float32)
+    seeds = np.zeros(2, dtype=np.int64)
+    with pytest.raises(ValueError, match="empty logits"):
+        _ft().sample_topp_batched_cpu(x, 2, 0, 0.9, 1.0, seeds)
+    with pytest.raises(ValueError, match="empty logits"):
+        _ft().sample_topk_batched_cpu(x, 2, -8, 4, 1.0, seeds)
+    with pytest.raises(ValueError, match="shape"):
+        _ft().sample_minp_batched_cpu(x, 3, 8, 0.05, 1.0, seeds)
+
+
+def test_batched_staged_empty_vocab_rejected():
+    # (0, 0): zero rows do not bypass the empty-vocab guard (same
+    # contract as the single-row samplers)
+    if not fusedtok.cuda_available():
+        pytest.skip("staged needs a GPU")
+    x = np.empty((0, 0), dtype=np.float32)
+    with pytest.raises(ValueError, match="empty logits"):
+        _ft().sample_topp_batched(x, 0, 0, 0.9, 1.0,
+                                  np.empty(0, dtype=np.int64))
+
+
+def test_batched_launcher_safe_invalids_rejected():
+    if not fusedtok.cuda_available():
+        pytest.skip("launcher needs a GPU")
+    x = np.ones((2, 8), dtype=np.float32)
+    seeds = np.zeros(2, dtype=np.int64)
+    with pytest.raises(ValueError, match="empty logits"):
+        _ft().sample_topp_batched_launch(0, 2, 0, 0.9, 1.0, seeds)
+    with pytest.raises(ValueError, match="rows"):
+        _ft().sample_topk_batched_launch(0, -1, 8, 4, 1.0, seeds)
+    with pytest.raises(ValueError, match="seeds"):
+        _ft().sample_minp_batched_launch(0, 2, 8, 0.05, 1.0,
+                                         np.zeros(3, dtype=np.int64))
+
+
+def test_batch_seeds_uint64_wrap_rejected():
+    # uint64 values above 2**63 - 1 wrap negative in the int64 staging
+    # array; the check runs AFTER the cast so they cannot sneak through
+    x = np.ones((2, 8), dtype=np.float32)
+    bad = np.array([0, 2 ** 63], dtype=np.uint64)
+    with pytest.raises(ValueError, match=r"2\*\*63"):
+        fusedtok.sample_topp_batched(x, 0.9, seeds=bad)
+    ok = np.array([0, 2 ** 63 - 1], dtype=np.uint64)
+    out = fusedtok.sample_topp_batched(x, 0.9, seeds=ok)
+    assert out.shape == (2,)

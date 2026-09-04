@@ -75,8 +75,12 @@ logits = torch.randn(131072, device="cuda")
 token = fusedtok.decode_step(logits, [], penalty=1.1,
                              p=0.9, temperature=0.8, seed=0)
 
-# serving a batch: one call, one seeded token per row
+# serving a batch: one call, one seeded token per row (spike the
+# logits like real decode output - on flat random logits the batched
+# win shrinks, see the benchmarks)
 batch_logits = torch.randn(8, 131072, device="cuda")
+batch_logits[torch.arange(8, device="cuda"),
+             batch_logits.argmax(dim=1)] += 20.0
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9)
 ```
 

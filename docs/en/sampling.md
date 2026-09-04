@@ -30,10 +30,10 @@ vals, idxs = fusedtok.topp(probs, 0.9)     # input = probabilities
 - `topp` takes **probabilities** (already softmaxed), `p` in `(0, 1]`;
   it returns the smallest top-p set, crossing element included.
 
-`argmax` returns one `int` - including the single device-to-host
-readback that a host return value inherently needs. On the zero-copy
-path `argmax` keeps two self-resetting workspace slots so the hot path
-is one kernel launch and no extra allocation (v1.2).
+`argmax` returns a host `int`, which requires a single
+device-to-host readback. On the zero-copy path `argmax` keeps two
+self-resetting workspace slots so the hot path is one kernel launch
+and no extra allocation (v1.2).
 
 ## The fused samplers
 
@@ -97,37 +97,46 @@ nucleus, draw with the same seeded hash.
   bisection. Since v1.4 the widening loop jumps adaptively like
   top-p: a failed window leaves its cum mass, and together with a
   one-time global total this yields a bound that always covers the
-  nucleus (`w >= W + (T - C) / min_p`), so wide nuclei skip the x8
-  ladder's intermediate stops (~30% off the wide-nucleus row) with
-  bit-identical tokens.
+  nucleus (`w >= W + (T - C) / min_p`, with W the failed window's
+  width, C its cumulated mass, and T the lazily-computed global
+  total), so wide nuclei skip the x8 ladder's intermediate stops
+  (~30% off the wide-nucleus row) with bit-identical tokens.
 
 ## Batched sampling - one call per decode step (v1.4)
 
 ```python
-tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seed=seeds)
+tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 ```
 
 `sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched`
 sample a whole `[rows, vocab]` batch in one call and return one token
-per row (int64; a CPU torch tensor for torch input, a numpy array
-otherwise - the host readback is inherent to the widening loop, so
-these are not CUDA-graph capturable, same contract as the singles).
+per row. The return is int64 on the HOST: a CPU torch tensor for torch
+input, a numpy array otherwise. The widening loop's host readback is
+inherent to returning tokens at all, so - like the single-row samplers
+- these are not CUDA-graph capturable.
 
-- `logits` is 2-D, contiguous, float32. `seeds` is one non-negative
-  integer per row; the default (`None`) is `0..rows-1`, so identical
-  rows still draw independently.
+- `logits` is 2-D, contiguous, float32.
+- `seeds` is one integer per row, accepted as a list, a numpy array or
+  a torch tensor (a CUDA tensor is moved to the host first). Values
+  are validated non-negative and below 2^63; the default (`None`) is
+  `0..rows-1`, so identical rows still draw independently. In a
+  serving loop, re-issue seeds per step - `step * rows + arange(rows)`
+  is the usual idiom - or every step reuses the same per-row streams.
 - Every row runs the single-row pipeline **verbatim** - same kernels,
   same accumulation order, per-row parity including the widening loop
   (rows finish at their own window sizes; finished rows are skipped
   while wider-nucleus rows retry).
-- Rows are processed in device-sized chunks (32), so very large
-  batches stream through a bounded workspace.
-- What batching buys: the per-row Python/launch overhead collapses -
-  B=8 wall time is 4-6x the per-row loop on submission-bound hosts
-  (topp 1340 -> 274 µs, minp 1399 -> 237 µs at [8, 131072] on a
-  3060), landing at torch's native batched-multinomial level on
-  peaked logits (`sample_topk_batched` outright wins: 2.33x / 1.25x).
-  The flat worst case keeps the singles' honest caveat (0.05-0.06x).
+- Rows are processed in fixed chunks of 32, so very large batches
+  stream through a bounded workspace.
+- What batching buys: the per-row Python/launch overhead collapses.
+  At B=8 the batched call is 4-6x faster than looping the single-row
+  op, in wall time, on submission-bound hosts (topp 1340 -> 274 µs,
+  minp 1399 -> 237 µs at [8, 131072] on a 3060; the event-timed
+  benchmark tables above measure GPU time, a different protocol). On
+  peaked logits the batched calls sit at torch's native
+  batched-multinomial level, and `sample_topk_batched` wins outright
+  (2.33x / 1.25x). The flat worst case keeps the singles' honest
+  caveat, one tier lower (0.05-0.06x).
 - `decode_step` has no batched variant yet (the per-row penalty
   bitmaps add a dimension; roadmap 1.5).
 
@@ -147,14 +156,18 @@ pick tokens a small **rank window** apart (measured ~14 ranks at
 n=152064; ~1 at 32k vocabularies). The GPU result itself is always
 bit-identical per seed, and the window-widening schedule never changes
 the sampled token. One related, finer-grained caveat (surfaced by the
-v1.4 batched work, a property of the single-row API since 1.2): the
-global softmax total rides per-block float atomics, whose arrival
-order can differ between processes - a draw landing exactly on a CDF
-boundary may pick a neighboring token across process restarts
-(observed once in ~8 drawn rows at 131k; effectively never). The
-batched samplers use the same pattern per row, so a row may differ
-from its standalone call by the same one-token boundary effect -
-the parity tests pin exact-or-neighbor-rank.
+v1.4 batched work; the underlying property has existed in the
+single-row API since 1.2): the global softmax total is accumulated
+with per-block float atomics, and the order in which a GPU schedules
+those blocks can differ between processes. A draw that lands exactly
+on a CDF boundary may therefore pick a neighboring token after a
+process restart - in a probe of eight rows drawn at a 131k vocabulary,
+one row sat on such a boundary and flipped between runs, so for
+practical purposes this never happens. The batched samplers use the
+same accumulation pattern per row, so a row can differ from its
+standalone call by the same one-token boundary effect; the parity
+tests pin the outcome to either the exact token or a neighboring-rank
+one.
 
 Why not fix it? The strictly-sequential float adds are the determinism
 contract - parallelizing the sum would change every token ever drawn

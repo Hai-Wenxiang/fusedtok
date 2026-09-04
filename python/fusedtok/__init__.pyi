@@ -2,7 +2,11 @@
 
 Every operator accepts either a numpy array or a torch tensor and
 returns the same family: float32 numpy in -> float32 numpy out; a CUDA
-torch tensor in -> CUDA torch tensor out (the zero-copy path). Torch is
+torch tensor in -> CUDA torch tensor out (the zero-copy path). The
+samplers are the documented exception: they return tokens (int /
+int64 array), and the batched variants always return int64 on the
+HOST (a CPU torch tensor or numpy array) - the widening loop's host
+readback is inherent to returning tokens at all. Torch is
 an OPTIONAL dependency and stubs must not import it, so the array types
 below are expressed as ``Array = ndarray | Any``: numpy is the concrete
 half, and a checker resolves passing a torch tensor through the ``Any``
@@ -15,8 +19,9 @@ Error contract (stable since 1.0):
 
 Selection determinism (stable since 1.0): top-k / top-p / argmax resolve
 ties toward the EARLIEST index. Sampling (sample_topp / sample_topk /
-sample_minp / decode_step) is deterministic per seed; the RNG is a
-splitmix-style hash - reproducible, NOT cryptographically secure.
+sample_minp / the sample_*_batched variants / decode_step) is
+deterministic per seed (per row-seed for the batched variants); the RNG
+is a splitmix-style hash - reproducible, NOT cryptographically secure.
 """
 
 from typing import Any, Optional, Union

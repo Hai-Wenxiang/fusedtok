@@ -148,14 +148,42 @@ std::vector<unsigned long long> seeds_vec(const I64Array& a) {
         reinterpret_cast<const unsigned long long*>(p + a.size()));
 }
 
-// batched-sampling tokens out (house pattern: array, not stl.h)
-py::array_t<long long> wrap_tokens(const std::vector<long long>& v) {
-    py::array_t<long long> out(
-        std::vector<py::ssize_t>{(py::ssize_t)v.size()});
-    if (!v.empty())
-        std::memcpy(out.mutable_data(), v.data(),
-                    v.size() * sizeof(long long));
-    return out;
+// Batched-sampler validation (v1.4.1): the checks every entry style
+// shares, collapsed into one place after the 1.4.0 bindings drifted
+// apart - the staged trio missed the shape-vs-buffer check (an
+// oversized rows*n read past the numpy buffer) and the _cpu trio
+// missed n <= 0 (an inverted pointer range is UB). The Python layer
+// derives rows/n from the shape, but _fusedtok is a supported direct
+// surface and gets the same contract.
+void check_batch_rows_n(int rows, int n) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+}
+
+void check_batch_host(const FArray& logits, int rows, int n) {
+    if (logits.ndim() != 2)
+        throw std::invalid_argument("logits must be 2-D");
+    check_batch_rows_n(rows, n);
+    if (logits.shape(0) != rows || logits.shape(1) != n)
+        throw std::invalid_argument("logits shape must be [rows, n]");
+}
+
+void check_batch_seeds(const I64Array& seeds, int rows) {
+    if (seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+}
+
+void check_batch_unit(const char* what, double v) {
+    if (!(v > 0.0 && v <= 1.0))
+        throw std::invalid_argument(std::string(what) +
+                                    " must be in (0, 1]");
+}
+
+void check_batch_temp(double t) {
+    if (!(t > 0.0))
+        throw std::invalid_argument("temperature must be > 0");
 }
 float* dfm(py::int_ p) { return reinterpret_cast<float*>((uintptr_t)p); }
 const long long* dll(py::int_ p) { return reinterpret_cast<const long long*>((uintptr_t)p); }
@@ -912,15 +940,11 @@ PYBIND11_MODULE(_fusedtok, m) {
     m.def("sample_topp_batched_cpu",
           [](FArray logits, int rows, int n, double p, double t,
              const I64Array& seeds) -> py::array_t<long long> {
-        if (logits.ndim() != 2)
-            throw std::invalid_argument("logits must be 2-D");
-        if (!(p > 0.0 && p <= 1.0))
-            throw std::invalid_argument("p must be in (0, 1]");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
-        return wrap_tokens(ft::sample_topp_batched_cpu(
+        check_batch_host(logits, rows, n);
+        check_batch_unit("p", p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_topp_batched_cpu(
             to_vec(logits), rows, n, (float)p, (float)t,
             seeds_vec(seeds)));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("p"),
@@ -929,15 +953,12 @@ PYBIND11_MODULE(_fusedtok, m) {
     m.def("sample_topk_batched_cpu",
           [](FArray logits, int rows, int n, int k, double t,
              const I64Array& seeds) -> py::array_t<long long> {
-        if (logits.ndim() != 2)
-            throw std::invalid_argument("logits must be 2-D");
+        check_batch_host(logits, rows, n);
         if (k <= 0)
             throw std::invalid_argument("k must be >= 1");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
-        return wrap_tokens(ft::sample_topk_batched_cpu(
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_topk_batched_cpu(
             to_vec(logits), rows, n, k, (float)t, seeds_vec(seeds)));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("k"),
        py::arg("t") = 1.0, py::arg("seeds"));
@@ -945,15 +966,11 @@ PYBIND11_MODULE(_fusedtok, m) {
     m.def("sample_minp_batched_cpu",
           [](FArray logits, int rows, int n, double min_p, double t,
              const I64Array& seeds) -> py::array_t<long long> {
-        if (logits.ndim() != 2)
-            throw std::invalid_argument("logits must be 2-D");
-        if (!(min_p > 0.0 && min_p <= 1.0))
-            throw std::invalid_argument("min_p must be in (0, 1]");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
-        return wrap_tokens(ft::sample_minp_batched_cpu(
+        check_batch_host(logits, rows, n);
+        check_batch_unit("min_p", min_p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_minp_batched_cpu(
             to_vec(logits), rows, n, (float)min_p, (float)t,
             seeds_vec(seeds)));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("min_p"),
@@ -962,72 +979,55 @@ PYBIND11_MODULE(_fusedtok, m) {
     m.def("sample_topp_batched",
           [](FArray logits, int rows, int n, double p, double t,
              const I64Array& seeds) -> py::array_t<long long> {
-        if (logits.ndim() != 2)
-            throw std::invalid_argument("logits must be 2-D");
-        if (!(p > 0.0 && p <= 1.0))
-            throw std::invalid_argument("p must be in (0, 1]");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
+        check_batch_host(logits, rows, n);
+        check_batch_unit("p", p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
         if (rows == 0)
-            return wrap_tokens({});
-        if (n <= 0)
-            throw std::invalid_argument("sample of empty logits");
+            return wrap_ivec({});
         DevBuf dx((size_t)rows * n * 4);
         h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
         const std::vector<long long> tokens = ft::sample_topp_batched_launch(
             dx.fget(), rows, n, (float)p, (float)t, seeds_vec(seeds));
         sync_device("sample topp batched kernel");
-        return wrap_tokens(tokens);
+        return wrap_ivec(tokens);
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("p"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
     m.def("sample_topk_batched",
           [](FArray logits, int rows, int n, int k, double t,
              const I64Array& seeds) -> py::array_t<long long> {
-        if (logits.ndim() != 2)
-            throw std::invalid_argument("logits must be 2-D");
+        check_batch_host(logits, rows, n);
         if (k <= 0)
             throw std::invalid_argument("k must be >= 1");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
         if (rows == 0)
-            return wrap_tokens({});
-        if (n <= 0)
-            throw std::invalid_argument("sample of empty logits");
+            return wrap_ivec({});
         DevBuf dx((size_t)rows * n * 4);
         h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
         const std::vector<long long> tokens = ft::sample_topk_batched_launch(
             dx.fget(), rows, n, k, (float)t, seeds_vec(seeds));
         sync_device("sample topk batched kernel");
-        return wrap_tokens(tokens);
+        return wrap_ivec(tokens);
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("k"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
     m.def("sample_minp_batched",
           [](FArray logits, int rows, int n, double min_p, double t,
              const I64Array& seeds) -> py::array_t<long long> {
-        if (logits.ndim() != 2)
-            throw std::invalid_argument("logits must be 2-D");
-        if (!(min_p > 0.0 && min_p <= 1.0))
-            throw std::invalid_argument("min_p must be in (0, 1]");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
+        check_batch_host(logits, rows, n);
+        check_batch_unit("min_p", min_p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
         if (rows == 0)
-            return wrap_tokens({});
-        if (n <= 0)
-            throw std::invalid_argument("sample of empty logits");
+            return wrap_ivec({});
         DevBuf dx((size_t)rows * n * 4);
         h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
         const std::vector<long long> tokens = ft::sample_minp_batched_launch(
             dx.fget(), rows, n, (float)min_p, (float)t, seeds_vec(seeds));
         sync_device("sample minp batched kernel");
-        return wrap_tokens(tokens);
+        return wrap_ivec(tokens);
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("min_p"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1035,17 +1035,11 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ x, int rows, int n, double p, double t,
              const I64Array& seeds,
              std::uintptr_t stream) -> py::array_t<long long> {
-        if (rows < 0)
-            throw std::invalid_argument("rows must be >= 0");
-        if (n <= 0)
-            throw std::invalid_argument("sample of empty logits");
-        if (!(p > 0.0 && p <= 1.0))
-            throw std::invalid_argument("p must be in (0, 1]");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
-        return wrap_tokens(ft::sample_topp_batched_launch(
+        check_batch_rows_n(rows, n);
+        check_batch_unit("p", p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_topp_batched_launch(
             df(x), rows, n, (float)p, (float)t, seeds_vec(seeds), stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("p"),
        py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
@@ -1054,17 +1048,12 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ x, int rows, int n, int k, double t,
              const I64Array& seeds,
              std::uintptr_t stream) -> py::array_t<long long> {
-        if (rows < 0)
-            throw std::invalid_argument("rows must be >= 0");
-        if (n <= 0)
-            throw std::invalid_argument("sample of empty logits");
+        check_batch_rows_n(rows, n);
         if (k <= 0)
             throw std::invalid_argument("k must be >= 1");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
-        return wrap_tokens(ft::sample_topk_batched_launch(
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_topk_batched_launch(
             df(x), rows, n, k, (float)t, seeds_vec(seeds), stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("k"),
        py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
@@ -1073,17 +1062,11 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ x, int rows, int n, double min_p, double t,
              const I64Array& seeds,
              std::uintptr_t stream) -> py::array_t<long long> {
-        if (rows < 0)
-            throw std::invalid_argument("rows must be >= 0");
-        if (n <= 0)
-            throw std::invalid_argument("sample of empty logits");
-        if (!(min_p > 0.0 && min_p <= 1.0))
-            throw std::invalid_argument("min_p must be in (0, 1]");
-        if (!(t > 0.0))
-            throw std::invalid_argument("temperature must be > 0");
-        if (seeds.size() != rows)
-            throw std::invalid_argument("seeds must have one entry per row");
-        return wrap_tokens(ft::sample_minp_batched_launch(
+        check_batch_rows_n(rows, n);
+        check_batch_unit("min_p", min_p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_minp_batched_launch(
             df(x), rows, n, (float)min_p, (float)t, seeds_vec(seeds),
             stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("min_p"),

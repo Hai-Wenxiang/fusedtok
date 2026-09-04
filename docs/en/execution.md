@@ -106,6 +106,9 @@ Notable exceptions (by design, documented per operator):
 
 - The fused samplers return a host `int`, so each call ends in one
   small device-to-host readback - they are not meant to be captured.
+- The batched samplers (`sample_*_batched`) return a host int64
+  tensor/array AND their widening loop re-launches kernels based on a
+  readback, so they are not capturable either (same contract).
 - `quantize_int8` / `qadd_int8` must read the reduced scale back to
   compose pass 2, so they sync the caller's stream once mid-call.
 - On the zero-copy path, integer inputs (attention `lens`, paged

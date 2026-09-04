@@ -4,6 +4,82 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] - 2026-09-05
+
+Audit-driven hardening release (the 1.2.1/1.3.1 playbook applied to the
+1.4 codebase): a staged-path validation hole, a cleanup pass over the
+batched sequencers, and a full documentation overhaul with every
+benchmark number regenerated under the shipping version stamp. No API
+changes; 485 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060
+Ti (Linux, CUDA 13.2); compute-sanitizer clean on the touched paths;
+the min-p token battery vs 1.3.1 remains bit-identical.
+
+### Fixed
+- **Staged-path shape validation** (batched samplers): the six
+  host-side `_fusedtok` bindings took `rows`/`n` as independent
+  parameters and copied `rows*n` floats without checking the numpy
+  buffer - an oversized pair read past it (the exact staged-path hole
+  class 1.3.1 closed for the attention ops; the single-row staged
+  binding derives `n` itself, the 1.4.0 batched ones regressed that
+  pattern), and the `_cpu` trio also lacked the `n <= 0` guard (a
+  negative `n` makes the row slice an inverted pointer range - UB).
+  `check_batch_host` now pins shape == [rows, n] plus `n <= 0` on all
+  six; the launchers share `check_batch_rows_n`.
+- **uint64 seed wraparound**: `_batch_seeds` checked negativity
+  BEFORE the int64 cast, so a uint64 seed above 2^63 - 1 wrapped
+  negative while the docstring promised non-negative seeds. The check
+  now runs after the cast; the accepted range is documented and
+  enforced as [0, 2^63).
+- Upload-failure messages report the failed copy's own return value
+  instead of `cudaGetLastError()` (which could name an unrelated
+  stale error and clears sticky state as a side effect).
+
+### Changed
+- The widening lower bounds live in one place each
+  (`topp_widen_bound` / `minp_widen_bound`), shared by the two
+  single-row widen functions and the batched loop (the 1.4.0
+  sequencer inlined copy-pastes; the section comment demands the
+  three stay in sync, now enforced structurally). Bit-identical math.
+- Batched-sequencer cleanup: the inactive-row write-back in the merge
+  loop was dead code with a misleading comment; totals readback is
+  lazily host-cached for BOTH widen modes (topp used to re-read every
+  iteration although the global total is retry-invariant); the three
+  per-attempt stalls use `cudaStreamSynchronize(cs)` instead of a
+  device-wide fence; the batched stripe drops the unused 4 KB/row
+  scan-scratch reserve; `BatchTail.totals` is word-aligned so the
+  layout comment IS the layout; the nine bindings' repeated
+  validation collapsed into the `check_batch_*` helper family;
+  `wrap_tokens` merged into the pre-existing `wrap_ivec`; the three
+  Python wrappers dispatch through one `_sample_batched` helper.
+- Benchmark tables regenerated on both GPUs under the 1.4.1 stamp
+  (the 1.4.0 JSONs carried a 1.3.1 stamp - generated before the
+  version bump). The 3060 flat-worst reference set carried one slow
+  WDDM round; the row states this and the JSON keeps per-round
+  values.
+
+### Added
+- Tests: staged/CPU shape-mismatch and `n <= 0` rejection, the
+  (0, 0) empty-vocab rejection, launcher-safe invalids, uint64 seed
+  wrap rejection; large batches across the 32-row chunk boundary,
+  seeds as CPU/CUDA torch tensors and plain lists, temperature
+  extremes (near-greedy and widening-forcing), interleavings with
+  argmax and single-row calls across workspace reallocations, empty
+  batches on the GPU paths, p=1.0 / min_p=1.0 edges, default-seed
+  coverage for all three batched samplers.
+- Documentation: execution.md/faq.md state the batched samplers'
+  non-capturability; faq gains the GPU-side cross-process ulp
+  pointer and the flat-logits batched FAQ; sampling.md documents
+  seed containers/bounds and the per-step re-seeding idiom;
+  benchmarks.md explains the b=8 rows' native-multinomial reference
+  and corrects the flat-loss range; glossary gains multinomial.
+
+### Documented
+- A Chinese naturalness pass over the v1.4 additions (jargon
+  replaced, calques rewritten, term translations corrected) and an
+  English stiffness pass (see the docs commit for the itemized
+  list); every stale number found by the audit resynced, including
+  attention.md's 8.91x and the README operator-table cells.
+
 ## [1.4.0] - 2026-09-05
 
 Batched sampling and a token-preserving min-p speedup. Three new public

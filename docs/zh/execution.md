@@ -52,9 +52,9 @@ CPU 参考实现是正确性的基准：它实现的是同一套算法（在需�
 几条值得记住的规则：
 
 - **半精度输入、float32 计算。** 读入时在内存边界升到 float32，
-  写出时按四舍五入到偶数舍回半精度。attention 的 softmax 和所有
-  累加器在任何 dtype 下都是 float32，数值差异只来自输入本身的
-  舍入。
+  写出时按「最近偶数舍入」（round-to-nearest-even）规则舍回半精度。
+  attention 的 softmax 和所有累加器在任何 dtype 下都是 float32，
+  数值差异只来自输入本身的舍入。
 - **输出 dtype 跟随输入**：bf16 进 bf16 出；attention 额外支持
   fp16 的往返。
 - 归一化的权重（`weight`、`bias`、`residual`）在激活为半精度时
@@ -97,6 +97,9 @@ g.replay()                                  # 整批一次 replay
 
 - 融合采样器返回主机端的 `int`，每次调用以一次很小的
   设备到主机回读收尾——它们本来就不打算被捕获。
+- 批量采样器（`sample_*_batched`）返回主机侧 int64 张量/数组，
+  而且扩窗循环要根据回读结果重新发射 kernel——同样不可捕获
+  （契约一致）。
 - `quantize_int8` / `qadd_int8` 必须把归约出的 scale 读回主机
   才能组织第二遍 kernel，所以调用中途会同步一次调用方的流。
 - 零拷贝路径上，整数输入（attention 的 `lens`、分页的
