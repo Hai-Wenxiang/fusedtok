@@ -42,11 +42,11 @@ rounding.
 - **(honest)** marks rows where fusedtok loses: attention_prefill vs
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
   (0.40-0.57x), flat-distribution sample_topp vs torch's fully
-  parallel sort (0.17-0.29x) and the wide-nucleus sample_minp row
-  (0.2-0.31x - two widening retries plus a 64k sort; the torch
-  boolean-mask composite never sorts). These are design-scope
-  statements, not measurement noise - the [topic pages](usage.md)
-  explain each one.
+  parallel sort (0.17-0.25x, singles and batched alike) and the
+  wide-nucleus sample_minp row (0.28-0.39x - one widening retry plus
+  a 32-64k sort; the torch boolean-mask composite never sorts). These
+  are design-scope statements, not measurement noise - the
+  [topic pages](usage.md) explain each one.
 - The **bandwidth column** (GB/s) counts only the bytes the op must
   move (e.g. 2 tensors for softmax, 3 for rmsnorm+residual); the
   **TOPS** figure on INT8 rows is dense-MACs-times-two per second.

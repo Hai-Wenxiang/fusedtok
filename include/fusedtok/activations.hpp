@@ -98,6 +98,19 @@ long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
 long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
                           float t, unsigned long long seed);
 
+// Batched variants (v1.4): logits is rows x n row-major, one seed per
+// row, one token per row returned. Semantics are the row-wise singles
+// (identical arithmetic per row by construction).
+std::vector<long long> sample_topp_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float p, float t,
+    const std::vector<unsigned long long>& seeds);
+std::vector<long long> sample_topk_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, int k, float t,
+    const std::vector<unsigned long long>& seeds);
+std::vector<long long> sample_minp_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float min_p,
+    float t, const std::vector<unsigned long long>& seeds);
+
 // ---------------------------------------------------------------------------
 // INT8 symmetric per-tensor quantization (the storage half; the compute
 // half - IMMA qgemm / decode GEMV - is declared just below):

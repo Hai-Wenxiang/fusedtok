@@ -4,6 +4,67 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-09-05
+
+Batched sampling and a token-preserving min-p speedup. Three new public
+operators; no existing signature changed. 473 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2);
+compute-sanitizer memcheck/racecheck clean on the touched paths; the
+min-p 1152-case token battery is bit-identical to 1.3.1.
+
+### Added
+- **Batched samplers** `sample_topp_batched` / `sample_minp_batched` /
+  `sample_topk_batched`: one call samples a whole `[rows, vocab]`
+  batch of logits and returns one token per row (int64; CPU torch
+  tensor or numpy array - the widening loop's host readback makes
+  them non-graph-capturable, same contract as the singles). Every row
+  runs the single-row pipeline verbatim - same kernels, same
+  accumulation order, per-row parity including the widening loop
+  (finished rows are skipped via an active bitmap while wide-nucleus
+  rows retry under one uniform window; rows process in chunks of 32).
+  `seeds` defaults to `0..rows-1` so identical rows draw
+  independently. Wall time at B=8 x 131k vs the per-row loop: 4-6x on
+  submission-bound hosts (3060: topp 1340 -> 274 us, minp 1399 ->
+  237 us; 5060 Ti 3.9x / 4.3x), landing at torch's native
+  batched-multinomial level on peaked logits (`sample_topk_batched`
+  wins outright: 2.33x / 1.25x); the flat worst case keeps the
+  singles' honest 0.05-0.06x. CPU paths loop the row-wise references
+  (bit-identical by construction).
+- Batched kernel family in the selection pipeline (row-decomposed
+  copies of the single-row bodies: blocks split as row * gpr +
+  local, per-row workspace stripes, compact per-row scalar tail for
+  one-readback-per-attempt host widening). Two real bugs found by the
+  mixed peaked/flat parity tests and fixed before commit: the tail
+  active bitmap overlapped the totals array (exptotal's atomicAdd
+  randomly deactivated rows), and a window growth between attempts
+  reallocates the workspace - the fresh zeroed tail read back as
+  token 0 for finished rows until the merge learned to only honor
+  active rows.
+
+### Changed
+- **min-p adaptive widening jump** (token-preserving): the widening
+  loop no longer climbs the plain x8 ladder. A failed window leaves
+  its cum mass, and together with a one-time lazily-computed global
+  total this yields a bound that always covers the value-threshold
+  nucleus (`w >= W + (T - C) / min_p` - sufficient where top-p's
+  mass bound is merely necessary). Wide-nucleus rows skip the
+  ladder's intermediate stops: the wide row improves 776.8 -> 540.0 us
+  on a 3060 and 366 -> 262 us on a 5060 Ti in the same-probe A/B
+  (-28-30%), peaked logits unchanged (first-window success never pays
+  the mass kernels). The 1152-case token battery vs the 1.3.1 build
+  is bit-identical.
+- Benchmark tables fully regenerated on both GPUs with four new
+  batched rows; README/docs numbers resynced (headline attn decode
+  8.91x -> 8.73x, flat-worst prose range 0.17-0.37x -> 0.17-0.25x).
+
+### Documented
+- The cross-process ulp boundary of the global softmax total (per-
+  block float atomics; arrival order differs between processes - a
+  draw landing exactly on a CDF boundary may pick a neighboring
+  token across restarts). A property of the single-row API since 1.2,
+  verified with the 1.3.1 build during the batched work; the batched
+  parity tests pin exact-or-neighbor-rank.
+
 ## [1.3.1] - 2026-09-04
 
 Audit-driven hardening release (the 1.2.1 playbook applied to the 1.3

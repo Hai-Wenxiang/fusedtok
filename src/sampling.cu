@@ -248,4 +248,55 @@ long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
     return (long long)order[nucleus - 1];     // float rounding fallback
 }
 
+// ---------------------------------------------------------------------------
+// batched CPU references (v1.4): the row-wise singles verbatim - each
+// row's token is bit-identical to calling the single-row reference on
+// that row, by construction (same functions, same order).
+// ---------------------------------------------------------------------------
+
+std::vector<long long> sample_topp_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float p, float t,
+    const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_topp_cpu(std::vector<float>(row, row + n), p,
+                                      t, seeds[r]));
+    }
+    return out;
+}
+
+std::vector<long long> sample_topk_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, int k, float t,
+    const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_topk_cpu(std::vector<float>(row, row + n), k,
+                                      t, seeds[r]));
+    }
+    return out;
+}
+
+std::vector<long long> sample_minp_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float min_p,
+    float t, const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_minp_cpu(std::vector<float>(row, row + n),
+                                      min_p, t, seeds[r]));
+    }
+    return out;
+}
+
 } // namespace fusedtok

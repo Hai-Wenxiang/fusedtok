@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 __all__ = [
     "cuda_available",
@@ -58,6 +58,9 @@ __all__ = [
     "sample_topp",
     "sample_topk",
     "sample_minp",
+    "sample_topp_batched",
+    "sample_topk_batched",
+    "sample_minp_batched",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -342,6 +345,29 @@ def _device_path(x, cuda):
     if _is_torch(x) and x.is_cuda:
         return "torch-cuda"
     return "staged" if cuda else "cpu"
+
+
+def _batch_seeds(seeds, rows, name):
+    """Batched-sampling seed normalization: ``None`` becomes
+    ``0..rows-1`` (the serving default - distinct streams per row);
+    anything else must be a 1-D integral host array with exactly one
+    non-negative entry per row."""
+    if seeds is None:
+        return np.arange(rows, dtype=np.int64)
+    if _is_torch(seeds):
+        if seeds.is_cuda:
+            seeds = seeds.cpu()
+        seeds = seeds.detach().numpy()
+    arr = np.asarray(seeds)
+    if arr.dtype.kind not in "iu":
+        raise TypeError(f"{name} must contain integers")
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be 1-D")
+    if arr.shape[0] != rows:
+        raise ValueError(f"{name} must have one entry per row")
+    if arr.size and arr.min() < 0:
+        raise ValueError(f"{name} values must be non-negative")
+    return np.ascontiguousarray(arr, dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -1461,6 +1487,142 @@ def sample_minp(logits, min_p, *, temperature=1.0, seed=0, cuda=False):
     call = (_fusedtok.sample_minp if path == "staged"
             else _fusedtok.sample_minp_cpu)
     return int(call(arr, min_p, temperature, seed))
+
+
+def sample_topp_batched(logits, p, *, temperature=1.0, seeds=None,
+                        cuda=False):
+    """Fused nucleus sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every row
+    runs the exact ``sample_topp`` pipeline and the call returns one
+    token id per row (int64 array / torch tensor on CPU - the host
+    readback is inherent to the widening loop).
+
+    ``seeds`` is one non-negative integer per row; ``None`` defaults to
+    ``0..rows-1`` so identical rows still draw independent tokens.
+    ``p`` in (0, 1], temperature > 0. Deterministic per (row, seed);
+    not CUDA-graph capturable (same contract as ``sample_topp``).
+    Rows are processed in device-sized chunks; each row's token matches
+    the single-row API up to the documented __expf/atomic-order ulp
+    boundary.
+    """
+    if not 0.0 < p <= 1.0:
+        raise ValueError("p must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        s = _batch_seeds(seeds, rows, "seeds")
+        toks = _fusedtok.sample_topp_batched_launch(
+            logits.data_ptr(), rows, n, p, temperature, s, _cuda_stream())
+        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    s = _batch_seeds(seeds, rows, "seeds")
+    if rows == 0:
+        out = np.empty(0, dtype=np.int64)
+    else:
+        call = (_fusedtok.sample_topp_batched if path == "staged"
+                else _fusedtok.sample_topp_batched_cpu)
+        out = np.asarray(call(arr, rows, n, p, temperature, s),
+                         dtype=np.int64)
+    return _numpy_to_torch_like(out) if _is_torch(logits) else out
+
+
+def sample_topk_batched(logits, k, *, temperature=1.0, seeds=None,
+                        cuda=False):
+    """Fused top-k sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every row
+    runs the exact ``sample_topk`` pipeline (``k`` shared by all rows,
+    ``k >= vocab`` samples the whole distribution) and the call returns
+    one token id per row (int64 array / torch tensor on CPU).
+
+    ``seeds`` is one non-negative integer per row; ``None`` defaults to
+    ``0..rows-1``. ``k`` >= 1, temperature > 0. Deterministic per
+    (row, seed); not CUDA-graph capturable. Each row's token matches
+    the single-row API up to the documented __expf/atomic-order ulp
+    boundary.
+    """
+    if k <= 0:
+        raise ValueError("k must be >= 1")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        s = _batch_seeds(seeds, rows, "seeds")
+        toks = _fusedtok.sample_topk_batched_launch(
+            logits.data_ptr(), rows, n, k, temperature, s,
+            _cuda_stream())
+        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    s = _batch_seeds(seeds, rows, "seeds")
+    if rows == 0:
+        out = np.empty(0, dtype=np.int64)
+    else:
+        call = (_fusedtok.sample_topk_batched if path == "staged"
+                else _fusedtok.sample_topk_batched_cpu)
+        out = np.asarray(call(arr, rows, n, k, temperature, s),
+                         dtype=np.int64)
+    return _numpy_to_torch_like(out) if _is_torch(logits) else out
+
+
+def sample_minp_batched(logits, min_p, *, temperature=1.0, seeds=None,
+                        cuda=False):
+    """Fused min-p sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every row
+    runs the exact ``sample_minp`` pipeline (value-threshold nucleus at
+    ``min_p`` times the row maximum) and the call returns one token id
+    per row (int64 array / torch tensor on CPU).
+
+    ``seeds`` is one non-negative integer per row; ``None`` defaults to
+    ``0..rows-1``. ``min_p`` in (0, 1], temperature > 0. Deterministic
+    per (row, seed); not CUDA-graph capturable. Each row's token
+    matches the single-row API up to the documented __expf/atomic-order
+    ulp boundary.
+    """
+    if not 0.0 < min_p <= 1.0:
+        raise ValueError("min_p must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        s = _batch_seeds(seeds, rows, "seeds")
+        toks = _fusedtok.sample_minp_batched_launch(
+            logits.data_ptr(), rows, n, min_p, temperature, s,
+            _cuda_stream())
+        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    s = _batch_seeds(seeds, rows, "seeds")
+    if rows == 0:
+        out = np.empty(0, dtype=np.int64)
+    else:
+        call = (_fusedtok.sample_minp_batched if path == "staged"
+                else _fusedtok.sample_minp_batched_cpu)
+        out = np.asarray(call(arr, rows, n, min_p, temperature, s),
+                         dtype=np.int64)
+    return _numpy_to_torch_like(out) if _is_torch(logits) else out
 
 
 def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,
