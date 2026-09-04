@@ -58,7 +58,22 @@ exp-rounding boundary of the CDF (CPU uses exact `exp`, GPU uses the
 ~2-ulp `__expf`); the two draws are then neighboring, equally valid
 samples. At very large vocabularies with near-uniform logits this
 happens at scale (a small rank window, measured ~14 ranks at
-n=152064). Details: [sampling - the same-token guarantee](sampling.md#the-same-token-guarantee).
+n=152064). There is also a rarer GPU-side boundary: the global
+softmax total is accumulated with per-block float atomics whose
+scheduling order differs between processes, so one draw in a boundary
+case may pick a neighboring token after a process restart. Details:
+[sampling - the same-token guarantee](sampling.md#the-same-token-guarantee).
+
+## Why is my batched sampler slower than torch on flat logits?
+
+`torch.multinomial` never sorts - it draws against the full
+distribution with a boolean-mask pass. The fusedtok samplers must
+ORDER the nucleus (the selection pipeline), and on near-uniform
+logits the nucleus is ~90% of the vocabulary, so they honestly lose
+that regime (0.05-0.06x batched, 0.17-0.25x single-row). Real decode
+logits are peaked, where the samplers sit at native-multinomial
+level or better. Details:
+[sampling - flat distributions](sampling.md#flat-distributions---the-honest-worst-case).
 
 ## Are the samplers cryptographically secure?
 
@@ -69,7 +84,9 @@ application needs one.
 ## Can I capture CUDA graphs?
 
 Yes, library-wide, with warm-up first. Exceptions: the fused samplers
-return host ints (each call ends in a readback), and
+return host ints (each call ends in a readback) - the `_batched`
+variants additionally re-launch kernels from a readback inside their
+widening loop, so int64 arrays or not, they stay outside graphs - and
 `quantize_int8`/`qadd_int8` sync once mid-call to compose their
 scales. The selection pipeline captures its own internal graph
 automatically - you do not manage it.
@@ -101,8 +118,13 @@ micro-benchmark yourself, prefer events over wall clock and expect
   maximum.
 - **Batched sampling** - sampling a whole `[rows, vocab]` batch in one
   call (the `_batched` samplers): every row runs the single-row
-  pipeline verbatim with its own seed; the win over a per-row loop is
-  collapsed launch/submission overhead, not different math.
+  pipeline verbatim with its own seed; the speedup over a per-row loop
+  comes from collapsing launch/submission overhead, not from different
+  math.
+- **multinomial** - torch's probability-weighted draw
+  (`torch.multinomial`); the reference implementation this library's
+  samplers are benchmarked against (composed with softmax, and with
+  top-k / a boolean mask where the row label says so).
 - **Radix** - the selection pipeline's ordering technique: candidate
   keys are histogrammed round by round on their high bytes (the radix
   sort idea).

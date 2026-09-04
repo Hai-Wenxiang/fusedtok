@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "fusedtok"
-version = "1.4.0"
+version = "1.4.1"
 description = "Fused CUDA kernels for LLM inference: attention decode (contiguous + paged kv-cache), RMSNorm, RoPE, SwiGLU, fused sampling, INT8 quantized GEMM - zero-copy torch support"
 readme = "README.md"
 license = { file = "LICENSE" }

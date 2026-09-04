@@ -70,8 +70,12 @@ logits = torch.randn(131072, device="cuda")
 token = fusedtok.decode_step(logits, [], penalty=1.1,
                              p=0.9, temperature=0.8, seed=0)
 
-# 并发服务一整批：一次调用，每行按各自种子出一枚 token
+# 并发服务一整批：一次调用，每行按各自种子各出一个 token
+# （把 logits 做出尖峰才像真实解码输出——平坦随机 logits 下批量
+# 优势会缩小，见基准测试页）
 batch_logits = torch.randn(8, 131072, device="cuda")
+batch_logits[torch.arange(8, device="cuda"),
+             batch_logits.argmax(dim=1)] += 20.0
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9)
 ```
 

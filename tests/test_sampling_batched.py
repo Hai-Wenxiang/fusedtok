@@ -254,3 +254,115 @@ class TestCuda:
         assert torch.is_tensor(out) and out.dtype == torch.int64
         ref = fusedtok.sample_topp_batched(x.numpy(), 0.9)
         assert out.numpy().tolist() == ref.tolist()
+
+    def test_large_batches_multiple_chunks(self):
+        # 64 rows = two full 32-row device chunks with mixed shapes;
+        # 32 rows = the exact chunk boundary; spot-check each row
+        # against its standalone call
+        rng = np.random.default_rng(101)
+        x = _rows(rng, 64, 4096)
+        dev = torch.from_numpy(x).cuda()
+        for b in (32, 64):
+            d = dev[:b]
+            for name, (batched, single, arg) in BATCHED.items():
+                got = batched(d, arg)
+                for r in (0, 1, 31, b - 1):
+                    want = int(single(d[r], arg, seed=r))
+                    _assert_row_close(x[r], int(got[r]), want,
+                                      (name, b, r))
+
+    def test_seeds_as_torch_and_list_containers(self):
+        # _batch_seeds accepts CUDA tensors (moved to host), CPU
+        # tensors and plain lists - all must give the same stream as
+        # the numpy array form
+        rng = np.random.default_rng(102)
+        x = rng.standard_normal((4, 2048)).astype(np.float32)
+        dev = torch.from_numpy(x).cuda()
+        ref = fusedtok.sample_topp_batched(dev, 0.9,
+                                           seeds=[5, 6, 7, 8])
+        same = [
+            fusedtok.sample_topp_batched(
+                dev, 0.9, seeds=np.array([5, 6, 7, 8], dtype=np.int64)),
+            fusedtok.sample_topp_batched(
+                dev, 0.9, seeds=torch.tensor([5, 6, 7, 8])),
+            fusedtok.sample_topp_batched(
+                dev, 0.9,
+                seeds=torch.tensor([5, 6, 7, 8], device="cuda")),
+        ]
+        for got in same:
+            assert got.tolist() == ref.tolist()
+
+    def test_temperature_extremes(self):
+        # tiny temperature collapses every row onto its argmax; a huge
+        # temperature flattens the distribution and forces the
+        # widening loop (the widest T - C mass the lazy totals cache
+        # ever sees)
+        rng = np.random.default_rng(103)
+        x = rng.standard_normal((4, 8192)).astype(np.float32)
+        dev = torch.from_numpy(x).cuda()
+        cold = fusedtok.sample_topp_batched(dev, 0.9, temperature=1e-4)
+        for r in range(4):
+            assert int(cold[r]) == int(dev[r].argmax())
+        hot = fusedtok.sample_minp_batched(dev, 0.05, temperature=1e4)
+        again = fusedtok.sample_minp_batched(dev, 0.05, temperature=1e4)
+        assert hot.tolist() == again.tolist()
+
+    def test_interleaved_with_argmax_and_singles(self):
+        # the batched family shares the process-wide selection
+        # workspace with argmax and the single-row samplers; alternate
+        # them (small after large, so the workspace REALLOCS between
+        # calls) to pin the reset invariants the widening loop relies on
+        rng = np.random.default_rng(104)
+        big = rng.standard_normal((8, 131072)).astype(np.float32)
+        big[:, 3] += 20.0
+        dbig = torch.from_numpy(big).cuda()
+        small = rng.standard_normal((3, 1024)).astype(np.float32)
+        dsmall = torch.from_numpy(small).cuda()
+        for _ in range(3):
+            toks = fusedtok.sample_topp_batched(dbig, 0.9)
+            assert all(0 <= t < 131072 for t in toks.tolist())
+            for r in range(8):
+                assert int(fusedtok.argmax(dbig[r])) == 3
+            got = fusedtok.sample_minp_batched(dsmall, 0.1)
+            for r in range(3):
+                want = int(fusedtok.sample_minp(dsmall[r], 0.1, seed=r))
+                assert int(got[r]) == want
+            assert fusedtok.sample_topk(dsmall[0], 10, seed=1) == \
+                fusedtok.sample_topk(dsmall[0], 10, seed=1)
+
+    def test_empty_batch_on_gpu_paths(self):
+        if not fusedtok.cuda_available():
+            pytest.skip("GPU")
+        z = torch.empty(0, 64, device="cuda")
+        for batched, _, arg in BATCHED.values():
+            out = batched(z, arg)
+            assert out.shape == (0,)
+        # staged empty batch (host staging path)
+        for batched, _, arg in BATCHED.values():
+            out = batched(np.empty((0, 64), dtype=np.float32), arg,
+                          cuda=True)
+            assert out.shape == (0,)
+
+    def test_parameter_edges_p_and_minp_one(self):
+        # p = 1.0: the whole distribution is the nucleus (forced
+        # coverage); min_p = 1.0: only the row maxima survive - both
+        # per-row equal to the singles
+        rng = np.random.default_rng(105)
+        x = rng.standard_normal((4, 3000)).astype(np.float32)
+        dev = torch.from_numpy(x).cuda()
+        got = fusedtok.sample_topp_batched(dev, 1.0)
+        for r in range(4):
+            want = int(fusedtok.sample_topp(dev[r], 1.0, seed=r))
+            _assert_row_close(x[r], int(got[r]), want, ("topp1", r))
+        got = fusedtok.sample_minp_batched(dev, 1.0)
+        for r in range(4):
+            want = int(fusedtok.sample_minp(dev[r], 1.0, seed=r))
+            _assert_row_close(x[r], int(got[r]), want, ("minp1", r))
+
+    def test_default_seeds_cover_all_three_samplers(self):
+        rng = np.random.default_rng(106)
+        x = np.tile(rng.standard_normal(2048).astype(np.float32), (4, 1))
+        for batched, single, arg in BATCHED.values():
+            got = batched(x, arg)
+            want = [int(single(x[0], arg, seed=s)) for s in range(4)]
+            assert got.tolist() == want

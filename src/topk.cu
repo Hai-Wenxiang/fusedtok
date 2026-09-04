@@ -1458,6 +1458,26 @@ void topp_select_launch(const float* x, float* vals, long long* idxs,
     select_common(x, vals, idxs, count_out, n, n, p, stream);
 }
 
+// Widening lower bounds (v1.4.1): the single-place formulas behind
+// widen_window / widen_window_minp and the batched widen loop, so the
+// three users cannot drift apart (the batched sequencer inlined a
+// copy-paste of each in 1.4.0). Both take the failed window width W,
+// its cum mass C and the global max-normalized total T; both return a
+// necessary/sufficient next-window bound (see the callers for which).
+static inline long long topp_widen_bound(int window, double p,
+                                         double total, double c) {
+    if (c > 0.0 && p * total > c)
+        return (long long)std::ceil((double)window * p * total / c) + 1;
+    return (long long)std::ceil(p * total) + 1;
+}
+
+static inline long long minp_widen_bound(int window, double min_p,
+                                         double total, double c) {
+    if (total > 0.0 && total - c > 0.0)
+        return (long long)std::ceil((total - c) / min_p) + window + 1;
+    return (long long)window + 1;      // floor if T - C <= 0
+}
+
 // Adaptive widening jump (v1.2). After a window attempt fails to cover
 // the nucleus, two floats the attempt already produced steer the next
 // window size (one 16-byte readback of the kWsTotal/kWsCumW workspace
@@ -1490,19 +1510,15 @@ static int widen_window(int window, int n, float p,
     // rounds on mid-tailed distributions)
     unsigned long long massw[2] = {0ULL, 0ULL};
     if (cudaMemcpy(massw, ws + kWsTotal, 2 * sizeof(*ws),
-                   cudaMemcpyDeviceToHost) != cudaSuccess)
+                    cudaMemcpyDeviceToHost) != cudaSuccess)
         throw std::runtime_error("sample mass readback failed");
     const float mass[2] = {
         *reinterpret_cast<const float*>(&massw[0]),   // global total
         *reinterpret_cast<const float*>(&massw[1]),   // window cum
     };
-    const double total = (double)mass[0];
-    const double cw = (double)mass[1];
-    long long lb;
-    if (cw > 0.0 && p * total > cw)         // else keep the plain bound
-        lb = (long long)std::ceil((double)window * p * total / cw) + 1;
-    else
-        lb = (long long)std::ceil(p * total) + 1;
+    const long long lb = topp_widen_bound(window, (double)p,
+                                          (double)mass[0],
+                                          (double)mass[1]);
     const long long want = std::max<long long>((long long)window * 8, lb);
     if (want >= n) return n;
     int mp = 1;                       // pow2 headroom over the bound
@@ -1535,9 +1551,7 @@ static int widen_window_minp(int window, int n, float min_p, double total,
                    cudaMemcpyDeviceToHost) != cudaSuccess)
         throw std::runtime_error("min-p mass readback failed");
     const double c = (double)*reinterpret_cast<const float*>(&cw);
-    long long lb = (long long)window + 1;      // floor if T - C <= 0
-    if (total > 0.0 && total - c > 0.0)        // else keep the ladder
-        lb = (long long)std::ceil((total - c) / (double)min_p) + window + 1;
+    const long long lb = minp_widen_bound(window, (double)min_p, total, c);
     const long long want = std::max<long long>((long long)window * 8, lb);
     if (want >= n) return n;
     int mp = 1;                       // pow2 headroom over the bound
@@ -2071,19 +2085,22 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
 //
 // Rows are processed in chunks of kBMaxBatch so the persistent
 // workspace stays bounded (32 stripes of a full-vocabulary window are
-// ~67 MB). The launcher synchronizes every attempt (inherent host
-// readback), so like the single-row samplers it is NOT CUDA-graph
-// capturable.
+// ~67 MB at a 131k vocabulary, ~135 MB at Qwen's 152k where the sort
+// pad m rounds up to 262144). The launcher synchronizes every attempt
+// (inherent host readback), so like the single-row samplers it is NOT
+// CUDA-graph capturable.
 // ---------------------------------------------------------------------------
 
 // rows per chunk (workspace bound; see the section note)
 namespace {
 constexpr int kBMaxBatch = 32;
 
-// compact per-row scalar tail after the B stripes. Word layout:
-// seeds [0, B) | tokens [B, 2B) | cumws [2B, 2B+C) | totals
-// [2B+C, 2B+2C) | active [2B+2C, 2B+3C), C = ceil(B / 2) - the float
-// pairs share words, the int bitmap follows them.
+// compact per-row scalar tail after the B stripes. Word layout (all
+// ranges word-aligned so the comment IS the layout): seeds [0, B) |
+// tokens [B, 2B) | cumws [2B, 2B+C) | totals [2B+C, 2B+2C) | active
+// [2B+2C, 2B+3C), C = ceil(B / 2). Each float array occupies C words;
+// for odd B the half-word left by cumws stays unused (a padded gap,
+// never shared - the 1.4.0 overlap bug came from exactly such sharing).
 struct BatchTail {
     unsigned long long* seeds;   // B u64
     long long* tokens;           // B i64, -1 = not yet sampled
@@ -2104,7 +2121,8 @@ inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
     t.seeds = ws + stripes;
     t.tokens = reinterpret_cast<long long*>(ws + stripes + rows);
     t.cumws = reinterpret_cast<float*>(ws + stripes + 2 * (size_t)rows);
-    t.totals = t.cumws + rows;
+    t.totals = reinterpret_cast<float*>(ws + stripes + 2 * (size_t)rows +
+                                       pairs);
     t.active = reinterpret_cast<int*>(ws + stripes + 2 * (size_t)rows +
                                      2 * pairs);
     return t;
@@ -2113,7 +2131,9 @@ inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
 // per-attempt scalar reset for the ACTIVE rows: tokens preset to the
 // single-row -1 sentinel; cum/totals zeroed so exptotal_b's atomicAdd
 // and the tail readbacks start from scratch. Inactive rows keep their
-// sampled tokens - the host copies them out once at the end.
+// sampled tokens in the host-side vector; the per-attempt readback
+// simply ignores them (the fresh tail after a workspace realloc
+// cannot be trusted for finished rows).
 __global__ void batch_preset_kernel(long long* __restrict__ tokens,
                                     float* __restrict__ cumws,
                                     float* __restrict__ totals,
@@ -2669,27 +2689,37 @@ std::vector<long long> sample_nucleus_batched_chunk(
     const float inv_t = 1.0f / t;
     std::vector<long long> tokens(rows, -1);
     std::vector<int> active(rows, 1);
-    std::vector<double> total(rows, -1.0);   // host cache (minp lazy)
+    std::vector<double> total(rows, -1.0);   // lazy host cache (both modes)
     std::vector<float> cum_h(rows, 0.0f), tot_h(rows, 0.0f);
     int window = std::min(kSelEarlyOut, n);
     for (;;) {
         int m = 1;
         while (m < window) m <<= 1;
-        const long long stride = kWsHead + kSelEarlyOut + 2 * (long long)m +
-                                 kWsScanWords;
+        // stripe layout = the single-row one MINUS the trailing scan
+        // scratch: the batched family computes row totals in the tail
+        // (never in kWsScanWords), and the scratch sits after the key
+        // buffers, so dropping it moves no offset the kernels touch
+        const long long stride = kWsHead + kSelEarlyOut + 2 * (long long)m;
         const size_t stripes = (size_t)rows * (size_t)stride;
         const size_t words = stripes + batch_tail_words(rows);
         unsigned long long* ws = selection_workspace(words);
         const BatchTail tail = batch_tail(ws, stripes, rows);
         // host-buffer uploads ride the stream; the per-attempt sync
-        // below proves them done before anything can go out of scope
-        if (cudaMemcpyAsync(tail.seeds, seeds, (size_t)rows * 8,
-                            cudaMemcpyHostToDevice, cs) != cudaSuccess ||
-            cudaMemcpyAsync(tail.active, active.data(), (size_t)rows * 4,
-                            cudaMemcpyHostToDevice, cs) != cudaSuccess)
-            throw std::runtime_error("batch args upload failed: " +
-                                     std::string(cudaGetErrorString(
-                                             cudaGetLastError())));
+        // below proves them done before anything can go out of scope.
+        // The message reports the failed copy's own return value -
+        // cudaGetLastError() here could name an unrelated stale error
+        // and clear sticky state as a side effect.
+        const cudaError_t up1 = cudaMemcpyAsync(
+            tail.seeds, seeds, (size_t)rows * 8, cudaMemcpyHostToDevice,
+            cs);
+        const cudaError_t up2 = (up1 == cudaSuccess)
+            ? cudaMemcpyAsync(tail.active, active.data(), (size_t)rows * 4,
+                              cudaMemcpyHostToDevice, cs)
+            : up1;
+        if (up1 != cudaSuccess || up2 != cudaSuccess)
+            throw std::runtime_error(
+                std::string("batch args upload failed: ") +
+                cudaGetErrorString(up1 != cudaSuccess ? up1 : up2));
         batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
             tail.tokens, tail.cumws, tail.totals, tail.active, rows);
         cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
@@ -2760,7 +2790,7 @@ std::vector<long long> sample_nucleus_batched_chunk(
                     tail.seeds, tail.tokens, tail.cumws, tail.active);
             check_launch("batch tail launch");
         }
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("batch sampling failed: ") +
                                      cudaGetErrorString(err));
@@ -2773,76 +2803,64 @@ std::vector<long long> sample_nucleus_batched_chunk(
             // Only ACTIVE rows may update: a window growth between
             // attempts can REALLOCATE the workspace, and the fresh
             // (zeroed) tail must never overwrite a finished row's
-            // token with a stale 0. The host copy is authoritative.
+            // token with a stale 0. The host-side `tokens` vector is
+            // the authoritative merged view.
             if (active[r] && tok[r] >= 0) {
                 tokens[r] = tok[r];
                 active[r] = 0;
-            } else if (!active[r]) {
-                tok[r] = tokens[r];   // keep the merged view truthful
             }
-            if (!active[r]) continue;
-            all = false;
+            if (active[r])
+                all = false;
         }
         if (all)
             return tokens;
         if (window == n)
             throw std::runtime_error("batch sampling nucleus not covered");
-        // widen: per failed row the single-row bound formulas, then the
-        // pow2 max. topp reads this attempt's totals back directly;
-        // minp computes them ONCE here (lazy, host-cached - the total
-        // is retry-invariant) then reuses the cache.
+        // widen: per failed row the single-row bound helpers
+        // (topp_widen_bound / minp_widen_bound), then the pow2 max.
+        // Totals are read back lazily through the SAME host cache for
+        // both modes - the global total is retry-invariant, so the
+        // first widening refreshes it once and later attempts reuse
+        // the cache (topp's DEVICE-side recompute still runs every
+        // attempt; the nucleus threshold needs it).
         if (cudaMemcpy(cum_h.data(), tail.cumws, (size_t)rows * 4,
                        cudaMemcpyDeviceToHost) != cudaSuccess)
             throw std::runtime_error("batch cum readback failed");
-        if (mode == 0) {
-            if (cudaMemcpy(tot_h.data(), tail.totals, (size_t)rows * 4,
-                           cudaMemcpyDeviceToHost) != cudaSuccess)
-                throw std::runtime_error("batch total readback failed");
-            for (int r = 0; r < rows; ++r)
-                if (active[r]) total[r] = (double)tot_h[r];
-        } else {
-            bool missing = false;
-            for (int r = 0; r < rows; ++r)
-                if (active[r] && total[r] < 0.0) missing = true;
-            if (missing) {
+        bool totals_missing = false;
+        for (int r = 0; r < rows; ++r)
+            if (active[r] && total[r] < 0.0) totals_missing = true;
+        if (totals_missing) {
+            if (mode == 1) {
+                // minp never computes totals during its attempts -
+                // produce them now, strictly after the failed one
+                // (same stream, its kWsCumW stores are already
+                // visible through the sync above)
                 expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                     x, ws, stride, n, inv_t, gpr, tail.active);
                 exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                     x, ws, stride, n, inv_t, tail.totals, gpr,
                     tail.active);
                 check_launch("batch mass launch");
-                err = cudaDeviceSynchronize();
+                err = cudaStreamSynchronize(cs);
                 if (err != cudaSuccess)
                     throw std::runtime_error(
                         std::string("batch mass failed: ") +
                         cudaGetErrorString(err));
-                if (cudaMemcpy(tot_h.data(), tail.totals, (size_t)rows * 4,
-                               cudaMemcpyDeviceToHost) != cudaSuccess)
-                    throw std::runtime_error("batch total readback failed");
-                for (int r = 0; r < rows; ++r)
-                    if (active[r]) total[r] = (double)tot_h[r];
             }
+            if (cudaMemcpy(tot_h.data(), tail.totals, (size_t)rows * 4,
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("batch total readback failed");
+            for (int r = 0; r < rows; ++r)
+                if (active[r]) total[r] = (double)tot_h[r];
         }
         long long want = (long long)window * 8;
         for (int r = 0; r < rows; ++r) {
             if (!active[r]) continue;
-            const double c = (double)cum_h[r];
-            const double tt = total[r];
-            long long lb;
-            if (mode == 0) {
-                // widen_window's formula (necessary mass bound)
-                if (c > 0.0 && (double)thr * tt > c)
-                    lb = (long long)std::ceil((double)window * thr * tt /
-                                              c) + 1;
-                else
-                    lb = (long long)std::ceil((double)thr * tt) + 1;
-            } else {
-                // widen_window_minp's formula (sufficient bound)
-                lb = (long long)window + 1;
-                if (tt > 0.0 && tt - c > 0.0)
-                    lb = (long long)std::ceil((tt - c) / (double)thr) +
-                         window + 1;
-            }
+            const long long lb = (mode == 0)
+                ? topp_widen_bound(window, (double)thr, total[r],
+                                   (double)cum_h[r])
+                : minp_widen_bound(window, (double)thr, total[r],
+                                   (double)cum_h[r]);
             want = std::max<long long>(want, lb);
         }
         if (want >= n) {
@@ -2856,7 +2874,11 @@ std::vector<long long> sample_nucleus_batched_chunk(
 }
 
 // per-chunk sequencer for top-k: one attempt, the k-window is covered
-// by construction (same structure as sample_topk_launch)
+// by construction. Same kernel sequence as the nucleus sequencer above
+// plus the k == n parallel-pack fast path the single-row topk launcher
+// lacks; the always-on active bitmap is dead weight here (topk rows
+// never deactivate) and exists only so the kernels stay identical
+// across the two sequencers.
 std::vector<long long> sample_topk_batched_chunk(
     const float* x, int rows, int n, int k, float t,
     const unsigned long long* seeds, std::uintptr_t stream) {
@@ -2865,20 +2887,26 @@ std::vector<long long> sample_topk_batched_chunk(
     const float inv_t = 1.0f / t;
     int m = 1;
     while (m < k) m <<= 1;
-    const long long stride = kWsHead + kSelEarlyOut + 2 * (long long)m +
-                             kWsScanWords;
+    // stripe layout = the nucleus sequencer's (scan scratch dropped;
+    // see the note there)
+    const long long stride = kWsHead + kSelEarlyOut + 2 * (long long)m;
     const size_t stripes = (size_t)rows * (size_t)stride;
     const size_t words = stripes + batch_tail_words(rows);
     unsigned long long* ws = selection_workspace(words);
     const BatchTail tail = batch_tail(ws, stripes, rows);
     std::vector<int> active(rows, 1);
-    if (cudaMemcpyAsync(tail.seeds, seeds, (size_t)rows * 8,
-                        cudaMemcpyHostToDevice, cs) != cudaSuccess ||
-        cudaMemcpyAsync(tail.active, active.data(), (size_t)rows * 4,
-                        cudaMemcpyHostToDevice, cs) != cudaSuccess)
-        throw std::runtime_error("batch args upload failed: " +
-                                 std::string(cudaGetErrorString(
-                                         cudaGetLastError())));
+    // same upload pattern as the nucleus sequencer (actual return
+    // values in the message, not cudaGetLastError)
+    const cudaError_t up1 = cudaMemcpyAsync(
+        tail.seeds, seeds, (size_t)rows * 8, cudaMemcpyHostToDevice, cs);
+    const cudaError_t up2 = (up1 == cudaSuccess)
+        ? cudaMemcpyAsync(tail.active, active.data(), (size_t)rows * 4,
+                          cudaMemcpyHostToDevice, cs)
+        : up1;
+    if (up1 != cudaSuccess || up2 != cudaSuccess)
+        throw std::runtime_error(
+            std::string("batch args upload failed: ") +
+            cudaGetErrorString(up1 != cudaSuccess ? up1 : up2));
     batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
         tail.tokens, tail.cumws, tail.totals, tail.active, rows);
     cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
@@ -2920,7 +2948,7 @@ std::vector<long long> sample_topk_batched_chunk(
         ws, stride, sorted_off, mate_off, k, tail.seeds, tail.tokens,
         tail.active);
     check_launch("batch tail launch");
-    cudaError_t err = cudaDeviceSynchronize();
+    cudaError_t err = cudaStreamSynchronize(cs);
     if (err != cudaSuccess)
         throw std::runtime_error(std::string("batch top-k failed: ") +
                                  cudaGetErrorString(err));
