@@ -285,9 +285,58 @@ def main():
                max(20, iters // 4))
         flat_logits = torch.randn(vocab, device="cuda") * 1e-3
         record("sample_topp flat (worst)", f"[{vocab}]",
-               lambda: fusedtok.sample_topp(flat_logits, TOPP_P),
-               lambda: torch_sample_topp_flat(flat_logits),
-               max(10, iters // 6))
+                lambda: fusedtok.sample_topp(flat_logits, TOPP_P),
+                lambda: torch_sample_topp_flat(flat_logits),
+                max(10, iters // 6))
+
+        # batched samplers (v1.4) at serving scale: one call samples the
+        # whole [8, vocab] batch. The reference is torch's NATIVE batched
+        # draw (softmax + multinomial over the 2-D tensor - no Python
+        # loop anywhere on either side); the same RNG caveat as the
+        # single-row rows applies. The probe-level comparison against
+        # fusedtok's own per-row loop (4-6x on submission-bound hosts)
+        # lives in the README prose, not the table - both table columns
+        # must be library calls.
+        if vocab == 131072:
+            b = 8
+            peaked_b = torch.randn(b, vocab, device="cuda")
+            peaks = peaked_b.argmax(dim=1)
+            peaked_b[torch.arange(b, device="cuda"), peaks] += 20.0
+            flat_b = torch.randn(b, vocab, device="cuda") * 1e-3
+
+            def torch_topp_b(src):
+                return torch.multinomial(torch.softmax(src, -1), 1)
+
+            record("sample_topp b=8 peaked", f"[{b}x{vocab}]",
+                   lambda: fusedtok.sample_topp_batched(peaked_b, TOPP_P),
+                   lambda: torch_topp_b(peaked_b),
+                   max(20, iters // 4))
+
+            def torch_minp_b(src):
+                p = torch.softmax(src, -1)
+                sel = p >= MINP * p.max(dim=1, keepdim=True).values
+                return torch.multinomial(p * sel, 1)
+
+            record("sample_minp b=8 peaked", f"[{b}x{vocab}]",
+                   lambda: fusedtok.sample_minp_batched(peaked_b, MINP),
+                   lambda: torch_minp_b(peaked_b),
+                   max(20, iters // 4))
+
+            def torch_topk_b(src):
+                v, i = torch.topk(src, TOPK_SMALL)
+                return i[torch.arange(b, device="cuda"),
+                         torch.multinomial(torch.softmax(v, -1), 1)]
+
+            record("sample_topk b=8 k=50", f"[{b}x{vocab}]",
+                   lambda: fusedtok.sample_topk_batched(peaked_b,
+                                                        TOPK_SMALL),
+                   lambda: torch_topk_b(peaked_b),
+                   max(20, iters // 4))
+
+            record("sample_topp b=8 flat (worst)", f"[{b}x{vocab}]",
+                   lambda: fusedtok.sample_topp_batched(flat_b, TOPP_P),
+                   lambda: torch_topp_b(flat_b),
+                   max(10, iters // 6))
 
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),

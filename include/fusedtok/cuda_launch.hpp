@@ -94,6 +94,26 @@ long long decode_step_launch(const float* x, const long long* ids,
                              int n, int m, float penalty, float p, float t,
                              unsigned long long seed,
                              std::uintptr_t stream = 0);
+
+// Batched samplers (v1.4): x is [rows, n] row-major, seeds holds one
+// seed per row; returns rows tokens. Each row runs the single-row
+// pipeline verbatim (same arithmetic, same accumulation order - see the
+// exptotal arrival-order ulp note in topk.cu). Like the single-row
+// samplers these synchronize per attempt and are NOT CUDA-graph
+// capturable. rows == 0 returns an empty vector.
+std::vector<long long> sample_topp_batched_launch(
+    const float* x, int rows, int n, float p, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+std::vector<long long> sample_topk_batched_launch(
+    const float* x, int rows, int n, int k, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+std::vector<long long> sample_minp_batched_launch(
+    const float* x, int rows, int n, float min_p, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+
 // INT8 quantization: q = clamp(round(x * (1/scale))), scale = absmax/127
 // (written to scale_out device float). n elements.
 void quantize_int8_launch(const float* x, signed char* q,

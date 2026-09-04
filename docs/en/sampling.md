@@ -1,15 +1,17 @@
 # Sampling and selection
 
 The selection operators (top-k, top-p, argmax) and the fused samplers
-(`sample_topp`, `sample_topk`, `sample_minp`, `decode_step`) share one
-pipeline and one determinism contract. This page explains both, plus
-the exact boundary where CPU and GPU draws may differ.
+(`sample_topp`, `sample_topk`, `sample_minp`, `decode_step`, plus the
+v1.4 `_batched` variants) share one pipeline and one determinism
+contract. This page explains both, plus the exact boundary where CPU
+and GPU draws may differ.
 
 **Other languages:** [中文：采样与选择](../zh/sampling.md)
 
 - [Selection operators](#selection-operators)
 - [The fused samplers](#the-fused-samplers)
 - [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp---threshold-by-max-sampling-v13)
+- [Batched sampling - one call per decode step (v1.4)](#batched-sampling---one-call-per-decode-step-v14)
 - [The same-token guarantee](#the-same-token-guarantee)
 - [Flat distributions - the honest worst case](#flat-distributions---the-honest-worst-case)
 - [How the pipeline works](#how-the-pipeline-works)
@@ -92,7 +94,42 @@ nucleus, draw with the same seeded hash.
   (`exps[0] == 1.0` exactly), so the nucleus is simply the prefix
   cut at the first element below `min_p` - no global-mass reduction
   is needed, and the serial walk inherits the v1.3 checkpoint
-  bisection.
+  bisection. Since v1.4 the widening loop jumps adaptively like
+  top-p: a failed window leaves its cum mass, and together with a
+  one-time global total this yields a bound that always covers the
+  nucleus (`w >= W + (T - C) / min_p`), so wide nuclei skip the x8
+  ladder's intermediate stops (~30% off the wide-nucleus row) with
+  bit-identical tokens.
+
+## Batched sampling - one call per decode step (v1.4)
+
+```python
+tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seed=seeds)
+```
+
+`sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched`
+sample a whole `[rows, vocab]` batch in one call and return one token
+per row (int64; a CPU torch tensor for torch input, a numpy array
+otherwise - the host readback is inherent to the widening loop, so
+these are not CUDA-graph capturable, same contract as the singles).
+
+- `logits` is 2-D, contiguous, float32. `seeds` is one non-negative
+  integer per row; the default (`None`) is `0..rows-1`, so identical
+  rows still draw independently.
+- Every row runs the single-row pipeline **verbatim** - same kernels,
+  same accumulation order, per-row parity including the widening loop
+  (rows finish at their own window sizes; finished rows are skipped
+  while wider-nucleus rows retry).
+- Rows are processed in device-sized chunks (32), so very large
+  batches stream through a bounded workspace.
+- What batching buys: the per-row Python/launch overhead collapses -
+  B=8 wall time is 4-6x the per-row loop on submission-bound hosts
+  (topp 1340 -> 274 µs, minp 1399 -> 237 µs at [8, 131072] on a
+  3060), landing at torch's native batched-multinomial level on
+  peaked logits (`sample_topk_batched` outright wins: 2.33x / 1.25x).
+  The flat worst case keeps the singles' honest caveat (0.05-0.06x).
+- `decode_step` has no batched variant yet (the per-row penalty
+  bitmaps add a dimension; roadmap 1.5).
 
 ## The same-token guarantee
 
@@ -109,7 +146,15 @@ accumulate along the strictly-sequential CDF walk, so CPU and GPU may
 pick tokens a small **rank window** apart (measured ~14 ranks at
 n=152064; ~1 at 32k vocabularies). The GPU result itself is always
 bit-identical per seed, and the window-widening schedule never changes
-the sampled token.
+the sampled token. One related, finer-grained caveat (surfaced by the
+v1.4 batched work, a property of the single-row API since 1.2): the
+global softmax total rides per-block float atomics, whose arrival
+order can differ between processes - a draw landing exactly on a CDF
+boundary may pick a neighboring token across process restarts
+(observed once in ~8 drawn rows at 131k; effectively never). The
+batched samplers use the same pattern per row, so a row may differ
+from its standalone call by the same one-token boundary effect -
+the parity tests pin exact-or-neighbor-rank.
 
 Why not fix it? The strictly-sequential float adds are the determinism
 contract - parallelizing the sum would change every token ever drawn
@@ -122,7 +167,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.17-0.37x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.17-0.25x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its

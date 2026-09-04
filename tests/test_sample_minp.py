@@ -9,6 +9,8 @@ threshold, so in the max-normalized exp column it is a PREFIX (exps[0]
   collapses to argmax; tied maxima stay tied)
 - tiny min_p ~ whole-vocabulary nucleus (the widening ladder + the
   full-vocabulary fast path)
+- wide-nucleus regimes at full vocabulary scale, where the v1.4
+  adaptive jump takes different window schedules than the x8 ladder
 - per-seed determinism, cross-path (CPU / staged / zero-copy) parity
 - mass concentration sanity (the nucleus carries most of the mass)
 - error contract (min_p bounds, temperature, wrong dtype / 2-D input)
@@ -189,6 +191,50 @@ class TestCuda:
         tok = int(fusedtok.sample_minp(dev, 1e-6, seed=5))
         assert 0 <= tok < 131072
         assert tok == int(fusedtok.sample_minp(dev, 1e-6, seed=5))
+
+    def test_wide_nucleus_adaptive_jump_matches_cpu(self):
+        # wide-nucleus regimes at full-vocabulary scale, where the v1.4
+        # adaptive jump takes DIFFERENT window schedules than the plain
+        # x8 ladder (min_p 0.05: one bound-driven hop past the ladder's
+        # mid stop; min_p 0.01: a direct jump to the whole vocabulary).
+        # Tokens are schedule-independent by construction - this pins
+        # that against the CPU reference (__expf boundary drift keeps
+        # the usual rank-window tolerance, generous for a ~70k-wide
+        # nucleus of serially accumulated mass)
+        rng = np.random.default_rng(88)
+        logits = rng.standard_normal(131072).astype(np.float32)
+        probs = _probs(logits)
+        order = np.argsort(-probs, kind="stable")
+        rank = {int(t): i for i, t in enumerate(order)}
+        dev = torch.from_numpy(logits).cuda()
+        for min_p in (0.05, 0.01):
+            for seed in (0, 3, 7):
+                host = fusedtok.sample_minp(logits, min_p, seed=seed)
+                got = int(fusedtok.sample_minp(dev, min_p, seed=seed))
+                assert host in rank and got in rank
+                assert abs(rank[host] - rank[got]) <= 64
+                assert got == int(fusedtok.sample_minp(dev, min_p,
+                                                       seed=seed))
+
+    def test_adaptive_jump_mixed_rows(self):
+        # a heavy spike in half the rows keeps those nuclei inside the
+        # first window while the plain-randn rows widen - one call each
+        # must equal the row sampled alone (schedule + lazy-total paths
+        # interleaved across calls on one stream)
+        rng = np.random.default_rng(89)
+        plain = rng.standard_normal(32768).astype(np.float32)
+        spiky = plain.copy()
+        spiky[11] += 8.0
+        d_plain = torch.from_numpy(plain).cuda()
+        d_spiky = torch.from_numpy(spiky).cuda()
+        for min_p in (0.1, 0.02):
+            for seed in (1, 4):
+                assert int(fusedtok.sample_minp(d_plain, min_p,
+                                                seed=seed)) == \
+                    int(fusedtok.sample_minp(d_plain, min_p, seed=seed))
+                assert int(fusedtok.sample_minp(d_spiky, min_p,
+                                                seed=seed)) == \
+                    fusedtok.sample_minp(spiky, min_p, seed=seed)
 
     def test_error_contract_cuda(self):
         x = torch.ones(8, device="cuda")

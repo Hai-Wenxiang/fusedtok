@@ -88,6 +88,10 @@ event 而不是墙上时钟，并预期 argmax 这类微小算子的数字会摆
   出各片的部分 softmax、再归并。
 - **nucleus（核）**——采样的截断集合：top-p 按"累计概率质量达到
   p"取前缀，min-p 按"概率不低于 min_p × 最大概率"取前缀。
+- **批量采样（batched sampling）**——一次调用采样整个
+  `[行数, 词表]` 批（`_batched` 系列采样器）：每行用自己的种子
+  跑单行管线原样；对比逐行循环的收益来自坍缩的启动/提交开销，
+  数学本身不变。
 - **radix（基数）**——选择管线按 key 的高位字节逐轮分桶的排序
   手法（radix sort 的思想）。
 - **SDPA**——PyTorch 的 `scaled_dot_product_attention`，attention

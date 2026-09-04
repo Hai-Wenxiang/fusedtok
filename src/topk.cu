@@ -1510,6 +1510,41 @@ static int widen_window(int window, int n, float p,
     return std::min(n, mp);
 }
 
+// Adaptive widening jump for min-p (v1.4). The nucleus is a VALUE
+// threshold (every element with exp >= min_p passes), so the top-p mass
+// bound does not transfer directly - but the max-normalized GLOBAL total
+// T (host-cached from a one-time expmax+exptotal pass) closes the gap:
+// on a failed window of W elements with cum mass C, every element past
+// rank W is at most exps[W-1], and every element of the nucleus past
+// rank W is at least min_p, so at most (T - C) / min_p further elements
+// can pass. w >= W + ceil((T - C) / min_p) + 1 therefore ALWAYS covers
+// the nucleus - a sufficient bound (top-p's is merely necessary), tight
+// for wide nuclei: a flat distribution (all exps ~ 1, T ~ n) jumps to
+// (nearly) the full vocabulary in one step. The x8 ladder stays as the
+// floor (small T - C, e.g. a heavy-tailed distribution whose window
+// already carries almost all mass), and the pow2 rounding adds slack
+// against the float drift between the parallel-tree T and the serial-walk
+// C (a hair-miss would only cost one more attempt, never correctness).
+// The sampled token is independent of the jump schedule: the nucleus
+// membership is a property of the full distribution, and the draw
+// renormalizes inside it.
+static int widen_window_minp(int window, int n, float min_p, double total,
+                             const unsigned long long* ws) {
+    unsigned long long cw = 0ULL;
+    if (cudaMemcpy(&cw, ws + kWsCumW, sizeof(cw),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("min-p mass readback failed");
+    const double c = (double)*reinterpret_cast<const float*>(&cw);
+    long long lb = (long long)window + 1;      // floor if T - C <= 0
+    if (total > 0.0 && total - c > 0.0)        // else keep the ladder
+        lb = (long long)std::ceil((total - c) / (double)min_p) + window + 1;
+    const long long want = std::max<long long>((long long)window * 8, lb);
+    if (want >= n) return n;
+    int mp = 1;                       // pow2 headroom over the bound
+    while (mp < want) mp <<= 1;
+    return std::min(n, mp);
+}
+
 // ---------------------------------------------------------------------------
 // fused nucleus sampling: softmax(logits/T) -> nucleus(p) -> inverse-CDF
 // draw from a hash-derived uniform. The token comes back through a
@@ -1880,6 +1915,7 @@ __device__ int walk_until_below(const float* __restrict__ exps, int count,
 __global__ void sample_minp_serial_kernel(
     const unsigned long long* __restrict__ keys,
     const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
     int* __restrict__ token_out,
     int k, int n, float min_p, unsigned long long seed) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
@@ -1889,9 +1925,13 @@ __global__ void sample_minp_serial_kernel(
     int ncp = 0;
     const int edge = walk_until_below(exps, k, min_p, &nucleus_mass, cps,
                                       stride, &ncp);
-    if (edge < 0 && k < n)
-        return;   // every window element passes: nucleus extends past
-                  // the window - the host retries wider (token stays -1)
+    if (edge < 0 && k < n) {
+        // every window element passes: nucleus extends past the window -
+        // the host retries wider (token stays -1). Leave the whole-window
+        // cum mass for the host's next-jump bound (widen_window_minp)
+        *reinterpret_cast<float*>(&ws[kWsCumW]) = nucleus_mass;
+        return;
+    }
     const int nucleus = (edge < 0) ? k : edge;
     // exps[0] == 1.0 >= min_p for a valid min_p, so the nucleus is
     // never empty and nucleus_mass > 0
@@ -1913,11 +1953,13 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
         throw std::invalid_argument("temperature must be > 0");
     cudaStream_t cs = (cudaStream_t)stream;
     // Window strategy: min-p nuclei are typically tiny (a handful of
-    // tokens), so the first 1024-window covers them; flat-tail cases
-    // widen on the plain x8 ladder. A mass bound like top-p's adaptive
-    // jump cannot exist here - the nucleus width is a value-threshold
-    // COUNT, not derivable from the window's mass - so the ladder is
-    // the honest schedule (max 3 retries at 131k vocab).
+    // tokens), so the first 1024-window covers them; wide-nucleus cases
+    // widen adaptively (v1.4): the value threshold alone bounds nothing,
+    // but combined with the one-time GLOBAL total the mass argument of
+    // widen_window_minp gives a sufficient next window. The total is
+    // computed lazily - only after the first failure, cached on the host
+    // (it is invariant across retries: same logits, same temperature).
+    double total = -1.0;
     int window = std::min(kSelEarlyOut, n);
     for (;;) {
         int m = 1;
@@ -1930,8 +1972,7 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
         cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
-        cudaMemcpyAsync(token_out, &token, sizeof(int),
-                        cudaMemcpyHostToDevice, cs);
+        cudaMemcpyAsync(token_out, &token, sizeof(int), cudaMemcpyHostToDevice, cs);
         ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
         const int grid = selection_grid(n);
         const float inv_t = 1.0f / t;
@@ -1958,7 +1999,7 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
         sample_minp_serial_kernel<<<1, 32,
                                     walk_cp_slots(window) * sizeof(float),
                                     cs>>>(
-            sorted, exps, token_out, window, n, min_p, seed);
+            sorted, exps, ws, token_out, window, n, min_p, seed);
         check_launch("minp tail launch");
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess)
@@ -1971,8 +2012,1004 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
             return token;
         if (window == n)
             throw std::runtime_error("min-p nucleus not covered");
-        window = std::min(n, window * 8);
+        if (total < 0.0) {
+            // one-time global max + total for the adaptive bound. The
+            // head memset of THIS attempt zeroed both slots; the kernels
+            // run here on the same stream, strictly after the failed
+            // attempt (its kWsCumW store is already visible - the sync
+            // above ordered it) and before the readback below.
+            expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                      kNoPen);
+            exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                        kNoPen);
+            check_launch("minp mass launch");
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess)
+                throw std::runtime_error(std::string("min-p mass failed: ") +
+                                         cudaGetErrorString(err));
+            unsigned long long tw = 0ULL;
+            if (cudaMemcpy(&tw, ws + kWsTotal, sizeof(tw),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("min-p total readback failed");
+            total = (double)*reinterpret_cast<const float*>(&tw);
+        }
+        window = widen_window_minp(window, n, min_p, total, ws);
     }
+}
+
+// ---------------------------------------------------------------------------
+// batched sampling (v1.4): sample_topp/minp/topk_batched - [rows, n]
+// logits in, one token per row out.
+//
+// Design: the per-row pipeline IS the single-row pipeline. Every kernel
+// below is the single-row body with three mechanical changes (keep in
+// sync with the originals when they change):
+//   1. blocks decompose as blockIdx.x = row * gpr + local, where gpr is
+//      exactly the single-row grid size - a row's blocks see the same
+//      launch shape a standalone call would;
+//   2. the row's state is a stride-word stripe with the SAME layout as
+//      the single-row workspace (head + candidates + paired key
+//      buffers + scan scratch), so every intra-row offset is untouched;
+//   3. the per-row scalars the HOST widens on (token / cum mass /
+//      total) live in compact tail arrays after the stripes - one small
+//      readback per attempt instead of B strided 4/8-byte copies (the
+//      per-copy cost dominates at B > 4 on submission-bound hosts).
+// The widening loop keeps ONE uniform window for the still-active rows
+// (a row that already sampled is skipped through an active-row bitmap
+// and costs only the early-return branch); the next window is the max
+// over the failed rows' bounds (the single-row widen_window /
+// widen_window_minp formulas evaluated per row), pow2-rounded. A row's
+// token is independent of the schedule - the same invariant the
+// single-row samplers are built on.
+//
+// Numerics: identical arithmetic and accumulation order per row, with
+// one documented ulp caveat - exptotal_b accumulates each row's total
+// with the same per-block atomicAdd pattern, and a row's block arrival
+// order under the batched grid may differ from a standalone launch, so
+// a row's total can drift ~1 ulp (same class as the CPU-exact-exp vs
+// GPU-__expf boundary; the parity tests pin the usual rank window).
+//
+// Rows are processed in chunks of kBMaxBatch so the persistent
+// workspace stays bounded (32 stripes of a full-vocabulary window are
+// ~67 MB). The launcher synchronizes every attempt (inherent host
+// readback), so like the single-row samplers it is NOT CUDA-graph
+// capturable.
+// ---------------------------------------------------------------------------
+
+// rows per chunk (workspace bound; see the section note)
+namespace {
+constexpr int kBMaxBatch = 32;
+
+// compact per-row scalar tail after the B stripes. Word layout:
+// seeds [0, B) | tokens [B, 2B) | cumws [2B, 2B+C) | totals
+// [2B+C, 2B+2C) | active [2B+2C, 2B+3C), C = ceil(B / 2) - the float
+// pairs share words, the int bitmap follows them.
+struct BatchTail {
+    unsigned long long* seeds;   // B u64
+    long long* tokens;           // B i64, -1 = not yet sampled
+    float* cumws;                // B f32, uncovered-window cum mass
+    float* totals;               // B f32, max-normalized global total
+    int* active;                 // B i32, 1 = row still needs a token
+};
+
+inline size_t batch_tail_words(int rows) {
+    const size_t pairs = (size_t)((rows + 1) / 2);
+    return 2 * (size_t)rows + 3 * pairs;
+}
+
+inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
+                            int rows) {
+    const size_t pairs = (size_t)((rows + 1) / 2);
+    BatchTail t;
+    t.seeds = ws + stripes;
+    t.tokens = reinterpret_cast<long long*>(ws + stripes + rows);
+    t.cumws = reinterpret_cast<float*>(ws + stripes + 2 * (size_t)rows);
+    t.totals = t.cumws + rows;
+    t.active = reinterpret_cast<int*>(ws + stripes + 2 * (size_t)rows +
+                                     2 * pairs);
+    return t;
+}
+
+// per-attempt scalar reset for the ACTIVE rows: tokens preset to the
+// single-row -1 sentinel; cum/totals zeroed so exptotal_b's atomicAdd
+// and the tail readbacks start from scratch. Inactive rows keep their
+// sampled tokens - the host copies them out once at the end.
+__global__ void batch_preset_kernel(long long* __restrict__ tokens,
+                                    float* __restrict__ cumws,
+                                    float* __restrict__ totals,
+                                    const int* __restrict__ active,
+                                    int rows) {
+    for (int r = threadIdx.x; r < rows; r += blockDim.x)
+        if (active[r]) {
+            tokens[r] = -1LL;
+            cumws[r] = 0.0f;
+            totals[r] = 0.0f;
+        }
+}
+
+// select_round_kernel with the row decomposition (see the section note;
+// penalty context intentionally absent - decode_step stays single-row)
+__global__ void select_round_b_kernel(
+    const float* __restrict__ x, unsigned long long* __restrict__ ws,
+    long long stride, int n, int level, unsigned long long remaining0,
+    float inv_t, int gpr, const int* __restrict__ active) {
+    const int row = blockIdx.x / gpr;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gpr;
+    const float* __restrict__ x_row = x + (size_t)row * n;
+    unsigned long long* __restrict__ ws_row = ws + (size_t)row * stride;
+    __shared__ unsigned long long sh_hist[256];
+    __shared__ int sh_ticket;
+
+    const unsigned long long stage = ws_row[kWsStage];
+    if (stage != 0ULL) return;
+    if (level < 0) return;
+
+    unsigned long long* hist = ws_row;
+    unsigned long long* ticket = ws_row + kWsTicket;
+
+    const unsigned long long prefix = ws_row[kWsPrefix];
+    const unsigned long long remaining =
+        (level == 7) ? remaining0 : ws_row[kWsRemaining];
+    const unsigned long long topmask =
+        (level == 7) ? 0ULL : ~((1ULL << (8 * (level + 1))) - 1ULL);
+    for (int b = threadIdx.x; b < 256; b += kSelBlock) sh_hist[b] = 0ULL;
+    __syncthreads();
+    for (int i = lid * blockDim.x + threadIdx.x; i < n;
+         i += gpr * blockDim.x) {
+        const unsigned long long key =
+            pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+        if ((key & topmask) != prefix) continue;
+        const int bin = (int)((key >> (8 * level)) & 0xFF);
+        const unsigned grp = __match_any_sync(__activemask(), bin);
+        if (__ffs(grp) - 1 == (int)(threadIdx.x & 31))
+            atomicAdd(&sh_hist[bin], (unsigned long long)__popc(grp));
+    }
+    __syncthreads();
+    for (int b = threadIdx.x; b < 256; b += kSelBlock)
+        if (sh_hist[b]) atomicAdd(&hist[b], sh_hist[b]);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        sh_ticket = (int)atomicAdd(ticket, 1ULL);
+    }
+    __syncthreads();
+    if (sh_ticket != gpr - 1) return;
+    __threadfence();
+
+    const volatile unsigned long long* vhist =
+        (const volatile unsigned long long*)hist;
+    for (int b = threadIdx.x; b < 256; b += kSelBlock)
+        sh_hist[b] = vhist[b];
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        unsigned long long acc = 0;
+        for (int b = 255; b >= 0; --b) {
+            const unsigned long long c = sh_hist[b];
+            if (acc + c >= remaining) {
+                ws_row[kWsPrefix] =
+                    prefix | ((unsigned long long)b << (8 * level));
+                ws_row[kWsRemaining] = remaining - acc;
+                ws_row[kWsLevelDone] = (unsigned long long)level;
+                if (c <= (unsigned long long)kSelEarlyOut)
+                    ws_row[kWsStage] = 1ULL;
+                break;
+            }
+            acc += c;
+        }
+    }
+    for (int b = threadIdx.x; b < 256; b += kSelBlock) hist[b] = 0ULL;
+    if (threadIdx.x == 0) *ticket = 0ULL;
+}
+
+// select_finalize_kernel with the row decomposition
+__global__ void select_finalize_b_kernel(
+    const float* __restrict__ x, unsigned long long* __restrict__ ws,
+    long long stride, int n, float inv_t, int gpr,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x / gpr;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gpr;
+    const float* __restrict__ x_row = x + (size_t)row * n;
+    unsigned long long* __restrict__ ws_row = ws + (size_t)row * stride;
+    __shared__ int sh_ticket;
+    const unsigned long long stage = ws_row[kWsStage];
+    if (stage == 2ULL) return;
+    if (stage == 0ULL) {
+        if (threadIdx.x == 0 && lid == 0) ws_row[kWsStage] = 2ULL;
+        return;
+    }
+
+    unsigned long long* ticket = ws_row + kWsTicket;
+    const unsigned long long prefix = ws_row[kWsPrefix];
+    const int level_done = (int)ws_row[kWsLevelDone];
+    const unsigned long long mask =
+        ~((1ULL << (8 * level_done)) - 1ULL);
+    unsigned long long* cand = ws_row + kWsCand;
+    unsigned long long* cand_cnt = ws_row + kWsCandCnt;
+    for (int i = lid * blockDim.x + threadIdx.x; i < n;
+         i += gpr * blockDim.x) {
+        const unsigned long long key =
+            pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+        if ((key & mask) == prefix) {
+            const unsigned long long pos = atomicAdd(cand_cnt, 1ULL);
+            if (pos < (unsigned long long)kSelEarlyOut) cand[pos] = key;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        sh_ticket = (int)atomicAdd(ticket, 1ULL);
+    }
+    __syncthreads();
+    if (sh_ticket != gpr - 1) return;
+    __threadfence();
+
+    int cnt = (int)(
+        *(const volatile unsigned long long*)&ws_row[kWsCandCnt]);
+    if (cnt > kSelEarlyOut) cnt = kSelEarlyOut;
+    const unsigned long long remaining = ws_row[kWsRemaining];
+    __shared__ unsigned long long sk[kSelEarlyOut];
+    int len = 1;
+    while (len < cnt) len <<= 1;
+    const volatile unsigned long long* vcand =
+        (const volatile unsigned long long*)cand;
+    for (int i = threadIdx.x; i < len; i += blockDim.x)
+        sk[i] = (i < cnt) ? vcand[i] : 0ULL;
+    __syncthreads();
+    bitonic_desc_shared(sk, len);
+    ws_row[kWsPrefix] = sk[remaining - 1];
+    ws_row[kWsRemaining] = 1ULL;
+    ws_row[kWsStage] = 2ULL;
+    *ticket = 0ULL;
+}
+
+// emit_selected with the row decomposition (block-local index and
+// row-relative grid; the two-level counting, k == n pack and tie slots
+// are the single-row logic verbatim)
+__device__ __forceinline__ void emit_selected_b(
+    const float* __restrict__ x_row,
+    unsigned long long* __restrict__ ws_row,
+    int n, int k, float inv_t, int lid, int gpr) {
+    const unsigned long long k_min = ws_row[kWsPrefix];
+    const unsigned long long tie_take = ws_row[kWsRemaining];
+    unsigned long long* keys = ws_row + kWsKeys;
+    unsigned long long* emit_cnt = ws_row + kWsEmit;
+    unsigned long long* tie_cnt = ws_row + kWsTie;
+
+    if (k == n) {
+        for (int i = lid * blockDim.x + threadIdx.x; i < n;
+             i += gpr * blockDim.x)
+            keys[i] = pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+        return;
+    }
+
+    __shared__ unsigned long long sh_keys[kSelBlock];
+    __shared__ unsigned long long sh_cnt;
+    __shared__ unsigned long long sh_base;
+    if (threadIdx.x == 0) sh_cnt = 0ULL;
+    __syncthreads();
+    for (int base = lid * blockDim.x; base < n; base += gpr * blockDim.x) {
+        const int i = base + threadIdx.x;
+        if (i < n) {
+            const unsigned long long key =
+                pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+            if (key > k_min) {
+                const unsigned long long pos = atomicAdd(&sh_cnt, 1ULL);
+                if (pos < (unsigned long long)kSelBlock) sh_keys[pos] = key;
+            } else if (key == k_min && tie_take > 0) {
+                const unsigned long long pos = atomicAdd(tie_cnt, 1ULL);
+                if (pos < tie_take) keys[k - tie_take + pos] = key;
+            }
+        }
+        __syncthreads();
+        const unsigned long long cnt = sh_cnt;
+        if (cnt > 0ULL) {
+            if (threadIdx.x == 0) {
+                __threadfence();
+                sh_base = atomicAdd(emit_cnt, cnt);
+            }
+            __syncthreads();
+            const unsigned long long out = sh_base + threadIdx.x;
+            if (threadIdx.x < cnt && out < (unsigned long long)k)
+                keys[out] = sh_keys[threadIdx.x];
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) sh_cnt = 0ULL;
+        __syncthreads();
+    }
+}
+
+// emit_finish_kernel's sampling tail (nucleus mode, k <= kSelEarlyOut
+// first window) with the row decomposition: the last block of EACH row
+// sorts that row's keys in shared memory and runs the serial sample
+// scan. An uncovered window leaves the sentinel and stores the cum
+// mass for the host's widening bound.
+__global__ void emit_finish_b_kernel(
+    const float* __restrict__ x, unsigned long long* __restrict__ ws,
+    long long stride, int n, int k, float inv_t, float p,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const float* __restrict__ totals, int gpr,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x / gpr;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gpr;
+    const float* __restrict__ x_row = x + (size_t)row * n;
+    unsigned long long* __restrict__ ws_row = ws + (size_t)row * stride;
+    __shared__ int sh_ticket;
+    emit_selected_b(x_row, ws_row, n, k, inv_t, lid, gpr);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        sh_ticket = (int)atomicAdd(ws_row + kWsTicket, 1ULL);
+    }
+    __syncthreads();
+    if (sh_ticket != gpr - 1) return;
+    __threadfence();
+
+    __shared__ unsigned long long sk[kSelEarlyOut];
+    const volatile unsigned long long* vkeys =
+        (const volatile unsigned long long*)(ws_row + kWsKeys);
+    int len = 1;
+    while (len < k) len <<= 1;
+    for (int i = threadIdx.x; i < len; i += blockDim.x)
+        sk[i] = (i < k) ? vkeys[i] : 0ULL;
+    __syncthreads();
+    bitonic_desc_shared(sk, len);
+
+    if (threadIdx.x != 0) return;
+    const float row_max = unfkey((unsigned)(sk[0] >> 32));
+    const float total = totals[row];
+    float cum = 0.0f;
+    int nucleus = 0;
+    float nucleus_mass = 0.0f;
+    bool covered = false;
+    for (int i = 0; i < k; ++i) {
+        cum += __expf(unfkey((unsigned)(sk[i] >> 32)) - row_max);
+        nucleus = i + 1;
+        if (cum >= p * total) { nucleus_mass = cum; covered = true; break; }
+    }
+    if (!covered) {
+        if (k < n) {
+            cumws[row] = cum;
+            return;
+        }
+        nucleus = k;
+        nucleus_mass = cum;
+    }
+    const float u = splitmix_uniform_device(seeds[row]);
+    const float target = u * nucleus_mass;
+    cum = 0.0f;
+    for (int i = 0; i < nucleus; ++i) {
+        cum += __expf(unfkey((unsigned)(sk[i] >> 32)) - row_max);
+        if (cum >= target) {
+            tokens[row] = (long long)(0xFFFFFFFFu -
+                                      (unsigned)(sk[i] & 0xFFFFFFFFu));
+            break;
+        }
+    }
+}
+
+// emit_kernel with the row decomposition
+__global__ void emit_b_kernel(const float* __restrict__ x,
+                              unsigned long long* __restrict__ ws,
+                              long long stride, int n, int k, float inv_t,
+                              int gpr, const int* __restrict__ active) {
+    const int row = blockIdx.x / gpr;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gpr;
+    emit_selected_b(x + (size_t)row * n, ws + (size_t)row * stride, n, k,
+                    inv_t, lid, gpr);
+}
+
+// chunk_sort_kernel row-decomposed: one grid-stride space over
+// rows * chunks (the chunk grid of ONE row)
+__global__ void chunk_sort_b_kernel(unsigned long long* __restrict__ ws,
+                                    long long stride, int k, int m, int rows,
+                                    const int* __restrict__ active) {
+    __shared__ unsigned long long sk[kSelSortChunk];
+    const int chunks = (m + kSelSortChunk - 1) / kSelSortChunk;
+    for (int cg = blockIdx.x; cg < rows * chunks; cg += gridDim.x) {
+        const int row = cg / chunks;
+        if (!active[row]) continue;
+        const int chunk = cg % chunks;
+        unsigned long long* keys = ws + (size_t)row * stride + kWsKeys;
+        const int base = chunk * kSelSortChunk;
+        const int len = min(kSelSortChunk, m - base);
+        for (int i = threadIdx.x; i < len; i += blockDim.x)
+            sk[i] = (base + i < k) ? keys[base + i] : 0ULL;
+        __syncthreads();
+        bitonic_desc_shared(sk, len);
+        for (int i = threadIdx.x; i < len; i += blockDim.x)
+            keys[base + i] = sk[i];
+        __syncthreads();
+    }
+}
+
+// merge_level_kernel row-decomposed: src/dst are the two key-buffer
+// bases (offset kWsKeys and kWsKeys + m); tiles decompose over
+// rows * ntiles with row-relative strides
+__global__ void merge_level_b_kernel(
+    const unsigned long long* __restrict__ src,
+    unsigned long long* __restrict__ dst, long long stride, int m, int run,
+    int rows, const int* __restrict__ active) {
+    __shared__ unsigned long long sA[kSelMergeTile];
+    __shared__ unsigned long long sB[kSelMergeTile];
+    const long long ntiles = m / kSelMergeTile;
+    for (long long t = blockIdx.x; t < (long long)rows * ntiles;
+         t += gridDim.x) {
+        const int row = (int)(t / ntiles);
+        if (!active[row]) continue;
+        const long long tile = t % ntiles;
+        const unsigned long long* s = src + (size_t)row * stride;
+        unsigned long long* d = dst + (size_t)row * stride;
+        const long long p0 = tile * kSelMergeTile;
+        const long long pair = p0 / (2 * run);
+        const long long lo0 = p0 - pair * 2 * run;
+        const long long a_base = pair * 2 * run;
+        const long long b_base = a_base + run;
+        long long l = lo0 > run ? lo0 - run : 0;
+        long long h = lo0 < run ? lo0 : run;
+        while (l < h) {
+            const long long mid = (l + h + 1) >> 1;
+            const bool pred =
+                mid == 0 || s[a_base + mid - 1] > s[b_base + lo0 - mid];
+            if (pred) l = mid; else h = mid - 1;
+        }
+        const long long i0 = l, j0 = lo0 - i0;
+        for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
+            sA[u] = (i0 + u < run) ? s[a_base + i0 + u] : 0ULL;
+            sB[u] = (j0 + u < run) ? s[b_base + j0 + u] : 0ULL;
+        }
+        __syncthreads();
+        for (int u = threadIdx.x; u < kSelMergeTile; u += kSelBlock) {
+            long long l2 = 0;
+            long long h2 = u < kSelMergeTile ? u : kSelMergeTile;
+            while (l2 < h2) {
+                const long long mid = (l2 + h2 + 1) >> 1;
+                const bool pred = mid == 0 || sA[mid - 1] > sB[u - mid];
+                if (pred) l2 = mid; else h2 = mid - 1;
+            }
+            const long long i = l2, j = u - i;
+            const bool take_a =
+                (i < kSelMergeTile) &&
+                (j >= kSelMergeTile || sA[i] > sB[j]);
+            d[p0 + u] = take_a ? sA[i] : sB[j];
+        }
+        __syncthreads();
+    }
+}
+
+// exp_window_kernel row-decomposed (keys/exps are WORD pointers; exps
+// casts per row - the stride is in u64 words)
+__global__ void exp_window_b_kernel(
+    const unsigned long long* __restrict__ keys_base,
+    unsigned long long* __restrict__ exps_base, long long stride, int k,
+    int gw, const int* __restrict__ active) {
+    const int row = blockIdx.x / gw;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gw;
+    const unsigned long long* keys = keys_base + (size_t)row * stride;
+    float* exps = reinterpret_cast<float*>(
+        exps_base + (size_t)row * stride);
+    const float row_max = unfkey((unsigned)(keys[0] >> 32));
+    for (int i = lid * blockDim.x + threadIdx.x; i < k;
+         i += gw * blockDim.x)
+        exps[i] = __expf(unfkey((unsigned)(keys[i] >> 32)) - row_max);
+}
+
+// expmax/exptotal row-decomposed (the max lives in the row stripe's
+// kWsExpMax slot - zeroed by the per-attempt stripe memset; the total
+// accumulates into the compact tail array, zeroed by batch_preset)
+__global__ void expmax_b_kernel(const float* __restrict__ x,
+                                unsigned long long* __restrict__ ws,
+                                long long stride, int n, float inv_t,
+                                int gpr, const int* __restrict__ active) {
+    const int row = blockIdx.x / gpr;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gpr;
+    const float* x_row = x + (size_t)row * n;
+    unsigned long long* ws_row = ws + (size_t)row * stride;
+    __shared__ unsigned int warp_best[kSelWarps];
+    unsigned int best = 0u;
+    for (int i = lid * blockDim.x + threadIdx.x; i < n;
+         i += gpr * blockDim.x) {
+        const unsigned int fk = fkey(step_logit(x_row, i, inv_t, kNoPen));
+        if (fk > best) best = fk;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        best = max(best, __shfl_down_sync(0xffffffffu, best, off));
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_best[warp] = best;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned int b = warp_best[0];
+        #pragma unroll
+        for (int w = 1; w < kSelWarps; ++w) b = max(b, warp_best[w]);
+        atomicMax(&ws_row[kWsExpMax], (unsigned long long)b);
+    }
+}
+
+__global__ void exptotal_b_kernel(const float* __restrict__ x,
+                                  unsigned long long* __restrict__ ws,
+                                  long long stride, int n, float inv_t,
+                                  float* __restrict__ totals, int gpr,
+                                  const int* __restrict__ active) {
+    const int row = blockIdx.x / gpr;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gpr;
+    const float* x_row = x + (size_t)row * n;
+    unsigned long long* ws_row = ws + (size_t)row * stride;
+    const float row_max = unfkey((unsigned)ws_row[kWsExpMax]);
+    float s = 0.0f;
+    for (int i = lid * blockDim.x + threadIdx.x; i < n;
+         i += gpr * blockDim.x)
+        s += __expf(step_logit(x_row, i, inv_t, kNoPen) - row_max);
+    __shared__ float warp_sum[kSelWarps];
+    s = warp_reduce_sum(s);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sum[warp] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < kSelWarps; ++w) t += warp_sum[w];
+        atomicAdd(&totals[row], t);
+    }
+}
+
+// sample_serial_kernel row-decomposed: one block per row, thread 0 of
+// the block walks that row (keys_off/exps_off select the sorted side of
+// the key pair and its mate - uniform across rows for a uniform m)
+__global__ void sample_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int n, float p,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const float* __restrict__ totals, const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+    extern __shared__ float cps[];
+    const int cps_stride = walk_cp_stride(k);
+    const float total = totals[row];
+    float cum = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_cp(exps, k, p * total, &cum, cps,
+                                   cps_stride, &ncp);
+    if (edge < 0 && k < n) {
+        cumws[row] = cum;
+        return;
+    }
+    const int nucleus = (edge < 0) ? k : edge + 1;
+    const float nucleus_mass = cum;
+    const float u = splitmix_uniform_device(seeds[row]);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
+                                 cps_stride);
+    if (hit >= 0)
+        tokens[row] = (long long)(0xFFFFFFFFu -
+                                  (unsigned)(keys[hit] & 0xFFFFFFFFu));
+}
+
+// sample_minp_serial_kernel row-decomposed (value-threshold walk; on
+// an uncovered window leaves the sentinel and the whole-window cum
+// mass for widen_window_minp's host-side bound)
+__global__ void sample_minp_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int n, float min_p,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+    extern __shared__ float cps[];
+    const int cps_stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, min_p, &nucleus_mass, cps,
+                                      cps_stride, &ncp);
+    if (edge < 0 && k < n) {
+        cumws[row] = nucleus_mass;
+        return;
+    }
+    const int nucleus = (edge < 0) ? k : edge;
+    const float u = splitmix_uniform_device(seeds[row]);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
+                                 cps_stride);
+    if (hit >= 0)
+        tokens[row] = (long long)(0xFFFFFFFFu -
+                                  (unsigned)(keys[hit] & 0xFFFFFFFFu));
+}
+
+// sample_topk_serial_kernel row-decomposed (the k-window is covered by
+// construction - no threshold, no widening)
+__global__ void sample_topk_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+    extern __shared__ float cps[];
+    const int cps_stride = walk_cp_stride(k);
+    float window_mass = 0.0f;
+    int ncp = 0;
+    walk_until_cp(exps, k, INFINITY, &window_mass, cps, cps_stride, &ncp);
+    const float u = splitmix_uniform_device(seeds[row]);
+    const float target = u * window_mass;
+    const int hit = walk_from_cp(exps, k, target, cps, ncp, cps_stride);
+    const int idx = (hit >= 0) ? hit : k - 1;
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// per-chunk attempt sequencer for the nucleus samplers (topp = mode 0,
+// minp = mode 1). Drives the shared kernel sequence above through the
+// uniform-window widening loop described in the section note.
+std::vector<long long> sample_nucleus_batched_chunk(
+    const float* x, int rows, int n, float thr, float t, int mode,
+    const unsigned long long* seeds, std::uintptr_t stream) {
+    cudaStream_t cs = (cudaStream_t)stream;
+    const int gpr = selection_grid(n);
+    const float inv_t = 1.0f / t;
+    std::vector<long long> tokens(rows, -1);
+    std::vector<int> active(rows, 1);
+    std::vector<double> total(rows, -1.0);   // host cache (minp lazy)
+    std::vector<float> cum_h(rows, 0.0f), tot_h(rows, 0.0f);
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;
+        const long long stride = kWsHead + kSelEarlyOut + 2 * (long long)m +
+                                 kWsScanWords;
+        const size_t stripes = (size_t)rows * (size_t)stride;
+        const size_t words = stripes + batch_tail_words(rows);
+        unsigned long long* ws = selection_workspace(words);
+        const BatchTail tail = batch_tail(ws, stripes, rows);
+        // host-buffer uploads ride the stream; the per-attempt sync
+        // below proves them done before anything can go out of scope
+        if (cudaMemcpyAsync(tail.seeds, seeds, (size_t)rows * 8,
+                            cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+            cudaMemcpyAsync(tail.active, active.data(), (size_t)rows * 4,
+                            cudaMemcpyHostToDevice, cs) != cudaSuccess)
+            throw std::runtime_error("batch args upload failed: " +
+                                     std::string(cudaGetErrorString(
+                                             cudaGetLastError())));
+        batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
+            tail.tokens, tail.cumws, tail.totals, tail.active, rows);
+        cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
+        const int grid = rows * gpr;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    x, ws, stride, n, level, (unsigned long long)window,
+                    inv_t, gpr, tail.active);
+            select_finalize_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, inv_t, gpr, tail.active);
+            check_launch("batch selection launch");
+        }
+        if (mode == 0) {
+            expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, inv_t, gpr, tail.active);
+            exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, inv_t, tail.totals, gpr, tail.active);
+            check_launch("batch mass launch");
+        }
+        if (mode == 0 && !full && window <= kSelEarlyOut) {
+            emit_finish_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, window, inv_t, thr, tail.seeds,
+                tail.tokens, tail.cumws, tail.totals, gpr, tail.active);
+            check_launch("batch emit+finish launch");
+        } else {
+            emit_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, window, inv_t, gpr, tail.active);
+            const int chunks = (m + kSelSortChunk - 1) / kSelSortChunk;
+            const int gsort = (int)std::max<long long>(
+                1LL, std::min<long long>((long long)rows * chunks,
+                                         4 * kMaxGrid));
+            chunk_sort_b_kernel<<<gsort, kSelBlock, 0, cs>>>(
+                ws, stride, window, m, rows, tail.active);
+            int cur = 0;
+            for (int run = kSelSortChunk; run < m; run <<= 1) {
+                const long long ntiles = m / kSelMergeTile;
+                const int gmerge = (int)std::max<long long>(
+                    1LL, std::min<long long>((long long)rows * ntiles,
+                                             4 * kMaxGrid));
+                merge_level_b_kernel<<<gmerge, kSelBlock, 0, cs>>>(
+                    ws + kWsKeys + (cur ? m : 0),
+                    ws + kWsKeys + (cur ? 0 : m), stride, m, run, rows,
+                    tail.active);
+                cur ^= 1;
+            }
+            const int sorted_off = kWsKeys + (cur ? m : 0);
+            const int mate_off = kWsKeys + (cur ? 0 : m);
+            const int gw = selection_grid(window);
+            exp_window_b_kernel<<<rows * gw, kSelBlock, 0, cs>>>(
+                ws + sorted_off, ws + mate_off, stride, window, gw,
+                tail.active);
+            if (mode == 0)
+                sample_serial_b_kernel<<<rows, 32,
+                                         walk_cp_slots(window) *
+                                             sizeof(float),
+                                         cs>>>(
+                    ws, stride, sorted_off, mate_off, window, n, thr,
+                    tail.seeds, tail.tokens, tail.cumws, tail.totals,
+                    tail.active);
+            else
+                sample_minp_serial_b_kernel<<<rows, 32,
+                                              walk_cp_slots(window) *
+                                                  sizeof(float),
+                                              cs>>>(
+                    ws, stride, sorted_off, mate_off, window, n, thr,
+                    tail.seeds, tail.tokens, tail.cumws, tail.active);
+            check_launch("batch tail launch");
+        }
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("batch sampling failed: ") +
+                                     cudaGetErrorString(err));
+        std::vector<long long> tok(rows);
+        if (cudaMemcpy(tok.data(), tail.tokens, (size_t)rows * 8,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("batch token readback failed");
+        bool all = true;
+        for (int r = 0; r < rows; ++r) {
+            // Only ACTIVE rows may update: a window growth between
+            // attempts can REALLOCATE the workspace, and the fresh
+            // (zeroed) tail must never overwrite a finished row's
+            // token with a stale 0. The host copy is authoritative.
+            if (active[r] && tok[r] >= 0) {
+                tokens[r] = tok[r];
+                active[r] = 0;
+            } else if (!active[r]) {
+                tok[r] = tokens[r];   // keep the merged view truthful
+            }
+            if (!active[r]) continue;
+            all = false;
+        }
+        if (all)
+            return tokens;
+        if (window == n)
+            throw std::runtime_error("batch sampling nucleus not covered");
+        // widen: per failed row the single-row bound formulas, then the
+        // pow2 max. topp reads this attempt's totals back directly;
+        // minp computes them ONCE here (lazy, host-cached - the total
+        // is retry-invariant) then reuses the cache.
+        if (cudaMemcpy(cum_h.data(), tail.cumws, (size_t)rows * 4,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("batch cum readback failed");
+        if (mode == 0) {
+            if (cudaMemcpy(tot_h.data(), tail.totals, (size_t)rows * 4,
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("batch total readback failed");
+            for (int r = 0; r < rows; ++r)
+                if (active[r]) total[r] = (double)tot_h[r];
+        } else {
+            bool missing = false;
+            for (int r = 0; r < rows; ++r)
+                if (active[r] && total[r] < 0.0) missing = true;
+            if (missing) {
+                expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    x, ws, stride, n, inv_t, gpr, tail.active);
+                exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    x, ws, stride, n, inv_t, tail.totals, gpr,
+                    tail.active);
+                check_launch("batch mass launch");
+                err = cudaDeviceSynchronize();
+                if (err != cudaSuccess)
+                    throw std::runtime_error(
+                        std::string("batch mass failed: ") +
+                        cudaGetErrorString(err));
+                if (cudaMemcpy(tot_h.data(), tail.totals, (size_t)rows * 4,
+                               cudaMemcpyDeviceToHost) != cudaSuccess)
+                    throw std::runtime_error("batch total readback failed");
+                for (int r = 0; r < rows; ++r)
+                    if (active[r]) total[r] = (double)tot_h[r];
+            }
+        }
+        long long want = (long long)window * 8;
+        for (int r = 0; r < rows; ++r) {
+            if (!active[r]) continue;
+            const double c = (double)cum_h[r];
+            const double tt = total[r];
+            long long lb;
+            if (mode == 0) {
+                // widen_window's formula (necessary mass bound)
+                if (c > 0.0 && (double)thr * tt > c)
+                    lb = (long long)std::ceil((double)window * thr * tt /
+                                              c) + 1;
+                else
+                    lb = (long long)std::ceil((double)thr * tt) + 1;
+            } else {
+                // widen_window_minp's formula (sufficient bound)
+                lb = (long long)window + 1;
+                if (tt > 0.0 && tt - c > 0.0)
+                    lb = (long long)std::ceil((tt - c) / (double)thr) +
+                         window + 1;
+            }
+            want = std::max<long long>(want, lb);
+        }
+        if (want >= n) {
+            window = n;
+        } else {
+            int mp = 1;
+            while (mp < want) mp <<= 1;
+            window = std::min(n, mp);
+        }
+    }
+}
+
+// per-chunk sequencer for top-k: one attempt, the k-window is covered
+// by construction (same structure as sample_topk_launch)
+std::vector<long long> sample_topk_batched_chunk(
+    const float* x, int rows, int n, int k, float t,
+    const unsigned long long* seeds, std::uintptr_t stream) {
+    cudaStream_t cs = (cudaStream_t)stream;
+    const int gpr = selection_grid(n);
+    const float inv_t = 1.0f / t;
+    int m = 1;
+    while (m < k) m <<= 1;
+    const long long stride = kWsHead + kSelEarlyOut + 2 * (long long)m +
+                             kWsScanWords;
+    const size_t stripes = (size_t)rows * (size_t)stride;
+    const size_t words = stripes + batch_tail_words(rows);
+    unsigned long long* ws = selection_workspace(words);
+    const BatchTail tail = batch_tail(ws, stripes, rows);
+    std::vector<int> active(rows, 1);
+    if (cudaMemcpyAsync(tail.seeds, seeds, (size_t)rows * 8,
+                        cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+        cudaMemcpyAsync(tail.active, active.data(), (size_t)rows * 4,
+                        cudaMemcpyHostToDevice, cs) != cudaSuccess)
+        throw std::runtime_error("batch args upload failed: " +
+                                 std::string(cudaGetErrorString(
+                                         cudaGetLastError())));
+    batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
+        tail.tokens, tail.cumws, tail.totals, tail.active, rows);
+    cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
+    const int grid = rows * gpr;
+    const bool full = (k == n);
+    if (!full) {
+        for (int level = 7; level >= 0; --level)
+            select_round_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, level, (unsigned long long)k, inv_t,
+                gpr, tail.active);
+        select_finalize_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+            x, ws, stride, n, inv_t, gpr, tail.active);
+        check_launch("batch selection launch");
+    }
+    emit_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+        x, ws, stride, n, k, inv_t, gpr, tail.active);
+    const int chunks = (m + kSelSortChunk - 1) / kSelSortChunk;
+    const int gsort = (int)std::max<long long>(
+        1LL, std::min<long long>((long long)rows * chunks, 4 * kMaxGrid));
+    chunk_sort_b_kernel<<<gsort, kSelBlock, 0, cs>>>(
+        ws, stride, k, m, rows, tail.active);
+    int cur = 0;
+    for (int run = kSelSortChunk; run < m; run <<= 1) {
+        const long long ntiles = m / kSelMergeTile;
+        const int gmerge = (int)std::max<long long>(
+            1LL, std::min<long long>((long long)rows * ntiles, 4 * kMaxGrid));
+        merge_level_b_kernel<<<gmerge, kSelBlock, 0, cs>>>(
+            ws + kWsKeys + (cur ? m : 0), ws + kWsKeys + (cur ? 0 : m),
+            stride, m, run, rows, tail.active);
+        cur ^= 1;
+    }
+    const int sorted_off = kWsKeys + (cur ? m : 0);
+    const int mate_off = kWsKeys + (cur ? 0 : m);
+    const int gw = selection_grid(k);
+    exp_window_b_kernel<<<rows * gw, kSelBlock, 0, cs>>>(
+        ws + sorted_off, ws + mate_off, stride, k, gw, tail.active);
+    sample_topk_serial_b_kernel<<<rows, 32, walk_cp_slots(k) * sizeof(float),
+                                  cs>>>(
+        ws, stride, sorted_off, mate_off, k, tail.seeds, tail.tokens,
+        tail.active);
+    check_launch("batch tail launch");
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("batch top-k failed: ") +
+                                 cudaGetErrorString(err));
+    std::vector<long long> tok(rows);
+    if (cudaMemcpy(tok.data(), tail.tokens, (size_t)rows * 8,
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("batch token readback failed");
+    for (int r = 0; r < rows; ++r)
+        if (tok[r] < 0)
+            throw std::runtime_error("batch top-k produced no token");
+    return tok;
+}
+} // namespace
+
+std::vector<long long> sample_topp_batched_launch(
+    const float* x, int rows, int n, float p, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(p > 0.0f && p <= 1.0f))
+        throw std::invalid_argument("p must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, p, t, 0, seeds.data() + c, stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
+std::vector<long long> sample_minp_batched_launch(
+    const float* x, int rows, int n, float min_p, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(min_p > 0.0f && min_p <= 1.0f))
+        throw std::invalid_argument("min_p must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, min_p, t, 1, seeds.data() + c,
+            stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
+std::vector<long long> sample_topk_batched_launch(
+    const float* x, int rows, int n, int k, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (k <= 0)
+        throw std::invalid_argument("k must be >= 1");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if (k > n) k = n;                             // full-vocab sampling
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_topk_batched_chunk(
+            x + (size_t)c * n, b, n, k, t, seeds.data() + c, stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -74,6 +74,10 @@ out = fusedtok.attention_decode(q, k_cache, v_cache, lens)
 logits = torch.randn(131072, device="cuda")
 token = fusedtok.decode_step(logits, [], penalty=1.1,
                              p=0.9, temperature=0.8, seed=0)
+
+# serving a batch: one call, one seeded token per row
+batch_logits = torch.randn(8, 131072, device="cuda")
+tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9)
 ```
 
 `examples/demo.py` in the repository tours every operator with

@@ -69,6 +69,10 @@ out = fusedtok.attention_decode(q, k_cache, v_cache, lens)
 logits = torch.randn(131072, device="cuda")
 token = fusedtok.decode_step(logits, [], penalty=1.1,
                              p=0.9, temperature=0.8, seed=0)
+
+# 并发服务一整批：一次调用，每行按各自种子出一枚 token
+batch_logits = torch.randn(8, 131072, device="cuda")
+tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9)
 ```
 
 仓库里的 `examples/demo.py` 会把每个算子都逐个演示一遍并与解析

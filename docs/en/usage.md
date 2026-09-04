@@ -14,7 +14,7 @@ tour of every operator see [`examples/demo.py`](../../examples/demo.py).
 | [Quickstart](quickstart.md) | install, first kernels, a taste of the fast paths |
 | [The execution model](execution.md) | the three dispatch paths, dtype rules, streams, CUDA graphs, the error contract |
 | [Attention operators](attention.md) | decode over contiguous and paged kv-caches, the append write sides (contiguous + paged), prefill |
-| [Sampling and selection](sampling.md) | top-k / top-p / min-p / argmax, the fused samplers, the same-token determinism guarantee |
+| [Sampling and selection](sampling.md) | top-k / top-p / min-p / argmax, the fused samplers (single-row and batched), the same-token determinism guarantee |
 | [The INT8 path](int8.md) | quantization utilities, integer-exact qgemm, W8A8 per-channel scales |
 | [Benchmarks](benchmarks.md) | the measurement protocol, how to read the tables (including the honest losses), reproduction |
 | [FAQ / troubleshooting](faq.md) | GPU support matrix, common rejections, timing caveats, glossary |

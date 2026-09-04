@@ -99,6 +99,10 @@ micro-benchmark yourself, prefer events over wall clock and expect
   top-p takes the prefix whose cumulative probability mass reaches p;
   min-p takes the prefix of probabilities at least min_p times the
   maximum.
+- **Batched sampling** - sampling a whole `[rows, vocab]` batch in one
+  call (the `_batched` samplers): every row runs the single-row
+  pipeline verbatim with its own seed; the win over a per-row loop is
+  collapsed launch/submission overhead, not different math.
 - **Radix** - the selection pipeline's ordering technique: candidate
   keys are histogrammed round by round on their high bytes (the radix
   sort idea).

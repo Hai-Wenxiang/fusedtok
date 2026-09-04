@@ -51,6 +51,9 @@ __all__ = [
     "sample_topp",
     "sample_topk",
     "sample_minp",
+    "sample_topp_batched",
+    "sample_topk_batched",
+    "sample_minp_batched",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -98,6 +101,17 @@ def sample_topk(logits: Array, k: int, *, temperature: float = 1.0,
                 seed: int = 0, cuda: bool = False) -> int: ...
 def sample_minp(logits: Array, min_p: float, *, temperature: float = 1.0,
                 seed: int = 0, cuda: bool = False) -> int: ...
+def sample_topp_batched(logits: Array, p: float, *,
+                        temperature: float = 1.0,
+                        seeds: Optional[Array] = None,
+                        cuda: bool = False) -> Array: ...
+def sample_topk_batched(logits: Array, k: int, *, temperature: float = 1.0,
+                        seeds: Optional[Array] = None,
+                        cuda: bool = False) -> Array: ...
+def sample_minp_batched(logits: Array, min_p: float, *,
+                        temperature: float = 1.0,
+                        seeds: Optional[Array] = None,
+                        cuda: bool = False) -> Array: ...
 def quantize_int8(x: Array) -> "tuple[Array, float]": ...
 def dequantize_int8(q: Array, scale: float) -> Array: ...
 def qadd_int8(qa: Array, sa: float, qb: Array,
