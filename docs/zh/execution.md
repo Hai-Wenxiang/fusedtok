@@ -52,7 +52,7 @@ CPU 参考实现是正确性的基准：它实现的是同一套算法（在需�
 几条值得记住的规则：
 
 - **半精度输入、float32 计算。** 读入时在内存边界升到 float32，
-  写出时按「最近偶数舍入」（round-to-nearest-even）规则舍回半精度。
+  写出时按"最近偶数舍入"（round-to-nearest-even）规则舍回半精度。
   attention 的 softmax 和所有累加器在任何 dtype 下都是 float32，
   数值差异只来自输入本身的舍入。
 - **输出 dtype 跟随输入**：bf16 进 bf16 出；attention 额外支持

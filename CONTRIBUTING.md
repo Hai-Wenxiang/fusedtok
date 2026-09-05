@@ -55,7 +55,7 @@ CUDA cases skip automatically.
 
 ## New-kernel checklist
 
-Lessons baked into the v0.3/v0.4/v0.5/v1.0/v1.1 sprints - run through this
+Lessons baked into the v0.3 through v1.5 sprints - run through this
 before pushing any new GPU kernel:
 
 - [ ] **Sanitizer trio before review**: `compute-sanitizer --tool memcheck`

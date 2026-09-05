@@ -51,8 +51,12 @@ std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
         if (id < 0 || id >= (long long)logits.size())
             throw std::invalid_argument("token id out of range");
     std::vector<float> y = logits;
+    // apply each DISTINCT id exactly once: the GPU kernel reads the
+    // original logits and writes y[id] once per occurrence (duplicate
+    // threads write the identical value), so scaling per occurrence
+    // here would diverge from the GPU on repeated ids
     for (long long id : token_ids) {
-        float v = y[(size_t)id];
+        float v = logits[(size_t)id];
         y[(size_t)id] = v > 0.0f ? v / penalty : v * penalty;
     }
     return y;
@@ -259,6 +263,9 @@ std::vector<long long> sample_topp_batched_cpu(
     const std::vector<unsigned long long>& seeds) {
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
     std::vector<long long> out;
     out.reserve((size_t)rows);
     for (int r = 0; r < rows; ++r) {
@@ -274,6 +281,9 @@ std::vector<long long> sample_topk_batched_cpu(
     const std::vector<unsigned long long>& seeds) {
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
     std::vector<long long> out;
     out.reserve((size_t)rows);
     for (int r = 0; r < rows; ++r) {
@@ -289,6 +299,9 @@ std::vector<long long> sample_minp_batched_cpu(
     float t, const std::vector<unsigned long long>& seeds) {
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
     std::vector<long long> out;
     out.reserve((size_t)rows);
     for (int r = 0; r < rows; ++r) {
@@ -311,6 +324,9 @@ std::vector<long long> decode_step_batched_cpu(
     const std::vector<unsigned long long>& seeds) {
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
     if ((int)offs.size() != rows + 1)
         throw std::invalid_argument(
             "sampled_ids offsets must have rows + 1 entries");

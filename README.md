@@ -7,7 +7,7 @@
 
 **Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU / attention
 decode and friends, with **zero-copy torch tensor support**: up to
-**8.7x faster than PyTorch SDPA** (attention decode, RTX 3060, see
+**8.8x faster than PyTorch SDPA** (attention decode, RTX 3060, see
 [Benchmarks](#benchmarks)).
 
 **中文文档请看 [README_zh.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README_zh.md)** | English below.
@@ -317,11 +317,10 @@ whole mid-k regression) brings the mid-k window to parity-or-winning
 as well. The fused samplers win against the
 eager composites when the logits look like real decode output
 (sample_topp peaked: 2.59x / 2.48x; sample_topk: 1.84x / 2.06x; the
-composites themselves swing run-to-run on
-WDDM - per-round values in the JSON); on a
-a FLAT distribution sample_topp is honestly 0.16x on a 5060 Ti and
-0.37x on a 3060 (the fusedtok side is stable; the reference's rounds
-carry WDDM noise) — the nucleus then
+composites themselves swing run-to-run on WDDM - per-round values in
+the JSON). On a flat distribution sample_topp is honestly 0.16x on a
+5060 Ti and 0.37x on a 3060 (the fusedtok side is stable; the
+reference's rounds carry WDDM noise) — the nucleus then
 spans ~90% of the vocabulary and the pipeline must effectively order
 the whole thing. v1.2 cut that worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three token-preserving changes - an adaptive
@@ -498,6 +497,13 @@ nvcc, and CI builds and runs the CPU test suite on every push.
   temperature raw launchers validate what their siblings already
   did; scalar-fallback kernels index in 64-bit; both docs languages
   resynced to the 1.5.0 JSONs with the stiff phrasing rewrites
+- 1.5.2 (released): audit-driven hardening, round three - the
+  batched radix rounds now apply the row's repetition penalty (the
+  unpenalized selection prefix mis-composed decode_step_batched's
+  window under penalty != 1); the kv_append_paged span is computed
+  in 64-bit; duplicate penalty ids can no longer diverge between
+  the CPU and GPU paths; rope grids, launcher guards and the batched
+  CPU references got the same checks their siblings have
 - future candidates (unscheduled): bf16/fp16 tensor-core prefill
   (rewrite-level), a CUTLASS-class INT8 GEMM schedule (the current
   qgemm is the exact/graph-capturable/zero-copy path, not the fastest
