@@ -79,7 +79,7 @@ GPU 用约 2 ulp 的 `__expf`），两边各抽到相邻的一个元素，两个
 以一次回读收尾）；批量采样器（`_batched` 系列）的扩窗循环还要
 根据回读结果重新发射 kernel，返回 int64 张量也一样进不了图；
 `quantize_int8` / `qadd_int8` 中途同步一次以合成 scale。选择管线
-自己维护内部 CUDA 图——不需要你管。
+自己维护内部 CUDA graph——不需要你管。
 
 ## Windows 计时注意事项
 

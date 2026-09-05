@@ -32,10 +32,10 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 | ✅ | Softmax（按行） | 数值稳定版 |
 | ✅ | SiLU / GeLU / GeLU-tanh / ReLU / Tanh / Sigmoid | 逐元素 |
 | ✅ | add / mul | 逐元素二元（融合加残差模式） |
-| ✅ | top-k / top-p（核采样） | 到达票据 radix + 早退压缩，缓存 CUDA 图整管线回放；并列取最靠前下标（131k k=50 上两张卡从持平到领先，全 k 范围如此） |
+| ✅ | top-k / top-p（核采样） | 到达票据 radix + 早退压缩，缓存 CUDA graph整管线回放；并列取最靠前下标（131k k=50 上两张卡从持平到领先，全 k 范围如此） |
 | ✅ | argmax / temperature | 贪心解码辅助 |
 | ✅ | sample_topp | 融合 top-p（nucleus）采样：softmax -> 截取 top-p 集合 -> 按种子抽签，用全局质量做阈值 |
-| ✅ | sample_topk | 融合 top-k 采样：softmax -> 保留 k 个 -> 在幸存者内重新归一化 -> 按种子抽签（131k 上 1.9-2.2x vs topk+multinomial 组合式） |
+| ✅ | sample_topk | 融合 top-k 采样：softmax -> 保留 k 个 -> 在幸存者内重新归一化 -> 按种子抽签（131k 上 1.8-2.1x vs topk+multinomial 组合式） |
 | ✅ | sample_minp | 融合 min-p 采样（v1.3）：保留所有 p >= min_p × p_max 的 token -> 重新归一化 -> 按种子抽签——值阈值截断，无需全局质量归约，核宽度天然自适应 |
 | ✅ | sample_topp/minp/topk_batched | 批量采样（v1.4）：一次调用处理整个 `[行数, 词表]` 的 logits，每行按各自种子各出一个 token——每行原封不动地复用单行管线（逐行结果一致）；相比逐行循环，收益纯粹来自省掉逐行的提交开销：受提交延迟限制的主机（如 Windows/WDDM）上墙上时钟时间快 4-6 倍，尖峰解码分布下与 torch 原生批量 multinomial 同档 |
 | ✅ | repetition penalty | CTRL 风格，作用于已生成的 token |
@@ -239,7 +239,7 @@ multinomial；decode 行另加 gather 惩罚；逐轮数值在 JSON）：
 | sample_topk_batched k=50 | [8×131072] | 199 µs | 307 µs（topk+multinomial） | **1.54x** |
 | sample_minp_batched p=0.05 | [8×131072] | 224 µs | 300 µs（掩码+multinomial） | **1.34x** |
 | sample_topp_batched p=0.9 | [8×131072] | 268 µs | 219 µs（multinomial） | 0.82x（参考侧 WDDM 波动，见下） |
-| decode_step_batched（惩罚 1.3，~64 token 历史） | [8×131072] | 315 µs | 269 µs（惩罚+softmax+multinomial） | 0.86x（对比逐行循环 **5.2x**，见下方说明） |
+| decode_step_batched（惩罚 1.3，~64 token 历史） | [8×131072] | 315 µs | 269 µs（惩罚+softmax+multinomial） | 0.86x（对比逐行循环墙上时钟 **5.2x**，见下方说明） |
 | sample_topp_batched（平坦最坏） | [8×131072] | 3608 µs | 215 µs | 0.06x（如实，同单行说明） |
 
 按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
@@ -266,9 +266,9 @@ multinomial；decode 行另加 gather 惩罚；逐轮数值在 JSON）：
 | top-k（k=4096，中段 k） | [131072] | 50 µs | 54 µs（CUB） | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~346 µs | ~344-350 µs | ~1.0x |
 | argmax | [131072] | 17 µs | 14 µs | 0.81x（事件计时有噪声；墙上时钟探针 0.96x） |
-| int8 qgemm pc（W8A8） | [4096×4096×4096] | 2071 µs（66.3 TOPS） | 1139 µs（cuBLASLt + 广播） | 0.55x（如实） |
+| int8 qgemm pc（W8A8） | [4096×4096×4096] | 2071 µs（66.4 TOPS） | 1139 µs（cuBLASLt + 广播） | 0.55x（如实） |
 | attention_prefill（因果） | S=1024, D=128 | 3301 µs | 1421 µs（SDPA flash） | 0.43x（如实） |
-| int8 qgemm（IMMA） | [4096×11008×4096] | 5465 µs（67.4 TOPS） | 2178 µs（cuBLASLt） | 0.40x（如实） |
+| int8 qgemm（IMMA） | [4096×11008×4096] | 5465 µs（67.6 TOPS） | 2178 µs（cuBLASLt） | 0.40x（如实） |
 | sample_minp p=0.05（宽核） | [131072] | 262 µs | 74 µs | 0.28x（如实：同 3060 行的宽核说明） |
 | sample_topp p=0.9（平坦最坏） | [131072] | 1053 µs | 165 µs | 0.16x（如实，见下） |
 
@@ -292,7 +292,7 @@ PyPI wheel 附带 sm_80/sm_86 原生 cubin 与 compute_86 PTX 回退 —— 已�
 Blackwell（sm_120）驱动上验证 JIT 运行正确。
 
 融合算子（RoPE / RMSNorm / SwiGLU）优势明显：eager 模式的中间张量要在显存间
-来回搬运。v0.4 选择管线（到达票据 radix 轮 + 早退压缩，缓存 CUDA 图整管线
+来回搬运。v0.4 选择管线（到达票据 radix 轮 + 早退压缩，缓存 CUDA graph整管线
 回放）在两张卡上小 k 场景均超过 torch 的 CUB radix select；v1.0 重调
 （块内排序阈值与排序 chunk 双双从 2048 降到 1024 —— 单个 block 双调排序
 （bitonic sort）2048 个 key 正是中段 k 退步的全部来源）让中段 k 窗口
@@ -382,7 +382,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - v0.3（已完成）：chunk-merge 选择排序 + 并行 nucleus 计数、bf16x4/x8 向量化、
   INT8 量化/反量化工具
 - v0.4.1（已完成）：按行 kernel（归一化/softmax）运行时线程块自动调优
-- v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA 图）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
+- v0.4（已完成）：到达票据选择管线（无 cooperative launch、早退压缩、缓存 CUDA graph）、全库 stream 化（CUDA graph 真捕获）、INT8 计算路径（IMMA qgemm + 解码 GEMV）、融合 decode_step 采样
 - v0.5（已完成）：attention —— GQA 解码注意力（连续 kv-cache、长 cache 自动 flash-decoding 切分、每序列长度）+ 分块 prefill 路径（诚实约 0.45x vs SDPA flash，定位便捷路径）；每 GPU 单图 benchmark；Windows wheel 进入 PyPI 发布管线
 - 1.0（已发布）：流水线化 tensor-core INT8 GEMM（cp.async 双缓冲、运行时 tile 调优；3060 上 17 -> 39 TOPS）与逐通道权重 scale（W8A8）、融合 top-k 采样（vs topk+multinomial 组合式 2.1x）、top-k 中段 k 补平、文本卫生门禁、wheel 矩阵扩容（Linux cp310-313 / Windows cp311-313）、API 冻结
 - 1.1（已发布）：半精度 attention —— `attention_decode` / `attention_prefill` 接受 bfloat16 与 float16 cache（float32 计算，解码路径字节减半）；并行 exp 预计算使平坦分布采样最坏情况耗时减半且 token 逐位不变
@@ -394,6 +394,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - 1.4.1（已发布）：审计驱动加固 —— 补齐 staged 路径批量采样的形状校验（此前 rows/n 直接信任、未对照缓冲区）；扩窗下界公式合一与批量时序器清理、两种扩窗模式统一惰性 totals 缓存、同步收窄到调用方流；基准表以发布版本戳重生成；文档大修（陈旧数字、呆板措辞、词汇表与 FAQ 补条）
 - 1.5（已发布）：批量版 `decode_step` —— 逐行不等长（ragged）历史经逐行惩罚位图，一次调用跑完"惩罚 -> 温度 -> 采样"整链。原 1.5 另一候选（批量尝试内的逐行独立窗口，让一个宽核行不再抬高整批统一窗口）做了三种实现、在 B=8/B=32 实测净损失或持平（串行逆 CDF 走查吃掉了每轮的大头、归并梯子每级都有一次 kernel 启动的固定开销、按窗口分桶只会把这个固定开销成倍放大）后撤销，数字与结论记录在 CHANGELOG——若走查并行化可重启这项工作
 - 1.5.1（已发布）：审计驱动加固 —— 修复 int8 GEMV 对齐门拒绝的行静默丢失头部元素（k % 4 != 0 时）；kv_append staged 绑定与 rope / temperature 裸启动器补齐兄弟接口已有的校验；标量回退内核索引升 64 位；双语文档按 1.5.0 基准 JSON 全量同步并改写呆板措辞
+- 1.5.2（已发布）：审计驱动加固第三轮 —— 批量 radix 轮现在施加行惩罚（未惩罚的选择前缀会让 decode_step_batched 在惩罚 ≠ 1 时窗口组成出错）；kv_append_paged 跨度按 64 位计算；重复惩罚 id 不再造成 CPU/GPU 分歧；rope 网格、启动器守卫与批量 CPU 参考补齐兄弟接口同款检查
 - 后续候选（未排期）：bf16/fp16 tensor-core prefill（重写级）；CUTLASS 级 INT8 GEMM 调度（当前 qgemm 定位是精确/可图捕获/零拷贝路径，而非最快路径）；16-bit radix key（动确定性契约）
 
 ## 社区

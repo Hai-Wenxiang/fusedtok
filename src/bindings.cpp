@@ -773,12 +773,20 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("topk_launch",
           [](py::int_ x, py::int_ vals, py::int_ idxs, int n, int k, std::uintptr_t stream) {
+        if (n <= 0)
+            throw std::invalid_argument("topk of empty input");
+        if (k <= 0 || k > n)
+            throw std::invalid_argument("k must be within [1, n]");
         ft::topk_launch(df(x), dfm(vals), dllm(idxs), n, k, stream);
     }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"),
         py::arg("k"), py::arg("stream") = 0);
 
     m.def("topp_select_launch", [](py::int_ x, py::int_ vals, py::int_ idxs,
                                    int n, double p, py::int_ count, std::uintptr_t stream) {
+        if (n <= 0)
+            throw std::invalid_argument("topp of empty input");
+        if (!(p > 0.0 && p <= 1.0))
+            throw std::invalid_argument("p must be in (0, 1]");
         ft::topp_select_launch(df(x), dfm(vals), dllm(idxs), n, (float)p, dim_(count), stream);
     }, py::arg("x"), py::arg("vals"), py::arg("idxs"), py::arg("n"), py::arg("p"),
        py::arg("count"), py::arg("stream") = 0);
@@ -961,8 +969,8 @@ PYBIND11_MODULE(_fusedtok, m) {
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
         return ft::sample_topp_launch(df(x), n, (float)p, (float)t, seed, stream);
-    }, py::arg("x"), py::arg("n"), py::arg("p"), py::arg("t"),
-       py::arg("seed"), py::arg("stream") = 0);
+    }, py::arg("logits"), py::arg("n"), py::arg("p"), py::arg("t") = 1.0,
+       py::arg("seed") = 0ULL, py::arg("stream") = 0);
 
     // ==================================================================
     // batched sampling (v1.4): [rows, n] logits, one seed per row,
@@ -1680,9 +1688,15 @@ PYBIND11_MODULE(_fusedtok, m) {
         // as the attention twins. Unused table slots are not checked
         // - the CPU reference accepts them, and rejecting them here
         // would make the staged path stricter than the CPU path.
+        // the span is computed in 64-bit and bounded: an absurd
+        // (tbl_width, page) pair must reject, not overflow into a
+        // wrapped (passing) bound - same guard as the attention twin
+        if ((long long)tbl_width * page > (1LL << 30))
+            throw std::invalid_argument("table capacity too large");
+        const long long span = (long long)tbl_width * page;
         for (py::ssize_t bi = 0; bi < batch; ++bi) {
             const int pos = (int)lens.data()[bi];
-            if (pos < 0 || pos >= tbl_width * page)
+            if (pos < 0 || pos >= span)
                 throw std::invalid_argument(
                     "lens entries must be within [0, table width * page)");
             const int blk = table.data()[bi * tbl_width + pos / page];

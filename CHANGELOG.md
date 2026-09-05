@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-09-05
+
+Audit-driven hardening, third round (the 1.2.1/1.3.1/1.4.1/1.5.1
+playbook, this time over the single-row selection/sampling sections
+and the 1.5.1 delta that previous rounds excluded). No API changes;
+527 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2).
+
+### Fixed
+- **The batched radix rounds dropped the repetition penalty.**
+  `select_round_b_kernel` derived its row's penalty context but
+  packed the histogram keys unpenalized - a leftover from the 1.4.0
+  "decode_step stays single-row" era that became live when
+  `decode_step_batched` arrived. Under `decode_step_batched` with
+  `penalty != 1` and a vocabulary larger than the first window, the
+  selection prefix came from the unpenalized key space while
+  finalize and emit compacted/thresholded penalized keys against it.
+  The widening loop self-heals at the full-vocabulary retry (which
+  is why the existing tests never caught it), and the fix restores
+  the exact single-row pipeline correspondence; a windowed-parity
+  matrix over boosted-top rows pins the contract going forward.
+
+### Hardened
+- The `kv_append_paged` staged binding computes its span in 64-bit
+  and bounds it - an absurd (table_width, page) pair overflowed the
+  32-bit bound check into a passing comparison, defeating the very
+  out-of-range guard the validation provides.
+- `repetition_penalty_cpu` applies each DISTINCT id exactly once
+  (reading the original logits per write): the GPU kernel writes the
+  identical value per duplicate occurrence, so scaling per
+  occurrence made CPU results diverge from GPU on repeated ids.
+- The rope host launchers compute their grid in 64-bit (the kernels
+  were promoted in 1.5.1; the int host math overflowed for long
+  caches - loud errors, never silent); `topk_launch` rejects k
+  outside [1, n]; `topp_select_launch` rejects p outside (0, 1]
+  (a rejected range left the caller's count slot unwritten); the
+  batched CPU references check `logits.size() >= rows * n`; the
+  three token-preset uploads report their own failure instead of a
+  mislabelled later error; `sample_topp_launch` keeps its
+  historical keyword and gains the sibling defaults; the quantize
+  formula comment in activations.hpp agrees with the reciprocal
+  contract; decode's empty-logits messages use one phrasing.
+
+### Docs
+- The 1.5.1 verification findings: the README headline completes
+  the 8.8x sync, a double article introduced by that same edit is
+  gone, README_zh finishes its number sync (topk 1.8-2.1x, TOPS
+  66.4/67.6, the wall-time qualifier), the deferred style sweep is
+  done (ASCII-hyphen ranges, single "CUDA graph" spelling, corpus
+  quote style, CONTRIBUTING's sprint list through v1.5).
+
 ## [1.5.1] - 2026-09-05
 
 Audit-driven hardening (the 1.2.1/1.3.1/1.4.1 playbook): one real

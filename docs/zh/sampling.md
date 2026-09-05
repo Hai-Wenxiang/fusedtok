@@ -102,7 +102,7 @@ tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 一次调用采样整个 `[行数, 词表]` 批，每行返回一个 token。返回值是
 **主机侧**的 int64：torch 输入回 CPU torch 张量，numpy 输入回 numpy
 数组——扩窗循环不可避免地要回读主机，因此与单行版一样不可做
-CUDA 图捕获。
+CUDA graph捕获。
 
 - `logits` 为二维、连续、float32。
 - `seeds` 每行一个整数，接受列表、numpy 数组或 torch 张量（CUDA
@@ -146,7 +146,7 @@ tokens = fusedtok.decode_step_batched(
   因此逐行一致性保持到文档化的 ulp 边界为止。
 - `penalty=1.0` 或历史全空时不会产生任何位图读写（此时调用与
   `sample_topp_batched` 完全等价）。
-- 逐（行, 种子）确定；不可 CUDA 图捕获；行按 32 行一组分块。
+- 逐（行, 种子）确定；不可 CUDA graph捕获；行按 32 行一组分块。
 - 批处理收益：B=8 墙上时钟探针、约 64 token 历史下，尖峰
   logits 比逐行循环 `decode_step` 快 5.2 倍（3060：1676 ->
   321 µs；5060 Ti：646 -> 145 µs），与 torch 原生"惩罚 +
@@ -184,7 +184,7 @@ softmax 总量靠逐 block 的浮点原子加累加，而 GPU 调度这些 block
 
 当核（nucleus）盖住几乎整个词表（接近均匀的 logits）时，
 `sample_topp` 实际上要给全词表排序，torch 的全并行排序仍然更快
-——基准表里如实标着 0.16–0.37x。v1.2 用三个不破坏契约的改动把
+——基准表里如实标着 0.16-0.37x。v1.2 用三个不破坏契约的改动把
 该最坏情况的耗时压到约 1/8.5（快约 8.5 倍；3060 上 n=131072
 实测 18.2ms -> 2.2ms）：
 
@@ -216,6 +216,6 @@ softmax 总量靠逐 block 的浮点原子加累加，而 GPU 调度这些 block
   block 在共享内存里把幸存者排序，不再继续细化。
 - **合并阶梯排序（merge-ladder sort）**：k 更大时，各 block 先分块
   排序，再按层级逐层合并，每层一次启动。
-- **缓存 CUDA 图**：整条序列按 (n, k, mode) 捕获一次，之后每次
+- **缓存 CUDA graph**：整条序列按 (n, k, mode) 捕获一次，之后每次
   调用就是一次图启动；每次调用的指针经由设备侧参数块传递，
   replay 能看到新张量。

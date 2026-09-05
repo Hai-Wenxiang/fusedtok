@@ -124,7 +124,7 @@ std::vector<long long> decode_step_batched_cpu(
 // ---------------------------------------------------------------------------
 // INT8 symmetric per-tensor quantization (the storage half; the compute
 // half - IMMA qgemm / decode GEMV - is declared just below):
-//   scale = max(|x|) / 127; q = clamp(round(x / scale), -127, 127)
+//   scale = max(|x|) / 127; q = clamp(round(x * (1/scale)), -127, 127)
 // ---------------------------------------------------------------------------
 
 std::pair<std::vector<signed char>, float>

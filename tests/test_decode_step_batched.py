@@ -244,6 +244,40 @@ class TestCuda:
                                         cuda=True))
         assert int(got[0]) == want
 
+    def test_penalty_rides_selection_rounds_windowed(self):
+        # The regression that motivated this test: the batched radix
+        # rounds packed keys from the UNPENALIZED distribution while
+        # finalize/emit used the penalized one, so with penalty != 1
+        # and n > the first window the emitted window composition was
+        # wrong in principle. The widening loop is self-healing (a
+        # full-vocabulary retry re-selects under the correct keys), so
+        # no Python-level draw was found that deterministically
+        # diverges - this matrix pins the end-state contract anyway:
+        # boosted-top rows whose histories cover the whole top cluster
+        # under penalties on both sides of 1.0, windowed vocabulary,
+        # parity against the composed single-row reference.
+        rng = np.random.default_rng(330)
+        n, b = 8192, 6
+        x = rng.standard_normal((b, n)).astype(np.float32)
+        hist = []
+        for r in range(b):
+            top = np.argsort(-x[r], kind="stable")[:300]
+            x[r, top] += 4.0                 # boosted cluster dominates
+            hist.append([int(t) for t in top])
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(b, dtype=np.int64)
+        for penalty in (0.5, 2.0):
+            for p in (0.9, 0.6):
+                got = fusedtok.decode_step_batched(
+                    dev, hist, penalty, p=p, seeds=seeds)
+                want = [int(fusedtok.decode_step(dev[r], hist[r],
+                                                 penalty, p=p,
+                                                 seed=int(seeds[r])))
+                        for r in range(b)]
+                for r in range(b):
+                    _assert_row_close(x[r], int(got[r]), want[r],
+                                      ("windowed", penalty, p, r))
+
     def test_b33_chunk_boundary(self):
         rng = np.random.default_rng(312)
         b, n = 33, 131072

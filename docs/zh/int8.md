@@ -77,12 +77,12 @@ y = fusedtok.qgemm_perchannel(a_q, a_scale, b_q, b_scales)
   内存带宽——约为 fp16 投影的 2 倍。这是每个 token 的热路径，
   也是 INT8 权重的意义所在。
 - **流水线化 IMMA GEMM** 在 3060 上约 38 TOPS、5060 Ti 上约
-  67 TOPS（是 v0.4 kernel 的 2–4 倍），但 cuBLASLt
+  67 TOPS（是 v0.4 kernel 的 2-4 倍），但 cuBLASLt
   （`torch._int_mm`）凭借更深的 tile 流水线和按架构精调的
-  epilogue，在逐张量行上速度仍为 fusedtok 的约 2.1–2.5 倍
-  （W8A8 行约 1.7–1.8 倍）。fusedtok 的 INT8 路径定位是
+  epilogue，在逐张量行上速度仍为 fusedtok 的约 2.1-2.5 倍
+  （W8A8 行约 1.7-1.8 倍）。fusedtok 的 INT8 路径定位是
   **精确 / 可图捕获 / 零拷贝**，不是最快；CUTLASS 级调度在
   路线图上。
 - `qgemm_perchannel` 的 scale 乘法融合进同一个 epilogue，kernel
   侧零开销——反而是组合式 torch 参考要为 scale 广播单独多跑一趟
-  kernel，README 基准表 0.55–0.58x 的差距即来源于此。
+  kernel，README 基准表 0.55-0.58x 的差距即来源于此。

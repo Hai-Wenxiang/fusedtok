@@ -1646,7 +1646,10 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
         // reset the control head FIRST, then preset the token sentinel
         // (the memset would otherwise wipe it), then ship the args
         cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
-        cudaMemcpyAsync(token_out, &token, sizeof(int), cudaMemcpyHostToDevice, cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
         ship_args(cs, dargs, x, nullptr, nullptr, nullptr, p);
         const int grid = selection_grid(n);
         // Full-vocabulary fast path (v1.2): when the window covers the
@@ -1757,8 +1760,9 @@ long long decode_step_launch(const float* x, const long long* ids,
                         (size_t)(bm - ws + bitmap_words) *
                             sizeof(unsigned long long),
                         cs);
-        cudaMemcpyAsync(token_out, &token, sizeof(int),
-                        cudaMemcpyHostToDevice, cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice, cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
         ship_args(cs, dargs, x, nullptr, nullptr, nullptr, p);
         const PenCtx pen{bm, penalty, use_pen};
         if (use_pen)
@@ -2036,7 +2040,10 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
         cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
-        cudaMemcpyAsync(token_out, &token, sizeof(int), cudaMemcpyHostToDevice, cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
         ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
         const int grid = selection_grid(n);
         const float inv_t = 1.0f / t;
@@ -2241,8 +2248,12 @@ __global__ void select_round_b_kernel(
     __syncthreads();
     for (int i = lid * blockDim.x + threadIdx.x; i < n;
          i += gpr * blockDim.x) {
+        // the histogram must rank the row's PENALIZED distribution:
+        // finalize and emit both apply pen, so an unpenalized prefix
+        // here would make them compact/threshold against a key space
+        // nothing else in the pipeline uses
         const unsigned long long key =
-            pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+            pack_key(step_logit(x_row, i, inv_t, pen), i);
         if ((key & topmask) != prefix) continue;
         const int bin = (int)((key >> (8 * level)) & 0xFF);
         const unsigned grp = __match_any_sync(__activemask(), bin);
@@ -3331,7 +3342,7 @@ std::vector<long long> decode_step_batched_launch(
     if (rows == 0)
         return {};
     if (n <= 0)
-        throw std::invalid_argument("decode of empty logits");
+        throw std::invalid_argument("decode_step of empty logits");
     if (!(penalty > 0.0f))
         throw std::invalid_argument("penalty must be > 0");
     if (!(p > 0.0f && p <= 1.0f))

@@ -640,6 +640,23 @@ def test_kv_append_staged_binding_lens_validated():
                         k, v, 2, 2, 4, 8)
 
 
+def test_repetition_penalty_duplicate_ids_cpu_matches_gpu():
+    # the GPU kernel reads the ORIGINAL logits per distinct id, so a
+    # duplicated id is penalized once; the CPU reference used to scale
+    # in place per occurrence and diverged on repeated ids
+    rng = np.random.default_rng(41)
+    x = rng.standard_normal(256).astype(np.float32)
+    ids = [10, 10, 10, 200, 200, 7]
+    cpu = _ft().repetition_penalty_cpu(x, np.array(ids, dtype=np.int64),
+                                       1.4)
+    if not fusedtok.cuda_available():
+        pytest.skip("gpu half needs a GPU")
+    dev = torch.from_numpy(x).cuda()
+    gpu = fusedtok.repetition_penalty(dev, ids, 1.4)
+    np.testing.assert_array_equal(np.asarray(cpu),
+                                  gpu.cpu().numpy())
+
+
 def test_kv_append_paged_staged_binding_lens_and_block_validated():
     pool = np.zeros((4, 2, 4, 4), dtype=np.float32)
     kn = np.ones((2, 2, 4), dtype=np.float32)

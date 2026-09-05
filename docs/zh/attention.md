@@ -166,7 +166,7 @@ prefill 请交给 SDPA / FlashAttention（基准表里如实标着约 0.45x
   展开，且在小 query 下效率偏低）。
 - bf16/fp16 cache 把字节减半。batch 为 1 时 kernel 受延迟限制，
   绝对收益有限，batch 越大收益越大。
-- 分页间接寻址比连续版多付约 1.09–1.11 倍。
+- 分页间接寻址比连续版多付约 1.09-1.11 倍。
 - prefill 刻意不与 flash 后端竞争。
 
 测试协议与复现方法见[基准测试](benchmarks.md)。
