@@ -560,15 +560,20 @@ __global__ void qgemv_kernel(const signed char* __restrict__ xq,
     const int lane = threadIdx.x & 31;
     const signed char* row = wq + (size_t)warp * k;
     int acc = 0;
-    // vectorized loads: char4 = 4 int8 values (4-byte alignment always
-    // holds - rows start at multiples of k bytes from an aligned base).
-    // The warp covers 128 bytes per iteration; the scalar tail (and any
-    // misalignment) falls back to single bytes. NOTE: char4 fields are
-    // PLAIN char - unsigned on MSVC hosts - so every lane value passes
-    // through an explicit (signed char) cast (a negative int8 read
-    // through an unsigned char would flip the product's sign).
+    // vectorized loads: char4 = 4 int8 values. The warp covers 128
+    // bytes per iteration; the scalar tail covers [k4, k). The gate is
+    // per-warp: rows start at multiples of k bytes from an aligned
+    // base, so ANY k % 4 != 0 misaligns rows 1..n-1 (and torch int8
+    // slices give arbitrary base alignment) - when the gate fails the
+    // scalar loop must cover the WHOLE row [0, k), not just the tail.
+    // NOTE: char4 fields are PLAIN char - unsigned on MSVC hosts - so
+    // every lane value passes through an explicit (signed char) cast
+    // (a negative int8 read through an unsigned char would flip the
+    // product's sign).
     const int k4 = (k / 4) * 4;
-    if (((size_t)row & 3) == 0 && ((size_t)xq & 3) == 0 && k4 > 0) {
+    const bool vec_ok =
+        ((size_t)row & 3) == 0 && ((size_t)xq & 3) == 0 && k4 > 0;
+    if (vec_ok) {
         for (int c = lane * 4; c < k4; c += 32 * 4) {
             const char4 xv = *reinterpret_cast<const char4*>(xq + c);
             const char4 wv = *reinterpret_cast<const char4*>(row + c);
@@ -578,7 +583,7 @@ __global__ void qgemv_kernel(const signed char* __restrict__ xq,
                  + (int)(signed char)xv.w * (int)(signed char)wv.w;
         }
     }
-    for (int c = k4 + lane; c < k; c += 32)
+    for (int c = (vec_ok ? k4 : 0) + lane; c < k; c += 32)
         acc += (int)xq[c] * (int)row[c];
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)

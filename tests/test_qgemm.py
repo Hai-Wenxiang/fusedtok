@@ -177,6 +177,24 @@ class TestTorchZeroCopy:
         np.testing.assert_array_equal(
             y.cpu().numpy(), fusedtok.qgemm(a, 0.03, b, 0.04 if False else 0.02))
 
+    def test_gemv_odd_k_scalar_fallback(self):
+        # The GEMV vector loop gates on 4-byte row alignment, and any
+        # k % 4 != 0 misaligns rows 1..n-1 (row r starts at r*k bytes).
+        # The scalar pass must then cover the WHOLE row, not just the
+        # [k4, k) tail - the pre-1.5.1 kernel silently dropped the
+        # first k4 elements of every misaligned row. Pin the fixed
+        # behavior bit-exactly on both M=1 shapes that always take the
+        # GEMV path and multi-row ones where only some rows align.
+        for m, n, k in [(1, 8, 129), (1, 5, 33), (1, 3, 7),
+                        (4, 8, 129), (5, 16, 30)]:
+            rng = np.random.default_rng(m * 31 + n + k)
+            a = rand_q(rng, m, k)
+            b = rand_q(rng, n, k)
+            y = fusedtok.qgemm(a, 0.05, b, 0.04, cuda=True)
+            ycpu = fusedtok.qgemm(a, 0.05, b, 0.04)
+            np.testing.assert_array_equal(
+                y, ycpu, err_msg=f"m={m} n={n} k={k}")
+
     def test_gemv_decode_shape(self):
         # the realistic decode step: [1, hidden] @ [vocab, hidden]^T
         rng = np.random.default_rng(13)

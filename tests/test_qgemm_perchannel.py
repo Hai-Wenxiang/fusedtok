@@ -192,6 +192,22 @@ class TestCuda:
             np.testing.assert_array_equal(
                 fusedtok.qgemm_perchannel(a, 0.03, b, sb, cuda=True), ycpu)
 
+    def test_gemv_odd_k_scalar_fallback(self):
+        # The GEMV vector loop gates on 4-byte row alignment; any
+        # k % 4 != 0 misaligns rows 1..n-1, and the scalar pass must
+        # then cover the whole row (the pre-1.5.1 kernel dropped its
+        # first k4 elements). Bit-exact against the CPU path.
+        for m, n, k in [(1, 8, 129), (1, 5, 33), (1, 3, 7),
+                        (4, 8, 129)]:
+            rng = np.random.default_rng(m * 17 + n + k)
+            a = rand_q(rng, m, k)
+            b = rand_q(rng, n, k)
+            sb = rand_scales(rng, n)
+            y = fusedtok.qgemm_perchannel(a, 0.05, b, sb, cuda=True)
+            ycpu = fusedtok.qgemm_perchannel(a, 0.05, b, sb)
+            np.testing.assert_array_equal(
+                y, ycpu, err_msg=f"m={m} n={n} k={k}")
+
 
 @pytest.mark.skipif(not (HAS_TORCH and fusedtok.cuda_available()),
                     reason="no torch/GPU")
