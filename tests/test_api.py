@@ -49,6 +49,7 @@ FROZEN_API = frozenset({
     "qgemm",
     "qgemm_perchannel",
     "decode_step",
+    "decode_step_batched",
     "attention_decode",
     "kv_append",
     "attention_decode_paged",
@@ -102,7 +103,8 @@ def test_stub_file_covers_the_frozen_surface():
 
 
 @pytest.mark.parametrize("op", ["sample_topp", "sample_topk",
-                                "decode_step", "temperature"])
+                                "decode_step", "decode_step_batched",
+                                "temperature"])
 def test_error_contract_value_errors(op):
     # the documented contract: value problems raise ValueError
     logits = __import__("numpy").zeros(16, dtype="float32")
@@ -114,5 +116,7 @@ def test_error_contract_value_errors(op):
             fn(logits, 0)                      # k must be >= 1
         elif op == "decode_step":
             fn(logits, [0], 0.0)               # penalty must be > 0
+        elif op == "decode_step_batched":
+            fn(logits.reshape(1, 16), [[0]], 0.0)   # penalty must be > 0
         else:
             fn(logits, 0.0)                    # temperature must be > 0

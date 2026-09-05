@@ -111,6 +111,16 @@ std::vector<long long> sample_minp_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float min_p,
     float t, const std::vector<unsigned long long>& seeds);
 
+// Batched fused decode step (v1.5): the composed per-row reference
+// repetition_penalty -> temperature -> sample_topp over ragged
+// histories (flat ids + rows + 1 offsets, same contract as the GPU
+// launcher). Each row is bit-identical to the single-row composition.
+std::vector<long long> decode_step_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<long long>& ids,
+    const std::vector<long long>& offs, float penalty, float p, float t,
+    const std::vector<unsigned long long>& seeds);
+
 // ---------------------------------------------------------------------------
 // INT8 symmetric per-tensor quantization (the storage half; the compute
 // half - IMMA qgemm / decode GEMV - is declared just below):

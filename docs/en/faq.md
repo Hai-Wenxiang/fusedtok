@@ -70,7 +70,7 @@ case may pick a neighboring token after a process restart. Details:
 distribution with a boolean-mask pass. The fusedtok samplers must
 ORDER the nucleus (the selection pipeline), and on near-uniform
 logits the nucleus is ~90% of the vocabulary, so they honestly lose
-that regime (0.05-0.06x batched, 0.17-0.25x single-row). Real decode
+that regime (0.05-0.06x batched, 0.16-0.37x single-row). Real decode
 logits are peaked, where the samplers sit at native-multinomial
 level or better. Details:
 [sampling - flat distributions](sampling.md#flat-distributions---the-honest-worst-case).
@@ -117,10 +117,10 @@ micro-benchmark yourself, prefer events over wall clock and expect
   min-p takes the prefix of probabilities at least min_p times the
   maximum.
 - **Batched sampling** - sampling a whole `[rows, vocab]` batch in one
-  call (the `_batched` samplers): every row runs the single-row
-  pipeline verbatim with its own seed; the speedup over a per-row loop
-  comes from collapsing launch/submission overhead, not from different
-  math.
+  call (the `_batched` samplers and `decode_step_batched`): every row
+  runs the single-row pipeline verbatim with its own seed; the speedup
+  over a per-row loop comes from collapsing launch/submission
+  overhead, not from different math.
 - **multinomial** - torch's probability-weighted draw
   (`torch.multinomial`); the reference implementation this library's
   samplers are benchmarked against (composed with softmax, and with

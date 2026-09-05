@@ -299,4 +299,44 @@ std::vector<long long> sample_minp_batched_cpu(
     return out;
 }
 
+// Batched fused decode step (v1.5): the row-wise composition
+// repetition_penalty -> sample_topp, exactly the single-row wrapper's
+// CPU path (python/fusedtok/__init__.py composes the same two
+// references), so per-row equality with decode_step on the CPU side
+// is bit-exact by construction.
+std::vector<long long> decode_step_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<long long>& ids,
+    const std::vector<long long>& offs, float penalty, float p, float t,
+    const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if ((int)offs.size() != rows + 1)
+        throw std::invalid_argument(
+            "sampled_ids offsets must have rows + 1 entries");
+    if (offs.front() != 0 || offs.back() != (long long)ids.size())
+        throw std::invalid_argument(
+            "sampled_ids offsets must start at 0 and end at its length");
+    for (size_t i = 1; i < offs.size(); ++i)
+        if (offs[i] < offs[i - 1])
+            throw std::invalid_argument(
+                "sampled_ids offsets must be non-decreasing");
+    if (!(penalty > 0.0f))
+        throw std::invalid_argument("penalty must be > 0");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        std::vector<float> logits_row(row, row + n);
+        if (!ids.empty())
+            logits_row = repetition_penalty_cpu(
+                logits_row,
+                std::vector<long long>(
+                    ids.begin() + offs[r], ids.begin() + offs[r + 1]),
+                penalty);
+        out.push_back(sample_topp_cpu(logits_row, p, t, seeds[r]));
+    }
+    return out;
+}
+
 } // namespace fusedtok

@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 __all__ = [
     "cuda_available",
@@ -67,6 +67,7 @@ __all__ = [
     "qgemm",
     "qgemm_perchannel",
     "decode_step",
+    "decode_step_batched",
     "attention_decode",
     "kv_append",
     "attention_decode_paged",
@@ -1653,3 +1654,126 @@ def decode_step(logits, sampled_ids, penalty=1.0, *, p=0.9, temperature=1.0,
     # CPU reference: the composed three calls, same operation order
     penalized = _fusedtok.repetition_penalty_cpu(arr, ids, penalty)
     return int(_fusedtok.sample_topp_cpu(penalized, p, temperature, seed))
+
+
+def _batch_ids_arg(sampled_ids, ids_offsets, rows, n):
+    """Normalize per-row histories to (flat int64 ids, int64 offsets).
+
+    Accepts a sequence of per-row sequences (ragged list of lists), a
+    2-D array whose every row contributes all its columns, or the
+    pre-normalized power path: a flat 1-D id array plus explicit
+    ``ids_offsets``. Values are range-checked here for the ragged/2-D
+    forms (they are host-origin by construction); CUDA torch ids are
+    moved to host first - the histories ride a small per-attempt
+    upload either way, so there is no zero-copy to preserve (the
+    bindings re-validate every path).
+    """
+    if ids_offsets is not None:
+        if _is_torch(sampled_ids):
+            sampled_ids = sampled_ids.detach().cpu().numpy()
+        if _is_torch(ids_offsets):
+            ids_offsets = ids_offsets.detach().cpu().numpy()
+        ids = np.ascontiguousarray(sampled_ids)
+        if ids.ndim != 1:
+            raise ValueError(
+                "sampled_ids with ids_offsets must be a flat 1-D array")
+        offs = np.ascontiguousarray(ids_offsets)
+        if offs.ndim != 1 or offs.size != rows + 1:
+            raise ValueError(
+                "ids_offsets must be 1-D with rows + 1 entries")
+        if not np.issubdtype(ids.dtype, np.integer):
+            raise TypeError("sampled_ids entries must be integers")
+        ids = ids.astype(np.int64, copy=False)
+        if ids.size and (ids.min() < 0 or ids.max() >= n):
+            raise ValueError(f"sampled_ids values must be in [0, {n})")
+        return ids, offs.astype(np.int64, copy=False)
+    if isinstance(sampled_ids, (list, tuple)):
+        if len(sampled_ids) != rows:
+            raise ValueError("sampled_ids must have one entry per row")
+        flat = []
+        offs = [0]
+        for row_ids in sampled_ids:
+            row = np.asarray(row_ids)
+            if row.size and not np.issubdtype(row.dtype, np.integer):
+                raise TypeError("sampled_ids entries must be integers")
+            flat.extend(int(i) for i in row)
+            offs.append(len(flat))
+        ids = np.asarray(flat, dtype=np.int64)
+        if ids.size and (ids.min() < 0 or ids.max() >= n):
+            raise ValueError(f"sampled_ids values must be in [0, {n})")
+        return ids, np.asarray(offs, dtype=np.int64)
+    arr = sampled_ids
+    if _is_torch(arr):
+        arr = arr.detach().cpu().numpy()
+    arr = np.asarray(arr)
+    if arr.ndim == 2:
+        if arr.shape[0] != rows:
+            raise ValueError("sampled_ids must have one entry per row")
+        if arr.size and not np.issubdtype(arr.dtype, np.integer):
+            raise TypeError("sampled_ids entries must be integers")
+        if arr.size and (arr.min() < 0 or arr.max() >= n):
+            raise ValueError(f"sampled_ids values must be in [0, {n})")
+        m = arr.shape[1]
+        return (np.ascontiguousarray(arr, dtype=np.int64).reshape(-1),
+                np.arange(rows + 1, dtype=np.int64) * m)
+    raise ValueError("sampled_ids must be per-row sequences, a 2-D "
+                     "array, or flat ids plus ids_offsets")
+
+
+def decode_step_batched(logits, sampled_ids, penalty=1.0, *, p=0.9,
+                        temperature=1.0, seeds=None, ids_offsets=None,
+                        cuda=False):
+    """Fused decode step for a batch of rows (v1.5).
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32). Every
+    row runs the exact ``decode_step`` pipeline - CTRL-style repetition
+    penalty over that row's history, then the temperature scale, then
+    nucleus sampling - and the call returns one token id per row
+    (int64 array / torch tensor on CPU; the host readback is inherent
+    to the widening loop).
+
+    ``sampled_ids`` carries the per-row histories: a ragged sequence
+    of per-row sequences (list of lists), a 2-D integer array (every
+    row contributes ALL its columns - pad rows yourself or use the
+    ragged forms), or a flat 1-D integer array plus ``ids_offsets``
+    (rows + 1 non-decreasing entries starting at 0). Values must lie
+    in ``[0, vocab)``. ``penalty`` > 0 (1.0 or empty histories disable
+    the bitmap entirely), ``p`` in (0, 1], temperature > 0.
+
+    ``seeds`` is one non-negative integer per row; ``None`` defaults
+    to ``0..rows-1``. Deterministic per (row, seed); not CUDA-graph
+    capturable. Each row's token matches the single-row ``decode_step``
+    up to the documented __expf/atomic-order ulp boundary.
+    """
+    if not penalty > 0.0:
+        raise ValueError("penalty must be > 0")
+    if not 0.0 < p <= 1.0:
+        raise ValueError("p must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        ids, offs = _batch_ids_arg(sampled_ids, ids_offsets, rows, n)
+        s = _batch_seeds(seeds, rows, "seeds")
+        toks = _fusedtok.decode_step_batched_launch(
+            logits.data_ptr(), rows, n, ids, offs, penalty, p,
+            temperature, s, _cuda_stream())
+        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    ids, offs = _batch_ids_arg(sampled_ids, ids_offsets, rows, n)
+    s = _batch_seeds(seeds, rows, "seeds")
+    if rows == 0:
+        out = np.empty(0, dtype=np.int64)
+    else:
+        call = (_fusedtok.decode_step_batched if path == "staged"
+                else _fusedtok.decode_step_batched_cpu)
+        out = np.asarray(call(arr, rows, n, ids, offs, penalty, p,
+                              temperature, s), dtype=np.int64)
+    return _numpy_to_torch_like(out) if _is_torch(logits) else out

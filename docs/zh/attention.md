@@ -125,8 +125,8 @@ fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
 - 一个微型 kernel、流序、可 CUDA graph 捕获。
 - 主机侧来源的 `lens` 取值在 `[0, T)` 内校验；设备上的张量直接信任
   （标准零拷贝信任边界）。
-- 性能（基准表）：3060 上 16.2µs vs torch 高级索引 66.4µs
-  （4.11x）、5060 Ti 上 9.4µs vs 20.8µs（2.22x）——算子本身很小、
+- 性能（基准表）：3060 上 14.0µs vs torch 高级索引 46.2µs
+  （3.31x）、5060 Ti 上 9.4µs vs 20.7µs（2.20x）——算子本身很小、
   受启动开销限制，倍数随参考侧高级索引自身的 WDDM 波动，量的
   是每步解码的固定成本。
 
@@ -162,7 +162,7 @@ prefill 请交给 SDPA / FlashAttention（基准表里如实标着约 0.45x
 顺序读一遍。可以期待的是：
 
 - f32 decode 在长 cache 上达到或超过 SDPA 的有效带宽
-  （README 表里 3060 @T=16384 最高 8.74x——参考实现需要额外做头
+  （README 表里 3060 @T=16384 最高 8.81x——参考实现需要额外做头
   展开，且在小 query 下效率偏低）。
 - bf16/fp16 cache 把字节减半。batch 为 1 时 kernel 受延迟限制，
   绝对收益有限，batch 越大收益越大。

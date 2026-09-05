@@ -42,7 +42,7 @@ rounding.
 - **(honest)** marks rows where fusedtok loses: attention_prefill vs
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
   (0.40-0.57x), flat-distribution sample_topp vs torch's fully
-  parallel sort (0.17-0.25x for the singles; the batched flat rows
+  parallel sort (0.16-0.37x for the singles; the batched flat rows
   fall to 0.05-0.06x - see the batched table) and the wide-nucleus
   sample_minp row (0.28-0.39x - one widening retry plus a 32-64k
   sort; the torch boolean-mask composite never sorts). These are

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(fusedtok VERSION 1.4.1 LANGUAGES CXX CUDA)
+project(fusedtok VERSION 1.5.0 LANGUAGES CXX CUDA)
 
 # C++17 for host code and CUDA alike (nvcc defaults to C++17 on CUDA
 # 13 but pinning both keeps non-default toolchains from drifting)

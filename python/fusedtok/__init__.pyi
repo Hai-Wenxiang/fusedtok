@@ -19,9 +19,10 @@ Error contract (stable since 1.0):
 
 Selection determinism (stable since 1.0): top-k / top-p / argmax resolve
 ties toward the EARLIEST index. Sampling (sample_topp / sample_topk /
-sample_minp / the sample_*_batched variants / decode_step) is
-deterministic per seed (per row-seed for the batched variants); the RNG
-is a splitmix-style hash - reproducible, NOT cryptographically secure.
+sample_minp / the sample_*_batched variants / decode_step /
+decode_step_batched) is deterministic per seed (per row-seed for the
+batched variants); the RNG is a splitmix-style hash - reproducible,
+NOT cryptographically secure.
 """
 
 from typing import Any, Optional, Union
@@ -65,6 +66,7 @@ __all__ = [
     "qgemm",
     "qgemm_perchannel",
     "decode_step",
+    "decode_step_batched",
     "attention_decode",
     "kv_append",
     "attention_decode_paged",
@@ -128,6 +130,12 @@ def qgemm_perchannel(a_q: Array, a_scale: float, b_q: Array, b_scales: Array,
 def decode_step(logits: Array, sampled_ids: Array, penalty: float = 1.0, *,
                 p: float = 0.9, temperature: float = 1.0, seed: int = 0,
                 cuda: bool = False) -> int: ...
+def decode_step_batched(logits: Array, sampled_ids: Array,
+                        penalty: float = 1.0, *, p: float = 0.9,
+                        temperature: float = 1.0,
+                        seeds: Optional[Array] = None,
+                        ids_offsets: Optional[Array] = None,
+                        cuda: bool = False) -> Array: ...
 def attention_decode(q: Array, k_cache: Array, v_cache: Array,
                      lens: Optional[Array] = None,
                      *, cuda: bool = False) -> Array: ...

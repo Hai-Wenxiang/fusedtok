@@ -4,6 +4,78 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-09-05
+
+Batched decode steps: the whole penalize -> temperature -> sample chain
+for a `[rows, vocab]` batch in one call. One new API name (37 -> 38);
+511 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2); compute-sanitizer clean (memcheck 0 / racecheck 0)
+on the new paths; every benchmark number regenerated under the 1.5.0
+stamp.
+
+### Added
+- **`decode_step_batched(logits, sampled_ids, penalty, *, p,
+  temperature, seeds, ids_offsets)`** - per-row repetition penalties
+  riding the fused pipeline. Each row's history marks a per-row vocab
+  bitmap; every logit read applies the CTRL penalty to the RAW value
+  before the temperature scale (the composed reference order), so
+  per-row parity with `decode_step` holds up to the documented ulp
+  boundary - exact on the CPU paths (bit-identical to the single-row
+  composition) and for B = 1 on the GPU (same grid shape). Histories
+  arrive as a ragged list of per-row sequences, a 2-D array (every row
+  takes all its columns), or flat ids + `ids_offsets` (rows + 1
+  non-decreasing entries; the serving path that skips per-row Python).
+  Id values are validated on every path - the histories ride a small
+  per-attempt host upload, so there is no device-resident form to
+  trust. `penalty=1.0` or all-empty histories degenerate exactly to
+  `sample_topp_batched`. Rows process in chunks of 32; not CUDA-graph
+  capturable (the widening loop's per-attempt readback, same contract
+  as the other batched samplers). At B=8 @ 131k with ~64-token
+  histories: 5.2x over looping `decode_step` on peaked rows
+  (1676 -> 321 us on a 3060, on par with torch's native penalize +
+  softmax + batched-multinomial at 266 us) and 3.1x on mid-tail rows
+  (17.3 -> 5.5 ms).
+- Eleven mixed-widen-class tests over the existing batched samplers
+  (rows spanning first-window / moderate / full-vocabulary widen
+  classes in one batch, each row equal to itself sampled as a B = 1
+  batch) - schedule-independence assertions that pin the token
+  contract whatever the widening schedule.
+
+### Investigated, measured, and rejected
+- **Per-row window sizes inside one batched attempt** (the roadmap's
+  other 1.5 item): three implementations (per-row windows through a
+  tail array; host-side bucketing by window; a hybrid with one shared
+  launch per stage and bucketed sort ladders) all measured a net loss
+  or parity on an RTX 3060 at B = 8 and B = 32 - the serial
+  inverse-CDF walk (~1.5 ms per full-vocabulary round at 131k)
+  dominates every attempt round a wide row survives, top-p's widen
+  bound is only necessary (mid rows under-shoot and re-walk more than
+  right-sizing saves), and merge levels carry a ~75-200 us per-launch
+  floor that bucketing multiplies. Token batteries stayed within the
+  documented ulp boundary throughout - the feature is correct, just
+  not profitable on this cost structure. The uniform shared window
+  stays; revisit if the walk goes parallel or launch floors drop. The
+  hardening tests above are what survived from the investigation.
+
+### Fixed
+- The GPU topp/minp walkers (single-row, the emit_finish tails, and
+  the batched variants) now take the last nucleus element when a
+  float-boundary draw never reaches its target - the CPU reference's
+  long-standing fallback, which the top-k walker always had. The old
+  behavior left the sentinel and made the host re-widen an
+  already-covering window (in the extreme, a spurious "nucleus not
+  covered"). Unreachable in practice: a 3690-token battery vs 1.4.1
+  shows the same exact-or-rank-1 rate as a wheel-vs-wheel control.
+
+### Changed
+- Dead `level < 0` early-returns removed from the radix refinement
+  kernels (a leftover from a superseded stage-machine design; no
+  launch site ever passed a negative level) and the stale header
+  paragraph rewritten.
+- Comment accuracy: `BatchTail.active` is an int per row, not a
+  bitmap; the batched section note now counts the penalty context as
+  the fourth mechanical difference from the single-row kernels.
+
 ## [1.4.1] - 2026-09-05
 
 Audit-driven hardening release (the 1.2.1/1.3.1 playbook applied to the

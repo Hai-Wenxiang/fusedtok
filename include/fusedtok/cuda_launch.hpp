@@ -114,6 +114,21 @@ std::vector<long long> sample_minp_batched_launch(
     const std::vector<unsigned long long>& seeds,
     std::uintptr_t stream = 0);
 
+// Batched fused decode step (v1.5): x is [rows, n], ids is the ragged
+// history array (flat, row r's slice is ids[offs[r] .. offs[r+1]),
+// offs holds rows + 1 non-decreasing entries starting at 0 and ending
+// at ids.size()). Each row runs the single-row decode_step pipeline -
+// repetition penalty on the RAW logit, then temperature, then nucleus
+// sampling - with per-row parity up to the documented exptotal
+// arrival-order ulp boundary. Id values must be validated by the
+// caller (host-origin data); rows == 0 returns an empty vector. Same
+// per-attempt synchronization, so not CUDA-graph capturable.
+std::vector<long long> decode_step_batched_launch(
+    const float* x, int rows, int n, const std::vector<long long>& ids,
+    const std::vector<long long>& offs, float penalty, float p, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+
 // INT8 quantization: q = clamp(round(x * (1/scale))), scale = absmax/127
 // (written to scale_out device float). n elements.
 void quantize_int8_launch(const float* x, signed char* q,

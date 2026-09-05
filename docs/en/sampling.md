@@ -12,6 +12,7 @@ and GPU draws may differ.
 - [The fused samplers](#the-fused-samplers)
 - [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp---threshold-by-max-sampling-v13)
 - [Batched sampling - one call per decode step (v1.4)](#batched-sampling---one-call-per-decode-step-v14)
+- [Batched decode steps - penalties included (v1.5)](#batched-decode-steps---penalties-included-v15)
 - [The same-token guarantee](#the-same-token-guarantee)
 - [Flat distributions - the honest worst case](#flat-distributions---the-honest-worst-case)
 - [How the pipeline works](#how-the-pipeline-works)
@@ -137,8 +138,41 @@ inherent to returning tokens at all, so - like the single-row samplers
   batched-multinomial level, and `sample_topk_batched` wins outright
   (2.33x / 1.25x). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05-0.06x).
-- `decode_step` has no batched variant yet (the per-row penalty
-  bitmaps add a dimension; roadmap 1.5).
+- `decode_step` gained its batched variant in v1.5 - see the next
+  section.
+
+## Batched decode steps - penalties included (v1.5)
+
+```python
+tokens = fusedtok.decode_step_batched(
+    batch_logits, histories, penalty=1.3, seeds=seeds)
+```
+
+`decode_step_batched` runs the whole fused decode chain - repetition
+penalty over each row's own history, temperature, nucleus sampling -
+for a whole `[rows, vocab]` batch in one call, one token per row
+returned (int64 on the host, same contract as the batched samplers).
+
+- `sampled_ids` carries the per-row histories: a ragged sequence of
+  per-row sequences (list of lists), a 2-D integer array (every row
+  contributes ALL its columns - pad rows yourself or use the ragged
+  forms), or a flat 1-D integer array plus `ids_offsets` (`rows + 1`
+  non-decreasing entries starting at 0 and ending at the flat length;
+  the serving-fast path that skips per-row Python). Values must lie in
+  `[0, vocab)`.
+- Each row marks its history into a per-row vocab bitmap and every
+  logit read applies the penalty to the RAW value before the
+  temperature scale - the same composed order as `decode_step`, so
+  per-row parity holds up to the documented ulp boundary.
+- `penalty=1.0` or all-empty histories skip the bitmap traffic
+  entirely (the call degenerates to `sample_topp_batched` exactly).
+- Deterministic per (row, seed); not CUDA-graph capturable; rows are
+  processed in chunks of 32.
+- What batching buys: at B=8 on a 3060 with ~64-token histories, the
+  batched call is 3.1x faster than looping `decode_step` on
+  mid-tail logits (17.3 -> 5.5 ms) and 5.2x on peaked logits
+  (1676 -> 321 µs, on par with torch's native penalize + softmax +
+  batched-multinomial composite at 266 µs).
 
 ## The same-token guarantee
 
@@ -180,7 +214,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.17-0.25x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.16-0.37x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its

@@ -185,6 +185,31 @@ void check_batch_temp(double t) {
     if (!(t > 0.0))
         throw std::invalid_argument("temperature must be > 0");
 }
+
+// decode_step_batched ids/offsets validation (v1.5): offsets are the
+// ragged-history contract (rows + 1 non-decreasing entries, 0 to
+// length), and HOST-ORIGIN id values are range-checked - the values
+// are visible here, and the id arrays ride a host upload anyway, so
+// unlike device-resident lens/table data there is no sync to avoid.
+void check_batch_ids(const I64Array& ids, const I64Array& offs, int rows,
+                     int n) {
+    if (offs.size() != rows + 1)
+        throw std::invalid_argument(
+            "sampled_ids offsets must have rows + 1 entries");
+    if (offs.size() == 0 || offs.at(0) != 0 ||
+        offs.at(offs.size() - 1) != (long long)ids.size())
+        throw std::invalid_argument(
+            "sampled_ids offsets must start at 0 and end at its length");
+    for (size_t i = 1; i < offs.size(); ++i)
+        if (offs.at(i) < offs.at(i - 1))
+            throw std::invalid_argument(
+                "sampled_ids offsets must be non-decreasing");
+    const long long* p = ids.data();
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (p[i] < 0 || p[i] >= n)
+            throw std::invalid_argument(
+                "sampled_ids entries must be in [0, vocab)");
+}
 float* dfm(py::int_ p) { return reinterpret_cast<float*>((uintptr_t)p); }
 const long long* dll(py::int_ p) { return reinterpret_cast<const long long*>((uintptr_t)p); }
 long long* dllm(py::int_ p) { return reinterpret_cast<long long*>((uintptr_t)p); }
@@ -1070,6 +1095,90 @@ PYBIND11_MODULE(_fusedtok, m) {
             df(x), rows, n, (float)min_p, (float)t, seeds_vec(seeds),
             stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("min_p"),
+       py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
+
+    // ==================================================================
+    // batched fused decode step (v1.5): [rows, n] logits, ragged
+    // per-row histories (flat ids + rows + 1 offsets), one seed per
+    // row, one token per row. Same three entry styles as the other
+    // batched samplers; ids/offsets are host arrays on every path
+    // (they ride a small per-attempt upload), so their values are
+    // always validated - only the logits go zero-copy.
+    // ==================================================================
+
+    m.def("decode_step_batched_cpu",
+          [](FArray logits, int rows, int n, const I64Array& ids,
+             const I64Array& offs, double penalty, double p, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_ids(ids, offs, rows, n);
+        if (!(penalty > 0.0))
+            throw std::invalid_argument("penalty must be > 0");
+        check_batch_unit("p", p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        const long long* ip = ids.data();
+        const long long* op = offs.data();
+        return wrap_ivec(ft::decode_step_batched_cpu(
+            to_vec(logits), rows, n,
+            std::vector<long long>(ip, ip + ids.size()),
+            std::vector<long long>(op, op + offs.size()),
+            (float)penalty, (float)p, (float)t, seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("penalty") = 1.0, py::arg("p") = 0.9,
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("decode_step_batched",
+          [](FArray logits, int rows, int n, const I64Array& ids,
+             const I64Array& offs, double penalty, double p, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_ids(ids, offs, rows, n);
+        if (!(penalty > 0.0))
+            throw std::invalid_argument("penalty must be > 0");
+        check_batch_unit("p", p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return wrap_ivec({});
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const long long* ip = ids.data();
+        const long long* op = offs.data();
+        const std::vector<long long> tokens =
+            ft::decode_step_batched_launch(
+                dx.fget(), rows, n,
+                std::vector<long long>(ip, ip + ids.size()),
+                std::vector<long long>(op, op + offs.size()),
+                (float)penalty, (float)p, (float)t, seeds_vec(seeds));
+        sync_device("decode step batched kernel");
+        return wrap_ivec(tokens);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("penalty") = 1.0, py::arg("p") = 0.9,
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("decode_step_batched_launch",
+          [](py::int_ x, int rows, int n, const I64Array& ids,
+             const I64Array& offs, double penalty, double p, double t,
+             const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        check_batch_rows_n(rows, n);
+        check_batch_ids(ids, offs, rows, n);
+        if (!(penalty > 0.0))
+            throw std::invalid_argument("penalty must be > 0");
+        check_batch_unit("p", p);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        const long long* ip = ids.data();
+        const long long* op = offs.data();
+        return wrap_ivec(ft::decode_step_batched_launch(
+            df(x), rows, n,
+            std::vector<long long>(ip, ip + ids.size()),
+            std::vector<long long>(op, op + offs.size()),
+            (float)penalty, (float)p, (float)t, seeds_vec(seeds),
+            stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("penalty") = 1.0, py::arg("p") = 0.9,
        py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
 
 
