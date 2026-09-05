@@ -961,7 +961,7 @@ PYBIND11_MODULE(_fusedtok, m) {
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
         return ft::sample_topp_launch(df(x), n, (float)p, (float)t, seed, stream);
-    }, py::arg("logits"), py::arg("n"), py::arg("p"), py::arg("t"),
+    }, py::arg("x"), py::arg("n"), py::arg("p"), py::arg("t"),
        py::arg("seed"), py::arg("stream") = 0);
 
     // ==================================================================

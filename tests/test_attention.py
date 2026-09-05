@@ -181,7 +181,8 @@ PREFILL_SHAPES = [
     (2, 6, 3, 17, 16),         # odd S, group 2, batch
     (1, 32, 8, 40, 128),       # LLaMA-ish GQA
     (1, 4, 1, 33, 8),          # ragged S over the 16-row tiles
-    (1, 8, 2, 64, 256),        # max dim
+    (1, 8, 2, 64, 256),        # LPR=8 band's largest dim
+    (1, 4, 2, 9, 512),         # LPR=16 band + the dim <= 512 boundary
 ]
 
 

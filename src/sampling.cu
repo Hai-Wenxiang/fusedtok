@@ -124,7 +124,7 @@ long long sample_topp_cpu(const std::vector<float>& logits,
     }
 
     // splitmix64-finalized uniform, identical to the device side
-    const float u = splitmix_uniform_host(seed);
+    const float u = splitmix_uniform(seed);
 
     const float target = u * nucleus_mass;
     cum = 0.0f;
@@ -177,7 +177,7 @@ long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
     for (int i = 0; i < k; ++i) window_mass += mass_at((size_t)i);
 
     // splitmix64-finalized uniform, identical to the device side
-    const float u = splitmix_uniform_host(seed);
+    const float u = splitmix_uniform(seed);
 
     const float target = u * window_mass;
     float cum = 0.0f;
@@ -237,7 +237,7 @@ long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
     }
 
     // splitmix64-finalized uniform, identical to the device side
-    const float u = splitmix_uniform_host(seed);
+    const float u = splitmix_uniform(seed);
 
     const float target = u * nucleus_mass;
     float cum = 0.0f;

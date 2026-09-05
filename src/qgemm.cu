@@ -664,9 +664,15 @@ void qgemm_launch(const signed char* aq, const signed char* bq,
     cudaStream_t cs = (cudaStream_t)stream;
     // K == 0: every dot product is empty -> the output is zeros. The
     // float scale is irrelevant (0 * anything = 0; the CPU reference
-    // multiplies the zero accumulator the same way).
+    // multiplies the zero accumulator the same way). The memset is
+    // checked like every other call - a silently failed one would
+    // leave torch.empty garbage behind (the v0.4 bug class).
     if (k == 0) {
-        cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs);
+        if (cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs) !=
+            cudaSuccess)
+            throw std::runtime_error(
+                std::string("qgemm zero-fill failed: ") +
+                cudaGetErrorString(cudaGetLastError()));
         return;
     }
     if (m == 1) {
@@ -707,7 +713,11 @@ void qgemm_perchannel_launch(const signed char* aq, const signed char* bq,
     if (m == 0 || n == 0) return;
     cudaStream_t cs = (cudaStream_t)stream;
     if (k == 0) {
-        cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs);
+        if (cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs) !=
+            cudaSuccess)
+            throw std::runtime_error(
+                std::string("qgemm zero-fill failed: ") +
+                cudaGetErrorString(cudaGetLastError()));
         return;
     }
     if (m == 1) {

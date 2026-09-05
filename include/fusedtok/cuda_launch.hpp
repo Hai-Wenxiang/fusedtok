@@ -131,6 +131,10 @@ std::vector<long long> decode_step_batched_launch(
 
 // INT8 quantization: q = clamp(round(x * (1/scale))), scale = absmax/127
 // (written to scale_out device float). n elements.
+// Concurrency contract (quantize/qadd/attention workspace caches):
+// these launchers use process-global device scratch, so concurrent
+// calls on DISTINCT streams (or host threads) race that scratch -
+// serialize them, or give each stream its own process.
 void quantize_int8_launch(const float* x, signed char* q,
                           float* scale_out, long long n, std::uintptr_t stream = 0);
 // x[i] = q[i] * scale.
