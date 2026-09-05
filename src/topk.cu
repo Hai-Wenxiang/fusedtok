@@ -221,6 +221,44 @@ __global__ void penalty_bitmap_kernel(const long long* __restrict__ ids,
     atomicOr(&bm[id >> 6], 1ULL << (id & 63));
 }
 
+// Batched penalty context (v1.5 decode_step_batched): the per-row
+// bitmaps sit contiguously after the stripes, bmw words apart. Kernels
+// derive their row's PenCtx after the row lookup; use == 0 (and the
+// samplers' kNoPenB below) selects the plain no-bitmap path.
+struct PenCtxB {
+    const unsigned long long* bm;   // row 0's bitmap base
+    float penalty;
+    int use;
+    int bmw;                        // bitmap words per row
+};
+
+__device__ __forceinline__ PenCtx b_pen(PenCtxB b, int row) {
+    return PenCtx{b.bm + (size_t)row * b.bmw, b.penalty, b.use};
+}
+
+constexpr PenCtxB kNoPenB{nullptr, 1.0f, 0, 0};
+
+// Batched bitmap build: the histories are ragged - one flat id array
+// plus per-row offsets (offs[r] .. offs[r+1] is row r). One thread per
+// id; the owning row comes from a short binary search over the offsets
+// (rows <= kBMaxBatch + 1 entries). atomicOr tolerates duplicate ids;
+// id values were validated host-side before the upload (the offsets
+// themselves too - monotone, in [0, m]).
+__global__ void penalty_bitmap_b_kernel(
+    const long long* __restrict__ ids, const int* __restrict__ offs,
+    int rows, int bmw, unsigned long long* __restrict__ bm_base) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= offs[rows]) return;
+    int lo = 0, hi = rows - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= j) lo = mid;
+        else hi = mid - 1;
+    }
+    const int id = (int)ids[j];
+    atomicOr(&bm_base[(size_t)lo * bmw + (id >> 6)], 1ULL << (id & 63));
+}
+
 // ---------------------------------------------------------------------------
 // per-call pointer block (graph-indirect arguments)
 // ---------------------------------------------------------------------------
@@ -340,14 +378,14 @@ __device__ __forceinline__ void bitonic_desc_shared(unsigned long long* sk,
 // stage 1/2: radix refinement rounds + early-exit compaction
 // ---------------------------------------------------------------------------
 
-// One launch per byte level (7..0), plus one extra "finalize" launch with
-// level == -1. Behavior is driven by the stage word so the host can issue
-// the full fixed sequence unconditionally (CUDA-graph friendly):
+// One launch per byte level (7..0); the compaction and the k_min
+// publish live in the separate select_finalize_kernel. Behavior is
+// driven by the stage word so the host can issue the full fixed
+// sequence unconditionally (CUDA-graph friendly):
 //   stage 0 (refine)  - histogram byte `level` of the candidates whose
 //                       bytes above this level match the prefix; the last
 //                       arriving block scans the global histogram and
-//                       tightens the prefix. level == -1 refines nothing:
-//                       the prefix is already the full k-th key.
+//                       tightens the prefix.
 //   stage 1/2         - return immediately: compaction and the k_min
 //                       publish belong to select_finalize_kernel (kept
 //                       out of this kernel so the rounds run with 2KB of
@@ -367,7 +405,6 @@ __global__ void select_round_kernel(const SelArgs* __restrict__ a,
 
     const unsigned long long stage = ws[kWsStage];
     if (stage != 0ULL) return;                       // settle/compact elsewhere
-    if (level < 0) return;                           // finalize: not here
 
     unsigned long long* hist = ws;
     unsigned long long* ticket = ws + kWsTicket;
@@ -598,14 +635,21 @@ __global__ void emit_finish_kernel(const SelArgs* __restrict__ a,
         const float u = splitmix_uniform_device(seed);
         const float target = u * nucleus_mass;
         cum = 0.0f;
+        int hit = -1;
         for (int i = 0; i < nucleus; ++i) {
             cum += __expf(unfkey((unsigned)(sk[i] >> 32)) - row_max);
             if (cum >= target) {
-                *token_out = (int)(0xFFFFFFFFu -
-                                   (unsigned)(sk[i] & 0xFFFFFFFFu));
+                hit = i;
                 break;
             }
         }
+        // a float-boundary draw that never reaches target takes the
+        // last nucleus element - the CPU reference's fallback (the
+        // topk walker has always done this)
+        if (hit < 0)
+            hit = nucleus - 1;
+        *token_out = (int)(0xFFFFFFFFu -
+                           (unsigned)(sk[hit] & 0xFFFFFFFFu));
         if (count_out) *count_out = nucleus;
         return;
     }
@@ -1062,9 +1106,13 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     const float u = splitmix_uniform_device(seed);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
-    if (hit >= 0)
-        *token_out = (int)(0xFFFFFFFFu -
-                           (unsigned)(keys[hit] & 0xFFFFFFFFu));
+    // a float-boundary draw that never reaches target takes the last
+    // nucleus element - the CPU reference's fallback (topk's walker
+    // has always done this); without it the sentinel stays and the
+    // host widens a window that already covers the nucleus
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
     if (count_out) *count_out = nucleus;
 }
 
@@ -1952,9 +2000,11 @@ __global__ void sample_minp_serial_kernel(
     const float u = splitmix_uniform_device(seed);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
-    if (hit >= 0)
-        *token_out = (int)(0xFFFFFFFFu -
-                           (unsigned)(keys[hit] & 0xFFFFFFFFu));
+    // float-boundary fallback: the last nucleus element, same as the
+    // CPU reference and the topk walker
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
 long long sample_minp_launch(const float* x, int n, float min_p, float t,
@@ -2052,11 +2102,11 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
 }
 
 // ---------------------------------------------------------------------------
-// batched sampling (v1.4): sample_topp/minp/topk_batched - [rows, n]
-// logits in, one token per row out.
+// batched sampling (v1.4): sample_topp/minp/topk_batched (v1.5 adds
+// decode_step_batched) - [rows, n] logits in, one token per row out.
 //
 // Design: the per-row pipeline IS the single-row pipeline. Every kernel
-// below is the single-row body with three mechanical changes (keep in
+// below is the single-row body with four mechanical changes (keep in
 // sync with the originals when they change):
 //   1. blocks decompose as blockIdx.x = row * gpr + local, where gpr is
 //      exactly the single-row grid size - a row's blocks see the same
@@ -2067,9 +2117,13 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
 //   3. the per-row scalars the HOST widens on (token / cum mass /
 //      total) live in compact tail arrays after the stripes - one small
 //      readback per attempt instead of B strided 4/8-byte copies (the
-//      per-copy cost dominates at B > 4 on submission-bound hosts).
+//      per-copy cost dominates at B > 4 on submission-bound hosts);
+//   4. the repetition-penalty context travels as PenCtxB (the bitmap
+//      base plus a per-row stride) instead of a ready PenCtx - each
+//      kernel derives its row's context with b_pen; the plain samplers
+//      pass kNoPenB and never touch a bitmap.
 // The widening loop keeps ONE uniform window for the still-active rows
-// (a row that already sampled is skipped through an active-row bitmap
+// (a row that already sampled is skipped through an active-row array
 // and costs only the early-return branch); the next window is the max
 // over the failed rows' bounds (the single-row widen_window /
 // widen_window_minp formulas evaluated per row), pow2-rounded. A row's
@@ -2124,8 +2178,15 @@ inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
     t.totals = reinterpret_cast<float*>(ws + stripes + 2 * (size_t)rows +
                                        pairs);
     t.active = reinterpret_cast<int*>(ws + stripes + 2 * (size_t)rows +
-                                     2 * pairs);
+                                      2 * pairs);
     return t;
+}
+
+// decode_step_batched's tail sits after its bitmap and id scratch
+// regions (same layout, shifted base)
+inline BatchTail batch_tail_at(unsigned long long* ws, size_t base,
+                               int rows) {
+    return batch_tail(ws + base, 0, rows);
 }
 
 // per-attempt scalar reset for the ACTIVE rows: tokens preset to the
@@ -2147,23 +2208,26 @@ __global__ void batch_preset_kernel(long long* __restrict__ tokens,
         }
 }
 
-// select_round_kernel with the row decomposition (see the section note;
-// penalty context intentionally absent - decode_step stays single-row)
+// select_round_kernel with the row decomposition (see the section
+// note). penalty context: decode_step_batched passes a per-row bitmap
+// through pb (b_pen derives the row's PenCtx); the plain samplers pass
+// kNoPenB.
 __global__ void select_round_b_kernel(
     const float* __restrict__ x, unsigned long long* __restrict__ ws,
     long long stride, int n, int level, unsigned long long remaining0,
-    float inv_t, int gpr, const int* __restrict__ active) {
+    float inv_t, int gpr, const int* __restrict__ active,
+    PenCtxB pb) {
     const int row = blockIdx.x / gpr;
     if (!active[row]) return;
     const int lid = blockIdx.x % gpr;
     const float* __restrict__ x_row = x + (size_t)row * n;
     unsigned long long* __restrict__ ws_row = ws + (size_t)row * stride;
+    const PenCtx pen = b_pen(pb, row);
     __shared__ unsigned long long sh_hist[256];
     __shared__ int sh_ticket;
 
     const unsigned long long stage = ws_row[kWsStage];
     if (stage != 0ULL) return;
-    if (level < 0) return;
 
     unsigned long long* hist = ws_row;
     unsigned long long* ticket = ws_row + kWsTicket;
@@ -2223,16 +2287,18 @@ __global__ void select_round_b_kernel(
     if (threadIdx.x == 0) *ticket = 0ULL;
 }
 
-// select_finalize_kernel with the row decomposition
+// select_finalize_kernel with the row decomposition (penalty context
+// through pb, same as select_round_b)
 __global__ void select_finalize_b_kernel(
     const float* __restrict__ x, unsigned long long* __restrict__ ws,
     long long stride, int n, float inv_t, int gpr,
-    const int* __restrict__ active) {
+    const int* __restrict__ active, PenCtxB pb) {
     const int row = blockIdx.x / gpr;
     if (!active[row]) return;
     const int lid = blockIdx.x % gpr;
     const float* __restrict__ x_row = x + (size_t)row * n;
     unsigned long long* __restrict__ ws_row = ws + (size_t)row * stride;
+    const PenCtx pen = b_pen(pb, row);
     __shared__ int sh_ticket;
     const unsigned long long stage = ws_row[kWsStage];
     if (stage == 2ULL) return;
@@ -2251,7 +2317,7 @@ __global__ void select_finalize_b_kernel(
     for (int i = lid * blockDim.x + threadIdx.x; i < n;
          i += gpr * blockDim.x) {
         const unsigned long long key =
-            pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+            pack_key(step_logit(x_row, i, inv_t, pen), i);
         if ((key & mask) == prefix) {
             const unsigned long long pos = atomicAdd(cand_cnt, 1ULL);
             if (pos < (unsigned long long)kSelEarlyOut) cand[pos] = key;
@@ -2287,11 +2353,12 @@ __global__ void select_finalize_b_kernel(
 
 // emit_selected with the row decomposition (block-local index and
 // row-relative grid; the two-level counting, k == n pack and tie slots
-// are the single-row logic verbatim)
+// are the single-row logic verbatim; the caller passes the row's
+// already-derived penalty context)
 __device__ __forceinline__ void emit_selected_b(
     const float* __restrict__ x_row,
     unsigned long long* __restrict__ ws_row,
-    int n, int k, float inv_t, int lid, int gpr) {
+    int n, int k, float inv_t, int lid, int gpr, PenCtx pen) {
     const unsigned long long k_min = ws_row[kWsPrefix];
     const unsigned long long tie_take = ws_row[kWsRemaining];
     unsigned long long* keys = ws_row + kWsKeys;
@@ -2301,7 +2368,7 @@ __device__ __forceinline__ void emit_selected_b(
     if (k == n) {
         for (int i = lid * blockDim.x + threadIdx.x; i < n;
              i += gpr * blockDim.x)
-            keys[i] = pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+            keys[i] = pack_key(step_logit(x_row, i, inv_t, pen), i);
         return;
     }
 
@@ -2314,7 +2381,7 @@ __device__ __forceinline__ void emit_selected_b(
         const int i = base + threadIdx.x;
         if (i < n) {
             const unsigned long long key =
-                pack_key(step_logit(x_row, i, inv_t, kNoPen), i);
+                pack_key(step_logit(x_row, i, inv_t, pen), i);
             if (key > k_min) {
                 const unsigned long long pos = atomicAdd(&sh_cnt, 1ULL);
                 if (pos < (unsigned long long)kSelBlock) sh_keys[pos] = key;
@@ -2352,14 +2419,15 @@ __global__ void emit_finish_b_kernel(
     const unsigned long long* __restrict__ seeds,
     long long* __restrict__ tokens, float* __restrict__ cumws,
     const float* __restrict__ totals, int gpr,
-    const int* __restrict__ active) {
+    const int* __restrict__ active, PenCtxB pb) {
     const int row = blockIdx.x / gpr;
     if (!active[row]) return;
     const int lid = blockIdx.x % gpr;
     const float* __restrict__ x_row = x + (size_t)row * n;
     unsigned long long* __restrict__ ws_row = ws + (size_t)row * stride;
     __shared__ int sh_ticket;
-    emit_selected_b(x_row, ws_row, n, k, inv_t, lid, gpr);
+    emit_selected_b(x_row, ws_row, n, k, inv_t, lid, gpr,
+                    b_pen(pb, row));
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence();
@@ -2402,26 +2470,33 @@ __global__ void emit_finish_b_kernel(
     const float u = splitmix_uniform_device(seeds[row]);
     const float target = u * nucleus_mass;
     cum = 0.0f;
+    int hit = -1;
     for (int i = 0; i < nucleus; ++i) {
         cum += __expf(unfkey((unsigned)(sk[i] >> 32)) - row_max);
         if (cum >= target) {
-            tokens[row] = (long long)(0xFFFFFFFFu -
-                                      (unsigned)(sk[i] & 0xFFFFFFFFu));
+            hit = i;
             break;
         }
     }
+    // float-boundary fallback: the last nucleus element, same as the
+    // CPU reference (the topk walker has always done this)
+    if (hit < 0)
+        hit = nucleus - 1;
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(sk[hit] & 0xFFFFFFFFu));
 }
 
-// emit_kernel with the row decomposition
+// emit_kernel with the row decomposition (penalty context through pb)
 __global__ void emit_b_kernel(const float* __restrict__ x,
                               unsigned long long* __restrict__ ws,
                               long long stride, int n, int k, float inv_t,
-                              int gpr, const int* __restrict__ active) {
+                              int gpr, const int* __restrict__ active,
+                              PenCtxB pb) {
     const int row = blockIdx.x / gpr;
     if (!active[row]) return;
     const int lid = blockIdx.x % gpr;
     emit_selected_b(x + (size_t)row * n, ws + (size_t)row * stride, n, k,
-                    inv_t, lid, gpr);
+                    inv_t, lid, gpr, b_pen(pb, row));
 }
 
 // chunk_sort_kernel row-decomposed: one grid-stride space over
@@ -2522,21 +2597,24 @@ __global__ void exp_window_b_kernel(
 
 // expmax/exptotal row-decomposed (the max lives in the row stripe's
 // kWsExpMax slot - zeroed by the per-attempt stripe memset; the total
-// accumulates into the compact tail array, zeroed by batch_preset)
+// accumulates into the compact tail array, zeroed by batch_preset;
+// penalty context through pb)
 __global__ void expmax_b_kernel(const float* __restrict__ x,
                                 unsigned long long* __restrict__ ws,
                                 long long stride, int n, float inv_t,
-                                int gpr, const int* __restrict__ active) {
+                                int gpr, const int* __restrict__ active,
+                                PenCtxB pb) {
     const int row = blockIdx.x / gpr;
     if (!active[row]) return;
     const int lid = blockIdx.x % gpr;
     const float* x_row = x + (size_t)row * n;
     unsigned long long* ws_row = ws + (size_t)row * stride;
+    const PenCtx pen = b_pen(pb, row);
     __shared__ unsigned int warp_best[kSelWarps];
     unsigned int best = 0u;
     for (int i = lid * blockDim.x + threadIdx.x; i < n;
          i += gpr * blockDim.x) {
-        const unsigned int fk = fkey(step_logit(x_row, i, inv_t, kNoPen));
+        const unsigned int fk = fkey(step_logit(x_row, i, inv_t, pen));
         if (fk > best) best = fk;
     }
     #pragma unroll
@@ -2558,17 +2636,19 @@ __global__ void exptotal_b_kernel(const float* __restrict__ x,
                                   unsigned long long* __restrict__ ws,
                                   long long stride, int n, float inv_t,
                                   float* __restrict__ totals, int gpr,
-                                  const int* __restrict__ active) {
+                                  const int* __restrict__ active,
+                                  PenCtxB pb) {
     const int row = blockIdx.x / gpr;
     if (!active[row]) return;
     const int lid = blockIdx.x % gpr;
     const float* x_row = x + (size_t)row * n;
     unsigned long long* ws_row = ws + (size_t)row * stride;
+    const PenCtx pen = b_pen(pb, row);
     const float row_max = unfkey((unsigned)ws_row[kWsExpMax]);
     float s = 0.0f;
     for (int i = lid * blockDim.x + threadIdx.x; i < n;
          i += gpr * blockDim.x)
-        s += __expf(step_logit(x_row, i, inv_t, kNoPen) - row_max);
+        s += __expf(step_logit(x_row, i, inv_t, pen) - row_max);
     __shared__ float warp_sum[kSelWarps];
     s = warp_reduce_sum(s);
     const int lane = threadIdx.x & 31;
@@ -2614,9 +2694,11 @@ __global__ void sample_serial_b_kernel(
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
                                  cps_stride);
-    if (hit >= 0)
-        tokens[row] = (long long)(0xFFFFFFFFu -
-                                  (unsigned)(keys[hit] & 0xFFFFFFFFu));
+    // float-boundary fallback: the last nucleus element, same as the
+    // CPU reference and the topk walker
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
 // sample_minp_serial_kernel row-decomposed (value-threshold walk; on
@@ -2648,9 +2730,11 @@ __global__ void sample_minp_serial_b_kernel(
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
                                  cps_stride);
-    if (hit >= 0)
-        tokens[row] = (long long)(0xFFFFFFFFu -
-                                  (unsigned)(keys[hit] & 0xFFFFFFFFu));
+    // float-boundary fallback: the last nucleus element, same as the
+    // CPU reference and the topk walker
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
 // sample_topk_serial_kernel row-decomposed (the k-window is covered by
@@ -2729,26 +2813,28 @@ std::vector<long long> sample_nucleus_batched_chunk(
             for (int level = 7; level >= 0; --level)
                 select_round_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                     x, ws, stride, n, level, (unsigned long long)window,
-                    inv_t, gpr, tail.active);
+                    inv_t, gpr, tail.active, kNoPenB);
             select_finalize_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                x, ws, stride, n, inv_t, gpr, tail.active);
+                x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
             check_launch("batch selection launch");
         }
         if (mode == 0) {
             expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                x, ws, stride, n, inv_t, gpr, tail.active);
+                x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
             exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                x, ws, stride, n, inv_t, tail.totals, gpr, tail.active);
+                x, ws, stride, n, inv_t, tail.totals, gpr, tail.active,
+                kNoPenB);
             check_launch("batch mass launch");
         }
         if (mode == 0 && !full && window <= kSelEarlyOut) {
             emit_finish_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                 x, ws, stride, n, window, inv_t, thr, tail.seeds,
-                tail.tokens, tail.cumws, tail.totals, gpr, tail.active);
+                tail.tokens, tail.cumws, tail.totals, gpr, tail.active,
+                kNoPenB);
             check_launch("batch emit+finish launch");
         } else {
             emit_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                x, ws, stride, n, window, inv_t, gpr, tail.active);
+                x, ws, stride, n, window, inv_t, gpr, tail.active, kNoPenB);
             const int chunks = (m + kSelSortChunk - 1) / kSelSortChunk;
             const int gsort = (int)std::max<long long>(
                 1LL, std::min<long long>((long long)rows * chunks,
@@ -2836,10 +2922,10 @@ std::vector<long long> sample_nucleus_batched_chunk(
                 // (same stream, its kWsCumW stores are already
                 // visible through the sync above)
                 expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                    x, ws, stride, n, inv_t, gpr, tail.active);
+                    x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
                 exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                    x, ws, stride, n, inv_t, tail.totals, gpr,
-                    tail.active);
+                    x, ws, stride, n, inv_t, tail.totals, gpr, tail.active,
+                    kNoPenB);
                 check_launch("batch mass launch");
                 err = cudaStreamSynchronize(cs);
                 if (err != cudaSuccess)
@@ -2873,10 +2959,206 @@ std::vector<long long> sample_nucleus_batched_chunk(
     }
 }
 
+// per-chunk sequencer for the fused batched decode step (v1.5): the
+// nucleus sequencer's mode-0 flow with a penalty context riding every
+// logit read. Workspace layout per attempt: stripes | per-row vocab
+// bitmaps | flat ids + row offsets | compact tail. The bitmaps are
+// ORed, so the per-attempt memset spans stripes + bitmaps in ONE
+// contiguous clear and the build kernel re-runs every attempt (ids
+// never change, but the clear is simpler than tracking reallocs - the
+// same trade the single-row launcher makes). The ids/offsets ride
+// past the memset zone and are re-uploaded per attempt (tiny, and
+// safe across the workspace's monotone growth).
+std::vector<long long> decode_step_batched_chunk(
+    const float* x, int rows, int n, const long long* ids,
+    const int* offs, int m_total, float penalty, float p, float t,
+    const unsigned long long* seeds, std::uintptr_t stream) {
+    cudaStream_t cs = (cudaStream_t)stream;
+    const int gpr = selection_grid(n);
+    const float inv_t = 1.0f / t;
+    const size_t bmw = ((size_t)n + 63) / 64;
+    const size_t bm_words = (size_t)rows * bmw;
+    const int use_pen = (m_total > 0 && penalty != 1.0f) ? 1 : 0;
+    std::vector<long long> tokens(rows, -1);
+    std::vector<int> active(rows, 1);
+    std::vector<double> total(rows, -1.0);
+    std::vector<float> cum_h(rows, 0.0f), tot_h(rows, 0.0f);
+    std::vector<int> offs_v(offs, offs + rows + 1);
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;
+        const long long stride = kWsHead + kSelEarlyOut + 2 * (long long)m;
+        const size_t stripes = (size_t)rows * (size_t)stride;
+        const size_t ids_words = (size_t)m_total;   // one i64 per word
+        const size_t offs_words = ((size_t)rows + 2) / 2;
+        const size_t tail_base = stripes + bm_words + ids_words +
+                                 offs_words;
+        const size_t words = tail_base + batch_tail_words(rows);
+        unsigned long long* ws = selection_workspace(words);
+        unsigned long long* bm_base = ws + stripes;
+        long long* ids_d = reinterpret_cast<long long*>(ws + stripes +
+                                                        bm_words);
+        int* offs_d = reinterpret_cast<int*>(
+            ws + stripes + bm_words + ids_words);
+        const BatchTail tail = batch_tail_at(ws, tail_base, rows);
+        const PenCtxB pb{bm_base, penalty, use_pen, (int)bmw};
+        const cudaError_t up1 = cudaMemcpyAsync(
+            tail.seeds, seeds, (size_t)rows * 8, cudaMemcpyHostToDevice,
+            cs);
+        const cudaError_t up2 = (up1 == cudaSuccess)
+            ? cudaMemcpyAsync(tail.active, active.data(), (size_t)rows * 4,
+                              cudaMemcpyHostToDevice, cs)
+            : up1;
+        const cudaError_t up3 =
+            (up2 == cudaSuccess && m_total > 0)
+                ? cudaMemcpyAsync(ids_d, ids, (size_t)m_total * 8,
+                                  cudaMemcpyHostToDevice, cs)
+                : up2;
+        const cudaError_t up4 = (up3 == cudaSuccess)
+            ? cudaMemcpyAsync(offs_d, offs_v.data(),
+                              (size_t)(rows + 1) * 4,
+                              cudaMemcpyHostToDevice, cs)
+            : up3;
+        if (up1 != cudaSuccess || up2 != cudaSuccess ||
+            up3 != cudaSuccess || up4 != cudaSuccess)
+            throw std::runtime_error(
+                std::string("batch decode args upload failed: ") +
+                cudaGetErrorString(up1 != cudaSuccess ? up1
+                                    : up2 != cudaSuccess ? up2
+                                    : up3 != cudaSuccess ? up3 : up4));
+        batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
+            tail.tokens, tail.cumws, tail.totals, tail.active, rows);
+        // one contiguous clear over stripes + bitmaps (the bitmaps are
+        // ORed, so they must start zero every attempt)
+        cudaMemsetAsync(ws, 0,
+                        (stripes + bm_words) *
+                            sizeof(unsigned long long),
+                        cs);
+        if (use_pen)
+            penalty_bitmap_b_kernel<<<
+                (int)((m_total + kSelBlock - 1) / kSelBlock), kSelBlock,
+                0, cs>>>(ids_d, offs_d, rows, (int)bmw, bm_base);
+        const int grid = rows * gpr;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    x, ws, stride, n, level, (unsigned long long)window,
+                    inv_t, gpr, tail.active, pb);
+            select_finalize_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, inv_t, gpr, tail.active, pb);
+            check_launch("batch decode selection launch");
+        }
+        expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+            x, ws, stride, n, inv_t, gpr, tail.active, pb);
+        exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+            x, ws, stride, n, inv_t, tail.totals, gpr, tail.active, pb);
+        check_launch("batch decode mass launch");
+        if (!full && window <= kSelEarlyOut) {
+            emit_finish_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, window, inv_t, p, tail.seeds,
+                tail.tokens, tail.cumws, tail.totals, gpr, tail.active,
+                pb);
+            check_launch("batch decode emit+finish launch");
+        } else {
+            emit_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                x, ws, stride, n, window, inv_t, gpr, tail.active, pb);
+            const int chunks = (m + kSelSortChunk - 1) / kSelSortChunk;
+            const int gsort = (int)std::max<long long>(
+                1LL, std::min<long long>((long long)rows * chunks,
+                                         4 * kMaxGrid));
+            chunk_sort_b_kernel<<<gsort, kSelBlock, 0, cs>>>(
+                ws, stride, window, m, rows, tail.active);
+            int cur = 0;
+            for (int run = kSelSortChunk; run < m; run <<= 1) {
+                const long long ntiles = m / kSelMergeTile;
+                const int gmerge = (int)std::max<long long>(
+                    1LL, std::min<long long>((long long)rows * ntiles,
+                                             4 * kMaxGrid));
+                merge_level_b_kernel<<<gmerge, kSelBlock, 0, cs>>>(
+                    ws + kWsKeys + (cur ? m : 0),
+                    ws + kWsKeys + (cur ? 0 : m), stride, m, run, rows,
+                    tail.active);
+                cur ^= 1;
+            }
+            const int sorted_off = kWsKeys + (cur ? m : 0);
+            const int mate_off = kWsKeys + (cur ? 0 : m);
+            const int gw = selection_grid(window);
+            exp_window_b_kernel<<<rows * gw, kSelBlock, 0, cs>>>(
+                ws + sorted_off, ws + mate_off, stride, window, gw,
+                tail.active);
+            sample_serial_b_kernel<<<rows, 32,
+                                     walk_cp_slots(window) *
+                                         sizeof(float),
+                                     cs>>>(
+                ws, stride, sorted_off, mate_off, window, n, p,
+                tail.seeds, tail.tokens, tail.cumws, tail.totals,
+                tail.active);
+            check_launch("batch decode tail launch");
+        }
+        cudaError_t err = cudaStreamSynchronize(cs);
+        if (err != cudaSuccess)
+            throw std::runtime_error(
+                std::string("batch decode failed: ") +
+                cudaGetErrorString(err));
+        std::vector<long long> tok(rows);
+        if (cudaMemcpy(tok.data(), tail.tokens, (size_t)rows * 8,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("batch decode readback failed");
+        bool all = true;
+        for (int r = 0; r < rows; ++r) {
+            if (active[r] && tok[r] >= 0) {
+                tokens[r] = tok[r];
+                active[r] = 0;
+            }
+            if (active[r])
+                all = false;
+        }
+        if (all)
+            return tokens;
+        if (window == n)
+            throw std::runtime_error(
+                "batch decode nucleus not covered");
+        // widen under the shared window: per failed row the single-row
+        // topp bound, then the pow2 max (same policy as the samplers)
+        if (cudaMemcpy(cum_h.data(), tail.cumws, (size_t)rows * 4,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("batch decode cum readback failed");
+        bool totals_missing = false;
+        for (int r = 0; r < rows; ++r)
+            if (active[r] && total[r] < 0.0) totals_missing = true;
+        if (totals_missing) {
+            if (cudaMemcpy(tot_h.data(), tail.totals, (size_t)rows * 4,
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error(
+                    "batch decode total readback failed");
+            for (int r = 0; r < rows; ++r)
+                if (active[r]) total[r] = (double)tot_h[r];
+        }
+        long long want = (long long)window * 8;
+        for (int r = 0; r < rows; ++r) {
+            if (!active[r]) continue;
+            const long long lb =
+                topp_widen_bound(window, (double)p, total[r],
+                                 (double)cum_h[r]);
+            want = std::max<long long>(want, lb);
+        }
+        if (want >= n) {
+            window = n;
+        } else {
+            int mp = 1;
+            while (mp < want) mp <<= 1;
+            window = std::min(n, mp);
+        }
+    }
+}
+
+
 // per-chunk sequencer for top-k: one attempt, the k-window is covered
 // by construction. Same kernel sequence as the nucleus sequencer above
 // plus the k == n parallel-pack fast path the single-row topk launcher
-// lacks; the always-on active bitmap is dead weight here (topk rows
+// lacks; the always-on active array is dead weight here (topk rows
 // never deactivate) and exists only so the kernels stay identical
 // across the two sequencers.
 std::vector<long long> sample_topk_batched_chunk(
@@ -2916,13 +3198,13 @@ std::vector<long long> sample_topk_batched_chunk(
         for (int level = 7; level >= 0; --level)
             select_round_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                 x, ws, stride, n, level, (unsigned long long)k, inv_t,
-                gpr, tail.active);
+                gpr, tail.active, kNoPenB);
         select_finalize_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-            x, ws, stride, n, inv_t, gpr, tail.active);
+            x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
         check_launch("batch selection launch");
     }
     emit_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-        x, ws, stride, n, k, inv_t, gpr, tail.active);
+        x, ws, stride, n, k, inv_t, gpr, tail.active, kNoPenB);
     const int chunks = (m + kSelSortChunk - 1) / kSelSortChunk;
     const int gsort = (int)std::max<long long>(
         1LL, std::min<long long>((long long)rows * chunks, 4 * kMaxGrid));
@@ -3035,6 +3317,49 @@ std::vector<long long> sample_topk_batched_launch(
         const int b = std::min(kBMaxBatch, rows - c);
         auto chunk = sample_topk_batched_chunk(
             x + (size_t)c * n, b, n, k, t, seeds.data() + c, stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
+std::vector<long long> decode_step_batched_launch(
+    const float* x, int rows, int n, const std::vector<long long>& ids,
+    const std::vector<long long>& offs, float penalty, float p, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("decode of empty logits");
+    if (!(penalty > 0.0f))
+        throw std::invalid_argument("penalty must be > 0");
+    if (!(p > 0.0f && p <= 1.0f))
+        throw std::invalid_argument("p must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if ((int)offs.size() != rows + 1)
+        throw std::invalid_argument(
+            "sampled_ids offsets must have rows + 1 entries");
+    if (offs.front() != 0 || offs.back() != (long long)ids.size())
+        throw std::invalid_argument(
+            "sampled_ids offsets must start at 0 and end at its length");
+    for (size_t i = 1; i < offs.size(); ++i)
+        if (offs[i] < offs[i - 1])
+            throw std::invalid_argument(
+                "sampled_ids offsets must be non-decreasing");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        // chunk-local offsets; the ids slice rides the flat array
+        std::vector<int> local(b + 1);
+        for (int r = 0; r <= b; ++r)
+            local[r] = (int)(offs[c + r] - offs[c]);
+        auto chunk = decode_step_batched_chunk(
+            x + (size_t)c * n, b, n, ids.data() + offs[c], local.data(),
+            local[b], penalty, p, t, seeds.data() + c, stream);
         std::copy(chunk.begin(), chunk.end(), out.begin() + c);
     }
     return out;

@@ -19,7 +19,7 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 
 ## 算子总览
 
-共 37 个算子与辅助函数（1.x 系列冻结的 `fusedtok.__all__`，见下方"API
+共 38 个算子与辅助函数（1.x 系列冻结的 `fusedtok.__all__`，见下方"API
 稳定性"）。`axpy` 是 v0.x 骨架保留至今的入门演示算子——可用，但不是
 性能特性。
 
@@ -40,6 +40,7 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 | ✅ | sample_topp/minp/topk_batched | 批量采样（v1.4）：一次调用处理整个 `[行数, 词表]` 的 logits，每行按各自种子各出一个 token——每行原封不动地复用单行管线（逐行结果一致）；相比逐行循环，收益纯粹来自省掉逐行的提交开销：受提交延迟限制的主机（如 Windows/WDDM）上墙上时钟时间快 4-6 倍，尖峰解码分布下与 torch 原生批量 multinomial 同档 |
 | ✅ | repetition penalty | CTRL 风格，作用于已生成的 token |
 | ✅ | decode_step | 整个解码步一次融合调用：重复惩罚 -> 温度 -> top-p 采样，一次调用一次回读 |
+| ✅ | decode_step_batched | 整个批的融合解码步（v1.5）：逐行 ragged 历史经逐行惩罚位图进入同一融合管线，每行按种子各出一个 token——每行跑单行 `decode_step` 管线，一致到文档化的 ulp 边界为止 |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | 对称逐张量 INT8，融合的反量化-相加-再量化 |
 | ✅ | qgemm | INT8 矩阵乘，int32 精确：cp.async 双缓冲流水线 IMMA GEMM + 运行时 tile 调优（64x64 / 128x128）+ 每 warp 一行的 GEMV（M=1 解码；速度约为 fp16 投影的 2 倍） |
 | ✅ | qgemm_perchannel | 真实 INT8 推理所用的 W8A8 布局：逐输出通道权重 scale 融合进同一 kernel 的 epilogue，零开销 |
@@ -147,6 +148,10 @@ token = fusedtok.sample_topk(logits, k=50, temperature=0.8, seed=step)
 # 并发解码整批出 token：[行数, 词表] 进、每行一个（种子默认 0..行数-1）
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9,
                                       temperature=0.8)
+# ……含逐行重复惩罚：ragged 历史，"扁平数组 + 偏移"是服务端快路径
+tokens = fusedtok.decode_step_batched(batch_logits, flat_ids,
+                                      penalty=1.1, p=0.9,
+                                      ids_offsets=offsets)
 ```
 
 一个最小的逐 token 采样循环：
@@ -187,7 +192,7 @@ float32）。
 ## API 稳定性
 
 1.0 冻结了当时的 34 个公开算子与辅助函数；此后新增算子均走小版本
-发布，目前 `fusedtok.__all__` 共 37 个，1.x 系列内签名保持不变。
+发布，目前 `fusedtok.__all__` 共 38 个，1.x 系列内签名保持不变。
 包内附带类型存根（`__init__.pyi`，PEP 561
 `py.typed`）。破坏性变更需要新的大版本并保留一个
 弃用窗口。确定性承诺：选择类并列取最靠前下标；采样按种子可复现
@@ -203,37 +208,39 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
-| attention_decode（GQA） | T=16384, D=128 | 881 µs | 7704 µs（SDPA） | **8.74x** |
-| attention_decode_paged（GQA） | T=16384, D=128, P=16 | 987 µs | 7708 µs（SDPA） | **7.81x** |
-| RoPE NeoX (q+k) | [8192×4096] | 1662 µs | 10172 µs | **6.12x** |
-| kv_append（连续 cache 写入） | B=8, T=4096 | 16 µs | 66 µs（高级索引） | **4.11x** |
-| RMSNorm（含残差） | [4096×4096] | 618 µs | 2085 µs | **3.37x** |
-| sample_topp p=0.9（峰值分布） | [131072] | 139 µs | 393 µs（排序+掩码+multinomial） | **2.82x** |
-| attention_decode bf16 | T=16384, D=128 | 872 µs | 1805 µs（SDPA bf16） | **2.07x** |
-| top-k (k=50) | [131072] | 80 µs | 159 µs | **1.99x** |
-| sample_topk k=50 | [131072] | 147 µs | 283 µs（topk+multinomial） | **1.93x** |
-| SwiGLU | [4096×4096] | 620 µs | 1034 µs | **1.67x** |
-| LayerNorm | [4096×4096] | 455 µs | 625 µs | **1.37x** |
-| sample_minp p=0.05（峰值分布） | [131072] | 161 µs | 213 µs（掩码+multinomial） | **1.33x** |
-| top-k（k=4096，中段 k） | [131072] | 112 µs | 128 µs | **1.14x** |
-| Softmax | [4096×4096] | 424 µs | 435 µs | **1.03x** |
-| SiLU / GeLU / add | [4096×4096] | ~418-621 µs | ~415-616 µs | ~1.0x |
-| argmax | [131072] | 50 µs | 40 µs | 0.79x（事件计时在 WDDM 上抖动大；墙上时钟探针 1.12x，见下） |
-| int8 qgemm pc（W8A8） | [4096×4096×4096] | 3602 µs（38.2 TOPS） | 2054 µs（cuBLASLt + 广播） | 0.57x（如实） |
-| int8 qgemm（IMMA） | [4096×11008×4096] | 9604 µs（38.5 TOPS） | 4511 µs（cuBLASLt） | 0.47x（如实） |
-| attention_prefill（因果） | S=1024, D=128 | 5779 µs | 2589 µs（SDPA flash） | 0.45x（如实） |
-| sample_minp p=0.05（宽核） | [131072] | 498 µs | 225 µs | 0.45x（如实：一次加宽重试加一次 32-64k 排序；torch 的布尔掩码组合式不用排序——min-p 的胜出场景见上方峰值行） |
-| sample_topp p=0.9（平坦最坏） | [131072] | 1477 µs | 588 µs | 0.40x（如实，见下；参考侧三轮里有一轮偏慢，逐轮数值见 JSON） |
+| attention_decode（GQA） | T=16384, D=128 | 874 µs | 7698 µs（SDPA） | **8.81x** |
+| attention_decode_paged（GQA） | T=16384, D=128, P=16 | 972 µs | 7667 µs（SDPA） | **7.89x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1636 µs | 10013 µs | **6.12x** |
+| kv_append（连续 cache 写入） | B=8, T=4096 | 14 µs | 46 µs（高级索引） | **3.31x** |
+| RMSNorm（含残差） | [4096×4096] | 610 µs | 2052 µs | **3.36x** |
+| sample_topp p=0.9（峰值分布） | [131072] | 148 µs | 382 µs（排序+掩码+multinomial） | **2.59x** |
+| attention_decode bf16 | T=16384, D=128 | 856 µs | 1813 µs（SDPA bf16） | **2.12x** |
+| sample_minp p=0.05（峰值分布） | [131072] | 144 µs | 209 µs（掩码+multinomial） | **1.45x** |
+| SwiGLU | [4096×4096] | 609 µs | 1026 µs | **1.68x** |
+| sample_topk k=50 | [131072] | 160 µs | 294 µs（topk+multinomial） | **1.84x** |
+| top-k (k=50) | [131072] | 83 µs | 127 µs（CUB） | **1.54x** |
+| LayerNorm | [4096×4096] | 449 µs | 612 µs | **1.36x** |
+| top-k（k=4096，中段 k） | [131072] | 109 µs | 129 µs | **1.18x** |
+| Softmax | [4096×4096] | 410 µs | 431 µs | **1.05x** |
+| SiLU / GeLU / add | [4096×4096] | ~412-614 µs | ~408-607 µs | ~1.0x |
+| argmax | [131072] | 56 µs | 46 µs | 0.81x（事件计时在 WDDM 上抖动大；墙上时钟探针 1.12x，见下） |
+| int8 qgemm pc（W8A8） | [4096×4096×4096] | 3573 µs（38.5 TOPS） | 2061 µs（cuBLASLt + 广播） | 0.58x（如实） |
+| int8 qgemm（IMMA） | [4096×11008×4096] | 9582 µs（38.5 TOPS） | 4510 µs（cuBLASLt） | 0.47x（如实） |
+| attention_prefill（因果） | S=1024, D=128 | 5802 µs | 2612 µs（SDPA flash） | 0.45x（如实） |
+| sample_minp p=0.05（宽核） | [131072] | 484 µs | 216 µs | 0.45x（如实：一次加宽重试加一次 32-64k 排序；torch 的布尔掩码组合式不用排序——min-p 的胜出场景见上方峰值行） |
+| sample_topp p=0.9（平坦最坏） | [131072] | 1357 µs | 496 µs | 0.37x（如实，见下） |
 
-批量采样（v1.4）—— 一次调用处理整个 `[8, 131072]` 批，参考为 torch 原生
-批量抽签（softmax + 2-D multinomial；逐轮数值在 JSON）：
+批量采样（v1.4）与批量解码步（v1.5）—— 一次调用处理整个
+`[8, 131072]` 批，参考为 torch 原生批量抽签（softmax + 2-D
+multinomial；decode 行另加 gather 惩罚；逐轮数值在 JSON）：
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
-| sample_minp_batched p=0.05 | [8×131072] | 230 µs | 360 µs（掩码+multinomial） | **1.56x** |
-| sample_topk_batched k=50 | [8×131072] | 249 µs | 372 µs（topk+multinomial） | **1.50x** |
-| sample_topp_batched p=0.9 | [8×131072] | 273 µs | 216 µs（multinomial） | 0.79x（参考侧 WDDM 波动，见下） |
-| sample_topp_batched（平坦最坏） | [8×131072] | 3685 µs | 215 µs | 0.06x（如实，同单行说明） |
+| sample_topk_batched k=50 | [8×131072] | 199 µs | 307 µs（topk+multinomial） | **1.54x** |
+| sample_minp_batched p=0.05 | [8×131072] | 224 µs | 300 µs（掩码+multinomial） | **1.34x** |
+| sample_topp_batched p=0.9 | [8×131072] | 268 µs | 219 µs（multinomial） | 0.82x（参考侧 WDDM 波动，见下） |
+| decode_step_batched（惩罚 1.3，~64 token 历史） | [8×131072] | 315 µs | 269 µs（惩罚+softmax+multinomial） | 0.86x（对比逐行循环 **5.2x**，见下方说明） |
+| sample_topp_batched（平坦最坏） | [8×131072] | 3608 µs | 215 µs | 0.06x（如实，同单行说明） |
 
 按行 kernel（归一化、softmax）自 v0.4.1 起按形状在首次调用时自动调优
 线程块大小；上表为调优后的数字。
@@ -246,36 +253,37 @@ RTX 3060（sm_86）、float32、torch 零拷贝张量、CUDA event 计时（**�
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
 | RoPE NeoX (q+k) | [8192×4096] | 1385 µs | 8371 µs | **6.05x** |
-| attention_decode（GQA） | T=16384, D=128 | 575 µs | 2690 µs（SDPA） | **4.68x** |
-| attention_decode_paged（GQA） | T=16384, D=128, P=16 | 627 µs | 2690 µs（SDPA） | **4.29x** |
-| RMSNorm（含残差） | [4096×4096] | 504 µs | 1657 µs | **3.29x** |
-| sample_topp p=0.9（峰值分布） | [131072] | 63 µs | 155 µs（排序+掩码+multinomial） | **2.48x** |
-| kv_append（连续 cache 写入） | B=8, T=4096 | 9 µs | 21 µs（高级索引） | **2.22x** |
-| sample_topk k=50 | [131072] | 45 µs | 92 µs（topk+multinomial） | **2.04x** |
+| attention_decode（GQA） | T=16384, D=128 | 574 µs | 2682 µs（SDPA） | **4.67x** |
+| attention_decode_paged（GQA） | T=16384, D=128, P=16 | 627 µs | 2681 µs（SDPA） | **4.28x** |
+| RMSNorm（含残差） | [4096×4096] | 505 µs | 1657 µs | **3.28x** |
+| sample_topp p=0.9（峰值分布） | [131072] | 62 µs | 155 µs（排序+掩码+multinomial） | **2.48x** |
+| kv_append（连续 cache 写入） | B=8, T=4096 | 9 µs | 21 µs（高级索引） | **2.20x** |
+| sample_topk k=50 | [131072] | 45 µs | 93 µs（topk+multinomial） | **2.06x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs（CUB） | **1.51x** |
-| attention_decode bf16 | T=16384, D=128 | 547 µs | 642 µs（SDPA bf16） | **1.17x** |
-| sample_minp p=0.05（峰值分布） | [131072] | 62 µs | 72 µs（掩码+multinomial） | **1.17x** |
+| attention_decode bf16 | T=16384, D=128 | 546 µs | 641 µs（SDPA bf16） | **1.17x** |
+| sample_minp p=0.05（峰值分布） | [131072] | 62 µs | 73 µs（掩码+multinomial） | **1.19x** |
 | top-k（k=4096，中段 k） | [131072] | 50 µs | 54 µs（CUB） | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~346 µs | ~344-350 µs | ~1.0x |
 | argmax | [131072] | 17 µs | 14 µs | 0.81x（事件计时有噪声；墙上时钟探针 0.96x） |
-| int8 qgemm pc（W8A8） | [4096×4096×4096] | 2078 µs（66.1 TOPS） | 1145 µs（cuBLASLt + 广播） | 0.55x（如实） |
-| attention_prefill（因果） | S=1024, D=128 | 3313 µs | 1425 µs（SDPA flash） | 0.43x（如实） |
-| int8 qgemm（IMMA） | [4096×11008×4096] | 5483 µs（67.4 TOPS） | 2203 µs（cuBLASLt） | 0.40x（如实） |
-| sample_minp p=0.05（宽核） | [131072] | 262 µs | 72 µs | 0.28x（如实：同 3060 行的宽核说明） |
-| sample_topp p=0.9（平坦最坏） | [131072] | 986 µs | 165 µs | 0.17x（如实，见下） |
+| int8 qgemm pc（W8A8） | [4096×4096×4096] | 2071 µs（66.3 TOPS） | 1139 µs（cuBLASLt + 广播） | 0.55x（如实） |
+| attention_prefill（因果） | S=1024, D=128 | 3301 µs | 1421 µs（SDPA flash） | 0.43x（如实） |
+| int8 qgemm（IMMA） | [4096×11008×4096] | 5465 µs（67.4 TOPS） | 2178 µs（cuBLASLt） | 0.40x（如实） |
+| sample_minp p=0.05（宽核） | [131072] | 262 µs | 74 µs | 0.28x（如实：同 3060 行的宽核说明） |
+| sample_topp p=0.9（平坦最坏） | [131072] | 1053 µs | 165 µs | 0.16x（如实，见下） |
 
-批量采样（v1.4）同 `[8, 131072]` 形状：
+批量采样（v1.4）与批量解码步（v1.5）同 `[8, 131072]` 形状：
 
 | 算子 | 形状 | fusedtok | PyTorch 参考 | 加速比 |
 |---|---|---:|---:|---:|
 | sample_topk_batched k=50 | [8×131072] | 95 µs | 115 µs（topk+multinomial） | **1.21x** |
-| sample_minp_batched p=0.05 | [8×131072] | 119 µs | 113 µs（掩码+multinomial） | 0.95x（持平） |
-| sample_topp_batched p=0.9 | [8×131072] | 131 µs | 83 µs（multinomial） | 0.64x |
-| sample_topp_batched（平坦最坏） | [8×131072] | 1763 µs | 83 µs | 0.05x（如实） |
+| sample_minp_batched p=0.05 | [8×131072] | 118 µs | 112 µs（掩码+multinomial） | 0.95x（持平） |
+| sample_topp_batched p=0.9 | [8×131072] | 131 µs | 83 µs（multinomial） | 0.63x |
+| decode_step_batched（惩罚 1.3，~64 token 历史） | [8×131072] | 142 µs | 99 µs（惩罚+softmax+multinomial） | 0.70x（对比逐行循环墙钟约 **4x**） |
+| sample_topp_batched（平坦最坏） | [8×131072] | 1755 µs | 83 µs | 0.05x（如实） |
 
 小形状下 Blackwell 的优势更大（softmax 1.7x、RMSNorm 3.1x @256 行、
-attention decode 3.79x @T=4096 跑出约 187 GB/s）——形状越大启动开销占比
+attention decode 3.78x @T=4096 跑出约 187 GB/s）——形状越大启动开销占比
 越低；完整扫描见 JSON。
 
 ![fusedtok 对比 PyTorch 参考（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx5060ti.png)
@@ -313,7 +321,11 @@ v1.4 的批量采样器把整个 `[行数, 词表]` 批一次调用送完：每�
 时间快 4-6 倍（3060：topp 1340 -> 274 µs、minp 1399 -> 237 µs；
 5060 Ti：3.9x / 4.3x），尖峰 logits 下与 torch 原生批量 multinomial
 处于同一档位（sample_topk_batched 明确胜出），平坦最坏则比单行版
-再低一档、劣势同样如实标注。
+再低一档、劣势同样如实标注。v1.5 把批处理扩展到整个解码步：
+`decode_step_batched` 用逐行词表位图把逐行重复惩罚也装进同一融合
+管线——B=8 尖峰行对比逐行循环 `decode_step` 快 5.2 倍（3060 上
+1676 -> 321 µs，torch 原生"惩罚+softmax+multinomial"组合为 266 µs），
+中尾行 3.1 倍。
 attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
 而 SDPA 要额外做头展开且在小查询下效率偏低）；
 attention_decode_paged（v1.2）为免碎片的 vLLM 式块池布局只付约
@@ -379,7 +391,8 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - 1.3.1（已发布）：审计驱动加固 —— 补齐 staged 路径的 lens/块表值校验（此前坏值会变成静默 GPU 越界写）与整数输入防护；修复两个潜伏采样走查 bug（stride≥2 检查点续走重复计数、自适应扩窗质量读错 workspace 字——中尾分布提速约 28% 且 token 逐位不变）；softmax 调优器封顶修复 sanitizer 门禁；kernel/启动代码清理合一；基准表全量重生成（新增 minp 峰值与 kv_append 行）与文档大修（陈旧数字、中文呆板残留、词汇表补条）
 - 1.4（已发布）：批量采样 —— `sample_topp/minp/topk_batched` 一次调用采样整个 `[行数, 词表]` 批（每行与单行 API 一致、每行独立种子、各行按自己的核宽度分批完成）；min-p 获得自适应扩窗跳变（用一个只算一次的全局总量推出充分下界——宽核行直接跳过阶梯中间档位，token 逐位不变）
 - 1.4.1（已发布）：审计驱动加固 —— 补齐 staged 路径批量采样的形状校验（此前 rows/n 直接信任、未对照缓冲区）；扩窗下界公式合一与批量时序器清理、两种扩窗模式统一惰性 totals 缓存、同步收窄到调用方流；基准表以发布版本戳重生成；文档大修（陈旧数字、呆板措辞、词汇表与 FAQ 补条）
-- 1.5（计划）：批量版 `decode_step`（重复惩罚的逐行位图需要再加一个批次维度）；批量尝试内的逐行独立窗口（目前一个宽核行会抬高整批的统一窗口）
+- 1.5（已发布）：批量版 `decode_step` —— 逐行 ragged 历史经逐行惩罚位图，一次调用跑完"惩罚 -> 温度 -> 采样"整链。原 1.5 另一候选（批量尝试内的逐行独立窗口，让一个宽核行不再抬高整批统一窗口）做了三种实现、在 B=8/B=32 实测净损失或持平（串行逆 CDF 走查主导每轮开销、归并梯子每级有发射底价、按窗口分桶只会翻倍底价）后撤销，数字与结论记录在 CHANGELOG——若走查并行化可重开
+- 后续候选（未排期）：bf16/fp16 tensor-core prefill（重写级）；CUTLASS 级 INT8 GEMM 调度（当前 qgemm 定位是精确/可图捕获/零拷贝路径，而非最快路径）；16-bit radix key（动确定性契约）
 
 ## 社区
 

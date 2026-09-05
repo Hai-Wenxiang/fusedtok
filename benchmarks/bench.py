@@ -338,6 +338,39 @@ def main():
                    lambda: torch_topp_b(flat_b),
                    max(10, iters // 6))
 
+            # batched decode steps (v1.5): the whole penalize -> scale
+            # -> sample chain over ragged ~64-token histories. The
+            # reference is torch's native composite: gather the history
+            # logits, apply the CTRL penalty, softmax, batched
+            # multinomial. Histories ride the flat-ids + offsets path
+            # (the serving form; the RNG caveat applies as usual).
+            PEN, HIST = 1.3, 64
+            gen = torch.Generator(device="cpu").manual_seed(0)
+            lens = HIST + torch.arange(b) % 3
+            hist_flat_np = torch.randint(
+                0, vocab, (int(lens.sum()),), generator=gen).numpy()
+            hist_offs_np = np.concatenate(
+                [[0], np.cumsum(lens.numpy())]).astype(np.int64)
+            hist_flat = torch.from_numpy(hist_flat_np).cuda()
+            hist_offs = torch.from_numpy(hist_offs_np).cuda()
+            row_of = torch.repeat_interleave(
+                torch.arange(b, device="cuda"),
+                lens.to("cuda"), dim=0)
+
+            def torch_decode_b():
+                y = peaked_b.clone()
+                v = y[row_of, hist_flat]
+                y[row_of, hist_flat] = torch.where(
+                    v > 0, v / PEN, v * PEN)
+                return torch.multinomial(torch.softmax(y, -1), 1)
+
+            record("decode_step b=8 peaked", f"[{b}x{vocab}]",
+                   lambda: fusedtok.decode_step_batched(
+                       peaked_b, hist_flat_np, PEN,
+                       p=TOPP_P, ids_offsets=hist_offs_np),
+                   torch_decode_b,
+                   max(20, iters // 4))
+
         record("argmax", f"[{vocab}]",
                lambda: fusedtok.argmax(logits),
                lambda: int(logits.argmax()),

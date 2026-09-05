@@ -6,7 +6,7 @@ single-row API. Cases:
 
 - per-row parity vs the singles on the GPU (mixed peaked/midtail/flat
   rows - the widening loop skips finished rows while wide-nucleus rows
-  retry under a uniform window)
+  retry under the shared window)
 - per-row parity on CPU/staged vs the row-wise singles (bit-identical
   by construction)
 - self-determinism (identical repeated calls), seed semantics
@@ -17,6 +17,10 @@ single-row API. Cases:
 - torch input returns a torch tensor, numpy input a numpy array
 - error contract (parameter bounds, 1-D/3-D rejection, seeds shape /
   dtype / negativity, non-contiguous GPU input)
+- mixed widen classes (v1.5 hardening): batches whose rows need
+  different window magnitudes still match the row-wise singles, and a
+  row inside a mixed batch equals the same row sampled as its own
+  B = 1 batch - the token is independent of the widening schedule
 """
 
 import numpy as np
@@ -366,3 +370,199 @@ class TestCuda:
             got = batched(x, arg)
             want = [int(single(x[0], arg, seed=s)) for s in range(4)]
             assert got.tolist() == want
+
+
+def _window_rows(rng, b, n):
+    """Rows engineered to sit in DIFFERENT widen classes: spiked rows
+    finish inside the first window, plain randn rows need one modest
+    widen, cooled rows a wider one, near-uniform rows widen to the full
+    vocabulary. Whatever schedule the sequencer picks, the tokens must
+    match the row-wise singles."""
+    x = (rng.standard_normal((b, n)) * 0.5).astype(np.float32)
+    for r in range(0, b, 4):
+        x[r, 3] += 18.0                    # finishes the first window
+    for r in range(2, b, 4):
+        x[r] *= 1e-3                       # widens to the full vocab
+    for r in range(3, b, 4):
+        x[r] *= 0.1                        # one moderate widen
+    return x
+
+
+@needs_gpu
+class TestMixedWidenClasses:
+    """Mixed widen classes in one batch (v1.5 hardening). The token a
+    row draws is independent of the widening schedule - the walk
+    replays the same fadd sequence over the same sorted prefix - so
+    every case asserts parity against the row-wise singles, and against
+    the same row sampled alone as a B = 1 batch (its own schedule)."""
+
+    def test_mixed_window_classes_match_singles(self):
+        # the flagship: rows spanning first-window / moderate / wide /
+        # full-vocab widen classes in ONE batch
+        rng = np.random.default_rng(200)
+        x = _window_rows(rng, 8, 131072)
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(8, dtype=np.int64)
+        for name in ("topp", "minp"):
+            batched, single, arg = BATCHED[name]
+            got = batched(dev, arg, seeds=seeds)
+            for r in range(8):
+                want = int(single(dev[r], arg, seed=int(seeds[r])))
+                _assert_row_close(x[r], int(got[r]), want, (name, r))
+
+    def test_mixed_batch_equals_singleton_batches(self):
+        # a row inside a mixed batch must equal the same row sampled
+        # as its own B = 1 batch: the B = 1 batch widens that row alone
+        # under its own bound, which is precisely what per-row windows
+        # give every row of the mixed batch. minp has no ulp channel
+        # (its token math never touches the global total) so equality
+        # is exact; topp keeps the documented boundary fallback.
+        rng = np.random.default_rng(201)
+        x = _window_rows(rng, 8, 131072)
+        dev = torch.from_numpy(x).cuda()
+        for r in range(8):
+            row = dev[r:r + 1]
+            for name in ("topp", "minp"):
+                batched, _, arg = BATCHED[name]
+                mixed = batched(dev, arg)
+                alone = batched(row, arg, seeds=np.array([r]))
+                _assert_row_close(x[r], int(mixed[r]), int(alone[0]),
+                                  ("singleton", name, r))
+
+    def test_minp_mixed_windows_exact(self):
+        # minp tokens are schedule-independent exactly (value-threshold
+        # walk; the global total only feeds the widen BOUND, never the
+        # draw), so mixed-window parity vs the singles is bit-exact
+        rng = np.random.default_rng(202)
+        x = _window_rows(rng, 8, 131072)
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(8, dtype=np.int64)
+        got = fusedtok.sample_minp_batched(dev, 0.05, seeds=seeds)
+        want = [int(fusedtok.sample_minp(dev[r], 0.05, seed=int(s)))
+                for r, s in enumerate(seeds)]
+        assert got.tolist() == want
+
+    def test_one_wide_row_among_peaked(self):
+        # the headline scenario: one near-uniform row used to lift the
+        # uniform window to the full vocabulary for the whole batch;
+        # now it only widens itself. Tokens unchanged either way.
+        rng = np.random.default_rng(203)
+        n, b = 131072, 8
+        x = (rng.standard_normal((b, n)) * 0.5).astype(np.float32)
+        for r in range(b):
+            x[r, 5] += 18.0
+        x[3] *= 1e-3                          # the lone wide row
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(b, dtype=np.int64)
+        got = fusedtok.sample_topp_batched(dev, 0.9, seeds=seeds)
+        for r in range(b):
+            want = int(fusedtok.sample_topp(dev[r], 0.9, seed=int(seeds[r])))
+            _assert_row_close(x[r], int(got[r]), want, ("wide1", r))
+
+    def test_all_wide_rows_reach_full_vocab(self):
+        # every row widens to the full vocabulary (the exhaustion-
+        # adjacent path, one step short of the throw): all tokens land
+        # in range and match the singles
+        rng = np.random.default_rng(204)
+        n, b = 131072, 8
+        x = (rng.standard_normal((b, n)) * 1e-3).astype(np.float32)
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(b, dtype=np.int64)
+        got = fusedtok.sample_topp_batched(dev, 0.9, seeds=seeds)
+        assert all(0 <= int(t) < n for t in got)
+        for r in range(b):
+            want = int(fusedtok.sample_topp(dev[r], 0.9, seed=int(seeds[r])))
+            _assert_row_close(x[r], int(got[r]), want, ("allwide", r))
+
+    def test_b33_mixed_windows_chunk_boundary(self):
+        # mixed widen classes crossing the 32-row device chunk boundary
+        rng = np.random.default_rng(205)
+        x = _window_rows(rng, 33, 131072)
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(33, dtype=np.int64)
+        got = fusedtok.sample_minp_batched(dev, 0.05, seeds=seeds)
+        for r in (0, 1, 2, 3, 16, 31, 32):
+            want = int(fusedtok.sample_minp(dev[r], 0.05, seed=int(seeds[r])))
+            _assert_row_close(x[r], int(got[r]), want, ("b33", r))
+
+    def test_temperature_extremes_mixed_rows(self):
+        # T = 1e-4 collapses every row to argmax (first window, exact);
+        # T = 1e4 spreads every nucleus to the full vocabulary
+        rng = np.random.default_rng(206)
+        x = _window_rows(rng, 8, 131072)
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(8, dtype=np.int64)
+        got = fusedtok.sample_topp_batched(dev, 0.9, seeds=seeds,
+                                           temperature=1e-4)
+        want = [int(fusedtok.sample_topp(dev[r], 0.9, seed=int(s),
+                                         temperature=1e-4))
+                for r, s in enumerate(seeds)]
+        assert got.tolist() == want
+        got = fusedtok.sample_topp_batched(dev, 0.9, seeds=seeds,
+                                           temperature=1e4)
+        assert all(0 <= int(t) < 131072 for t in got)
+        for r in range(8):
+            w = int(fusedtok.sample_topp(dev[r], 0.9, seed=int(seeds[r]),
+                                         temperature=1e4))
+            _assert_row_close(x[r], int(got[r]), w, ("thot", r))
+
+    def test_interleaved_with_argmax_and_singles(self):
+        # mixed-window batches interleaved with argmax and singles
+        # across workspace reallocations (the realloc-stale-tail guard
+        # must hold when later attempts run SMALLER max windows than
+        # earlier ones - the grower never shrinks, the tail moves)
+        rng = np.random.default_rng(207)
+        x = _window_rows(rng, 8, 131072)
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(8, dtype=np.int64)
+        wide = torch.from_numpy(
+            (rng.standard_normal((8, 131072)) * 1e-3)
+            .astype(np.float32)).cuda()
+        a = fusedtok.sample_topp_batched(wide, 0.9, seeds=seeds)
+        assert int(fusedtok.argmax(dev[0])) == 3
+        b = fusedtok.sample_topp_batched(dev, 0.9, seeds=seeds)
+        for r in range(8):
+            want = int(fusedtok.sample_topp(dev[r], 0.9, seed=int(seeds[r])))
+            _assert_row_close(x[r], int(b[r]), want, ("inter", r))
+        c = fusedtok.sample_topk_batched(dev, 50, seeds=seeds + 100)
+        assert all(0 <= int(t) < 131072 for t in c)
+        d = fusedtok.sample_topp_batched(wide, 0.9, seeds=seeds)
+        assert d.tolist() == a.tolist()
+
+    def test_topp_p_one_mixed_rows(self):
+        # p = 1.0 forces full coverage: every row's nucleus is the whole
+        # window, so every row ends at the full vocabulary - mixed
+        # classes collapse into one and parity must still hold
+        rng = np.random.default_rng(208)
+        x = _window_rows(rng, 8, 131072)
+        dev = torch.from_numpy(x).cuda()
+        got = fusedtok.sample_topp_batched(dev, 1.0)
+        for r in range(8):
+            want = int(fusedtok.sample_topp(dev[r], 1.0, seed=r))
+            _assert_row_close(x[r], int(got[r]), want, ("p1", r))
+
+    def test_small_vocab_full_first_window(self):
+        # n <= the first-window cap (kSelEarlyOut = 1024): attempt 1 IS
+        # the full vocabulary - rows take the k == n parallel-pack path,
+        # finish_ok is false, and mixed shapes must still match
+        rng = np.random.default_rng(209)
+        x = _window_rows(rng, 6, 512)
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(6, dtype=np.int64)
+        for name in ("topp", "minp", "topk"):
+            batched, single, arg = BATCHED[name]
+            got = batched(dev, arg, seeds=seeds)
+            for r in range(6):
+                want = int(single(dev[r], arg, seed=int(seeds[r])))
+                _assert_row_close(x[r], int(got[r]), want,
+                                  ("smallvocab", name, r))
+
+    def test_mixed_windows_self_determinism(self):
+        # identical repeated calls on the per-row path
+        rng = np.random.default_rng(210)
+        x = _window_rows(rng, 8, 131072)
+        dev = torch.from_numpy(x).cuda()
+        for batched, _, arg in BATCHED.values():
+            first = batched(dev, arg)
+            for _ in range(3):
+                assert batched(dev, arg).tolist() == first.tolist()
