@@ -11,8 +11,9 @@ namespace {
 
 // Naive kernel: one thread computes one output element.
 // No memory coalescing tricks, no vectorized loads - correctness first.
-__global__ void axpy_kernel(const float* x, float* y, float a, float b, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void axpy_kernel(const float* x, float* y, float a, float b,
+                            long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = a * x[i] + b;
 }
 
@@ -26,7 +27,7 @@ std::vector<float> axpy_cpu(const std::vector<float>& x, float a, float b) {
 
 void axpy_launch(const float* x, float* y, long long n, float a, float b, std::uintptr_t stream) {
     if (n <= 0) return;
-    axpy_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(x, y, a, b, (int)n);
+    axpy_kernel<<<(unsigned)grid_for(n), kBlock, 0, (cudaStream_t)stream>>>(x, y, a, b, n);
     check_launch("axpy kernel launch");
 }
 

@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/pyproject.toml)
 
 **面向 LLM 推理的融合 CUDA 算子库** —— RMSNorm / RoPE / SwiGLU / 解码注意力
-等，支持**torch 张量零拷贝**：对比 PyTorch SDPA 最高 **8.7 倍加速**
+等，支持**torch 张量零拷贝**：对比 PyTorch SDPA 最高 **8.8 倍加速**
 （解码注意力，RTX 3060，见[性能基准](#性能基准)）。
 
 **English version: [README.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README.md)**
@@ -46,7 +46,7 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 | ✅ | qgemm_perchannel | 真实 INT8 推理所用的 W8A8 布局：逐输出通道权重 scale 融合进同一 kernel 的 epilogue，零开销 |
 | ✅ | attention_decode | 解码步因果注意力：GQA + 连续 kv-cache，在线 softmax、长 cache 自动 flash-decoding 切分、支持逐序列有效长度（`lens`）；**float32 / bfloat16 / float16 存储**（半精度 cache = 解码字节减半，softmax 仍 float32） |
 | ✅ | kv_append | 连续解码循环的 cache 写入侧（v1.3）：每序列一个新 token 的 k/v 行原地 scatter 到 cache 第 `lens[b]` 行（一个微型 kernel，f32/bf16/fp16） |
-| ✅ | attention_decode_paged | 1.2 主打特性：同样的解码注意力跑在 **vLLM 式块池 kv-cache** `[Nb, Hkv, P, D]` 上，经每序列块表间接寻址——cache 内存零碎片；任意合法表均可，f32/bf16/fp16 存储，约为连续版 1.09-1.11x 开销（对比预展开头参考 7.8x / 4.3x vs SDPA） |
+| ✅ | attention_decode_paged | 1.2 主打特性：同样的解码注意力跑在 **vLLM 式块池 kv-cache** `[Nb, Hkv, P, D]` 上，经每序列块表间接寻址——cache 内存零碎片；任意合法表均可，f32/bf16/fp16 存储，约为连续版 1.09-1.11x 开销（对比预展开头参考 7.9x / 4.3x vs SDPA） |
 | ✅ | kv_append_paged | 分页循环的 cache 写入侧：每序列一个新 token 的 k/v 行原地 scatter 到池中 `lens[b]` 位置（一个微型 kernel，f32/bf16/fp16） |
 | ✅ | attention_prefill | 新序列 S 行注意力（因果 / 双向）；便捷路径——重度 prefill 仍建议交给 SDPA/flash（诚实约 0.45x） |
 | ✅ | axpy | `a*x + b` —— v0.x 的入门演示算子，为 API 兼容保留 |
@@ -279,7 +279,7 @@ multinomial；decode 行另加 gather 惩罚；逐轮数值在 JSON）：
 | sample_topk_batched k=50 | [8×131072] | 95 µs | 115 µs（topk+multinomial） | **1.21x** |
 | sample_minp_batched p=0.05 | [8×131072] | 118 µs | 112 µs（掩码+multinomial） | 0.95x（持平） |
 | sample_topp_batched p=0.9 | [8×131072] | 131 µs | 83 µs（multinomial） | 0.63x |
-| decode_step_batched（惩罚 1.3，~64 token 历史） | [8×131072] | 142 µs | 99 µs（惩罚+softmax+multinomial） | 0.70x（对比逐行循环墙钟约 **4x**） |
+| decode_step_batched（惩罚 1.3，~64 token 历史） | [8×131072] | 142 µs | 99 µs（惩罚+softmax+multinomial） | 0.70x（对比逐行循环墙上时钟 **4.5x**，见下方说明） |
 | sample_topp_batched（平坦最坏） | [8×131072] | 1755 µs | 83 µs | 0.05x（如实） |
 
 小形状下 Blackwell 的优势更大（softmax 1.7x、RMSNorm 3.1x @256 行、
@@ -323,9 +323,10 @@ v1.4 的批量采样器把整个 `[行数, 词表]` 批一次调用送完：每�
 处于同一档位（sample_topk_batched 明确胜出），平坦最坏则比单行版
 再低一档、劣势同样如实标注。v1.5 把批处理扩展到整个解码步：
 `decode_step_batched` 用逐行词表位图把逐行重复惩罚也装进同一融合
-管线——B=8 尖峰行对比逐行循环 `decode_step` 快 5.2 倍（3060 上
-1676 -> 321 µs，torch 原生"惩罚+softmax+multinomial"组合为 266 µs），
-中尾行 3.1 倍。
+管线——B=8 墙上时钟探针下，尖峰行对比逐行循环 `decode_step` 快
+5.2 倍（3060：1676 -> 321 µs，torch 原生"惩罚+softmax+multinomial"
+组合为 266 µs）、5060 Ti 上 4.5 倍（646 -> 145 µs），中尾行 3.1 倍
+（3060）。
 attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
 而 SDPA 要额外做头展开且在小查询下效率偏低）；
 attention_decode_paged（v1.2）为免碎片的 vLLM 式块池布局只付约
@@ -385,13 +386,14 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - v0.5（已完成）：attention —— GQA 解码注意力（连续 kv-cache、长 cache 自动 flash-decoding 切分、每序列长度）+ 分块 prefill 路径（诚实约 0.45x vs SDPA flash，定位便捷路径）；每 GPU 单图 benchmark；Windows wheel 进入 PyPI 发布管线
 - 1.0（已发布）：流水线化 tensor-core INT8 GEMM（cp.async 双缓冲、运行时 tile 调优；3060 上 17 -> 39 TOPS）与逐通道权重 scale（W8A8）、融合 top-k 采样（vs topk+multinomial 组合式 2.1x）、top-k 中段 k 补平、文本卫生门禁、wheel 矩阵扩容（Linux cp310-313 / Windows cp311-313）、API 冻结
 - 1.1（已发布）：半精度 attention —— `attention_decode` / `attention_prefill` 接受 bfloat16 与 float16 cache（float32 计算，解码路径字节减半）；并行 exp 预计算使平坦分布采样最坏情况耗时减半且 token 逐位不变
-- 1.2（已发布）：分页 kv-cache attention —— `attention_decode_paged` 跑在 vLLM 式块池 `[Nb, Hkv, P, D]` + 每序列块表上（连续版 1.09-1.13x 开销，任意合法表均可）与 `kv_append_paged`（原地 cache 写入侧）；平坦分布采样最坏情况压到约 1/8.5（自适应跳窗 + 全词表快路径 + 批量载入串行走查，token 逐位不变）；argmax 减负（每次调用少一次提交少一次分配）
+- 1.2（已发布）：分页 kv-cache attention —— `attention_decode_paged` 跑在 vLLM 式块池 `[Nb, Hkv, P, D]` + 每序列块表上（连续版 1.09-1.11x 开销，任意合法表均可）与 `kv_append_paged`（原地 cache 写入侧）；平坦分布采样最坏情况压到约 1/8.5（自适应跳窗 + 全词表快路径 + 批量载入串行走查，token 逐位不变）；argmax 减负（每次调用少一次提交少一次分配）
 - 1.2.1（已发布）：审计驱动的加固 —— 修复选择工作区在超过 131072 词表（Qwen 级）时的越界；lens/块表/token id 改为主机侧校验 + 设备张量信任边界（带 `lens` 的 CUDA graph 捕获从此可用）；零拷贝路径补齐空输入与 dtype/连续性防护；基准带宽数字如实化（四行此前虚高 1.5 倍）；编译零警告（MSVC /W3 + GCC -Wall -Wextra）；文档重组为主题页并全面重写中文表述
 - 1.3（已发布）：`sample_minp`（min-p 采样——相对 p_max 的值阈值核，无需全局质量归约，核宽度天然自适应）与 `kv_append`（连续 cache 的写入侧）；采样串行走查获得检查点二分（walk 1 记录前缀和、walk 2 二分续走——平坦最坏再压到约 1/1.6，token 逐位不变）；零拷贝助手拒绝 CPU 操作数（宿主指针进 kernel 会毒化 CUDA 上下文）
 - 1.3.1（已发布）：审计驱动加固 —— 补齐 staged 路径的 lens/块表值校验（此前坏值会变成静默 GPU 越界写）与整数输入防护；修复两个潜伏采样走查 bug（stride≥2 检查点续走重复计数、自适应扩窗质量读错 workspace 字——中尾分布提速约 28% 且 token 逐位不变）；softmax 调优器封顶修复 sanitizer 门禁；kernel/启动代码清理合一；基准表全量重生成（新增 minp 峰值与 kv_append 行）与文档大修（陈旧数字、中文呆板残留、词汇表补条）
 - 1.4（已发布）：批量采样 —— `sample_topp/minp/topk_batched` 一次调用采样整个 `[行数, 词表]` 批（每行与单行 API 一致、每行独立种子、各行按自己的核宽度分批完成）；min-p 获得自适应扩窗跳变（用一个只算一次的全局总量推出充分下界——宽核行直接跳过阶梯中间档位，token 逐位不变）
 - 1.4.1（已发布）：审计驱动加固 —— 补齐 staged 路径批量采样的形状校验（此前 rows/n 直接信任、未对照缓冲区）；扩窗下界公式合一与批量时序器清理、两种扩窗模式统一惰性 totals 缓存、同步收窄到调用方流；基准表以发布版本戳重生成；文档大修（陈旧数字、呆板措辞、词汇表与 FAQ 补条）
-- 1.5（已发布）：批量版 `decode_step` —— 逐行 ragged 历史经逐行惩罚位图，一次调用跑完"惩罚 -> 温度 -> 采样"整链。原 1.5 另一候选（批量尝试内的逐行独立窗口，让一个宽核行不再抬高整批统一窗口）做了三种实现、在 B=8/B=32 实测净损失或持平（串行逆 CDF 走查主导每轮开销、归并梯子每级有发射底价、按窗口分桶只会翻倍底价）后撤销，数字与结论记录在 CHANGELOG——若走查并行化可重开
+- 1.5（已发布）：批量版 `decode_step` —— 逐行不等长（ragged）历史经逐行惩罚位图，一次调用跑完"惩罚 -> 温度 -> 采样"整链。原 1.5 另一候选（批量尝试内的逐行独立窗口，让一个宽核行不再抬高整批统一窗口）做了三种实现、在 B=8/B=32 实测净损失或持平（串行逆 CDF 走查吃掉了每轮的大头、归并梯子每级都有一次 kernel 启动的固定开销、按窗口分桶只会把这个固定开销成倍放大）后撤销，数字与结论记录在 CHANGELOG——若走查并行化可重启这项工作
+- 1.5.1（已发布）：审计驱动加固 —— 修复 int8 GEMV 对齐门拒绝的行静默丢失头部元素（k % 4 != 0 时）；kv_append staged 绑定与 rope / temperature 裸启动器补齐兄弟接口已有的校验；标量回退内核索引升 64 位；双语文档按 1.5.0 基准 JSON 全量同步并改写呆板措辞
 - 后续候选（未排期）：bf16/fp16 tensor-core prefill（重写级）；CUTLASS 级 INT8 GEMM 调度（当前 qgemm 定位是精确/可图捕获/零拷贝路径，而非最快路径）；16-bit radix key（动确定性契约）
 
 ## 社区

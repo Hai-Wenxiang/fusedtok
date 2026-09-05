@@ -51,7 +51,7 @@ machines without a GPU, and powers the parity tests.
 |---|---|---|
 | elementwise, activations, norms, RoPE | float32 | float32, bfloat16 |
 | `attention_decode`, `attention_decode_paged`, `attention_prefill`, `kv_append`, `kv_append_paged` | float32 | float32, bfloat16, float16 |
-| selection and sampling (`topk`, `sample_*`, `decode_step`, ...) | float32 | float32 |
+| selection and sampling (`topk`, `sample_*`, `decode_step`/`decode_step_batched`, ...) | float32 | float32 |
 | INT8 ops (`qgemm`, ...) | int8 operands, float32 scales/outputs | same |
 
 Rules worth knowing:
@@ -106,9 +106,10 @@ Notable exceptions (by design, documented per operator):
 
 - The fused samplers return a host `int`, so each call ends in one
   small device-to-host readback - they are not meant to be captured.
-- The batched samplers (`sample_*_batched`) return a host int64
-  tensor/array AND their widening loop re-launches kernels based on a
-  readback, so they are not capturable either (same contract).
+- The batched samplers (`sample_*_batched`) and `decode_step_batched`
+  return a host int64 tensor/array AND their widening loop re-launches
+  kernels based on a readback, so they are not capturable either (same
+  contract).
 - `quantize_int8` / `qadd_int8` must read the reduced scale back to
   compose pass 2, so they sync the caller's stream once mid-call.
 - On the zero-copy path, integer inputs (attention `lens`, paged

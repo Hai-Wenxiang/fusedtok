@@ -38,12 +38,12 @@ void rope_check(const std::vector<float>& q, const std::vector<float>* k,
 template <typename T>
 __global__ void rope_kernel(const T* x, T* y, int seq, int dim,
                             float theta, int pos_offset) {
-    int p = blockIdx.x * blockDim.x + threadIdx.x;   // global pair index
+    long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     int pairs_per_row = dim / 2;
-    if (p >= seq * pairs_per_row) return;
+    if (p >= (long long)seq * pairs_per_row) return;
 
-    int row = p / pairs_per_row;                     // row within this batch
-    int j = p - row * pairs_per_row;                 // pair index within row
+    int row = (int)(p / pairs_per_row);              // row within this batch
+    int j = (int)(p - (long long)row * pairs_per_row); // pair index within row
     int m = row + pos_offset;                        // absolute position
 
     // freq = theta^(-2j/dim) computed as exp2(-(2j/dim) * log2(theta)):
@@ -67,12 +67,12 @@ __global__ void rope_kernel(const T* x, T* y, int seq, int dim,
 template <typename T>
 __global__ void rope_neox_kernel(const T* x, T* y, int seq, int dim,
                                  float theta, int pos_offset) {
-    int p = blockIdx.x * blockDim.x + threadIdx.x;   // global j index
+    long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     int half = dim / 2;
-    if (p >= seq * half) return;
+    if (p >= (long long)seq * half) return;
 
-    int row = p / half;
-    int j = p - row * half;
+    int row = (int)(p / half);
+    int j = (int)(p - (long long)row * half);
     int m = row + pos_offset;
 
     // freq = theta^(-2j/dim) computed as exp2(-(2j/dim) * log2(theta)):

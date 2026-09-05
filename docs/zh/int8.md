@@ -49,9 +49,9 @@ y = fusedtok.qgemm_perchannel(a_q, a_scale, b_q, b_scales)
 # y[M, N] = (A_q @ B_q^T) * (a_scale * b_scales[j])    # W8A8
 ```
 
-- `M == 1` 时走带宽型的每 warp 一行 GEMV kernel（解码步的投影）；
-  更大的 `M` 走带运行时 tile 调优的 tensor-core IMMA 流水线
-  （64x64 或 128x128 tile，cp.async 双缓冲）。
+- `M == 1` 走每 warp 一行的 GEMV kernel，吃满内存带宽（解码步的
+  投影）；更大的 `M` 走带运行时 tile 调优的 tensor-core IMMA
+  流水线（64x64 或 128x128 tile，cp.async 双缓冲）。
 - `qgemm_perchannel` 是真实 INT8 推理用的布局（SmoothQuant /
   TensorRT-LLM 风格的 W8A8）：激活带一个逐张量 scale，权重带
   **每个输出通道一个** scale（`b_scales[j]`，长度 N 的 float32

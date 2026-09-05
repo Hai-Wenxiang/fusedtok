@@ -26,8 +26,8 @@ python benchmarks/bench.py            # 全套，几分钟
 - `--iters N` 调整每轮迭代次数（发布数据用 60，默认 100 便于
   快速检查）。
 
-产物落在 `docs/benchmarks/`：每 GPU 一份 JSON + 一张单面板加速比
-图（文件名含设备名）。README 的基准表就从这些 JSON 生成——同源
+产物落在 `docs/benchmarks/`：每 GPU 一份 JSON + 一张加速比
+图（单图）。README 的基准表就从这些 JSON 生成——同源
 同舍入。
 
 ## 表格怎么读
@@ -35,18 +35,20 @@ python benchmarks/bench.py            # 全套，几分钟
 - 头条表格展示**每算子最大形状**；更小的形状在 JSON 里
   （Blackwell 上小形状的优势反而更大——形状越大，启动开销占比
   越低）。
-- **（诚实）** 标注的是 fusedtok 输掉的行：attention_prefill 对
+- **（如实）** 标注的是 fusedtok 输掉的行：attention_prefill 对
   SDPA 的 flash 后端（约 0.45x）、INT8 GEMM 对 cuBLASLt
   （0.40-0.58x）、平坦分布的 sample_topp 对 torch 全并行排序
   （单行 0.16-0.37x；批量平坦行再低一档，0.05-0.06x，见批量表）
-  与宽核的 sample_minp 行（0.28-0.39x——一次加宽重试加一次
+  与宽核的 sample_minp 行（0.28-0.45x——一次加宽重试加一次
   32-64k 排序；torch 的布尔掩码组合式从不排序）。这些是设计
   范围的声明，不是测量噪声——各[主题页](usage.md)有解释。
 - **批量采样行**（`b=8`）的参考是 torch 的**原生** 2-D 抽签——
-  对整个 `[8, 词表]` 张量做 softmax 加 `multinomial`（按行标注
-  另加 top-k 或布尔掩码）——不是单行行所用的逐行组合式；批量
+  对整个 `[8, 词表]` 张量做 softmax 加 `multinomial`（表中每行
+  都标明参考实现另加的组合：top-k 或布尔掩码）——不是单行版
+  所用的逐行组合式；批量
   对比逐行循环（提交受限主机上 4-6 倍墙上时钟）写在 README
-  正文里，因为表的两列都必须是库调用。
+  正文里，因为表的两列都必须是库调用。`decode_step_batched` 行
+  的参考在抽签前还多做一次逐行 gather 式惩罚。
 - **带宽列**（GB/s）只统计该算子必须搬运的字节（如 softmax 2
   张量、rmsnorm+res 3 张量）；INT8 行的 **TOPS** 按每秒稠密 MAC
   数 ×2 计算。

@@ -560,15 +560,20 @@ __global__ void qgemv_kernel(const signed char* __restrict__ xq,
     const int lane = threadIdx.x & 31;
     const signed char* row = wq + (size_t)warp * k;
     int acc = 0;
-    // vectorized loads: char4 = 4 int8 values (4-byte alignment always
-    // holds - rows start at multiples of k bytes from an aligned base).
-    // The warp covers 128 bytes per iteration; the scalar tail (and any
-    // misalignment) falls back to single bytes. NOTE: char4 fields are
-    // PLAIN char - unsigned on MSVC hosts - so every lane value passes
-    // through an explicit (signed char) cast (a negative int8 read
-    // through an unsigned char would flip the product's sign).
+    // vectorized loads: char4 = 4 int8 values. The warp covers 128
+    // bytes per iteration; the scalar tail covers [k4, k). The gate is
+    // per-warp: rows start at multiples of k bytes from an aligned
+    // base, so ANY k % 4 != 0 misaligns rows 1..n-1 (and torch int8
+    // slices give arbitrary base alignment) - when the gate fails the
+    // scalar loop must cover the WHOLE row [0, k), not just the tail.
+    // NOTE: char4 fields are PLAIN char - unsigned on MSVC hosts - so
+    // every lane value passes through an explicit (signed char) cast
+    // (a negative int8 read through an unsigned char would flip the
+    // product's sign).
     const int k4 = (k / 4) * 4;
-    if (((size_t)row & 3) == 0 && ((size_t)xq & 3) == 0 && k4 > 0) {
+    const bool vec_ok =
+        ((size_t)row & 3) == 0 && ((size_t)xq & 3) == 0 && k4 > 0;
+    if (vec_ok) {
         for (int c = lane * 4; c < k4; c += 32 * 4) {
             const char4 xv = *reinterpret_cast<const char4*>(xq + c);
             const char4 wv = *reinterpret_cast<const char4*>(row + c);
@@ -578,7 +583,7 @@ __global__ void qgemv_kernel(const signed char* __restrict__ xq,
                  + (int)(signed char)xv.w * (int)(signed char)wv.w;
         }
     }
-    for (int c = k4 + lane; c < k; c += 32)
+    for (int c = (vec_ok ? k4 : 0) + lane; c < k; c += 32)
         acc += (int)xq[c] * (int)row[c];
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -659,9 +664,15 @@ void qgemm_launch(const signed char* aq, const signed char* bq,
     cudaStream_t cs = (cudaStream_t)stream;
     // K == 0: every dot product is empty -> the output is zeros. The
     // float scale is irrelevant (0 * anything = 0; the CPU reference
-    // multiplies the zero accumulator the same way).
+    // multiplies the zero accumulator the same way). The memset is
+    // checked like every other call - a silently failed one would
+    // leave torch.empty garbage behind (the v0.4 bug class).
     if (k == 0) {
-        cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs);
+        if (cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs) !=
+            cudaSuccess)
+            throw std::runtime_error(
+                std::string("qgemm zero-fill failed: ") +
+                cudaGetErrorString(cudaGetLastError()));
         return;
     }
     if (m == 1) {
@@ -702,7 +713,11 @@ void qgemm_perchannel_launch(const signed char* aq, const signed char* bq,
     if (m == 0 || n == 0) return;
     cudaStream_t cs = (cudaStream_t)stream;
     if (k == 0) {
-        cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs);
+        if (cudaMemsetAsync(y, 0, (size_t)m * n * sizeof(float), cs) !=
+            cudaSuccess)
+            throw std::runtime_error(
+                std::string("qgemm zero-fill failed: ") +
+                cudaGetErrorString(cudaGetLastError()));
         return;
     }
     if (m == 1) {

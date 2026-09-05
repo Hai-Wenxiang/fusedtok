@@ -133,10 +133,10 @@ inherent to returning tokens at all, so - like the single-row samplers
   At B=8 the batched call is 4-6x faster than looping the single-row
   op, in wall time, on submission-bound hosts (topp 1340 -> 274 µs,
   minp 1399 -> 237 µs at [8, 131072] on a 3060; the event-timed
-  benchmark tables above measure GPU time, a different protocol). On
-  peaked logits the batched calls sit at torch's native
+  benchmark tables in the README measure GPU time, a different
+  protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
-  (2.33x / 1.25x). The flat worst case keeps the singles' honest
+  (1.54x / 1.21x). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05-0.06x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.
@@ -145,7 +145,7 @@ inherent to returning tokens at all, so - like the single-row samplers
 
 ```python
 tokens = fusedtok.decode_step_batched(
-    batch_logits, histories, penalty=1.3, seeds=seeds)
+    batch_logits, sampled_ids, penalty=1.3, seeds=seeds)
 ```
 
 `decode_step_batched` runs the whole fused decode chain - repetition
@@ -155,24 +155,25 @@ returned (int64 on the host, same contract as the batched samplers).
 
 - `sampled_ids` carries the per-row histories: a ragged sequence of
   per-row sequences (list of lists), a 2-D integer array (every row
-  contributes ALL its columns - pad rows yourself or use the ragged
+  contributes all its columns - pad rows yourself or use the ragged
   forms), or a flat 1-D integer array plus `ids_offsets` (`rows + 1`
   non-decreasing entries starting at 0 and ending at the flat length;
   the serving-fast path that skips per-row Python). Values must lie in
   `[0, vocab)`.
 - Each row marks its history into a per-row vocab bitmap and every
-  logit read applies the penalty to the RAW value before the
+  logit read applies the penalty to the raw value before the
   temperature scale - the same composed order as `decode_step`, so
   per-row parity holds up to the documented ulp boundary.
 - `penalty=1.0` or all-empty histories skip the bitmap traffic
-  entirely (the call degenerates to `sample_topp_batched` exactly).
+  entirely (the call is then exactly `sample_topp_batched`).
 - Deterministic per (row, seed); not CUDA-graph capturable; rows are
   processed in chunks of 32.
-- What batching buys: at B=8 on a 3060 with ~64-token histories, the
-  batched call is 3.1x faster than looping `decode_step` on
-  mid-tail logits (17.3 -> 5.5 ms) and 5.2x on peaked logits
-  (1676 -> 321 µs, on par with torch's native penalize + softmax +
-  batched-multinomial composite at 266 µs).
+- What batching buys: on wall-time probes at B=8 with ~64-token
+  histories, the batched call is 5.2x faster than looping
+  `decode_step` on peaked logits (3060: 1676 -> 321 µs; 5060 Ti:
+  646 -> 145 µs) and 3.1x on mid-tail logits (3060: 17.3 -> 5.5 ms) -
+  within ~20% of torch's native penalize + softmax +
+  batched-multinomial composite on the peaked rows.
 
 ## The same-token guarantee
 
