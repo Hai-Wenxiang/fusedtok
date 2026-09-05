@@ -200,12 +200,12 @@ void check_batch_ids(const I64Array& ids, const I64Array& offs, int rows,
         offs.at(offs.size() - 1) != (long long)ids.size())
         throw std::invalid_argument(
             "sampled_ids offsets must start at 0 and end at its length");
-    for (size_t i = 1; i < offs.size(); ++i)
+    for (py::ssize_t i = 1; i < offs.size(); ++i)
         if (offs.at(i) < offs.at(i - 1))
             throw std::invalid_argument(
                 "sampled_ids offsets must be non-decreasing");
     const long long* p = ids.data();
-    for (size_t i = 0; i < ids.size(); ++i)
+    for (py::ssize_t i = 0; i < ids.size(); ++i)
         if (p[i] < 0 || p[i] >= n)
             throw std::invalid_argument(
                 "sampled_ids entries must be in [0, vocab)");
@@ -391,6 +391,8 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
     m.def("temperature_launch",
           [](py::int_ in, py::int_ out, long long n, float t, std::uintptr_t stream) {
+        if (!(t > 0.0f))
+            throw std::invalid_argument("temperature must be > 0");
         ft::temperature_launch(df(in), dfm(out), n, t, stream); }, py::arg("in"), py::arg("out"),
         py::arg("n"), py::arg("t"), py::arg("stream") = 0);
     m.def("add_launch",
@@ -673,6 +675,13 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("rope_launch", [](bool neox, py::int_ in, py::int_ out, int seq, int dim,
                             double theta, int pos_offset, std::uintptr_t stream) {
+        // the raw launcher skips the Python wrapper's checks; without
+        // them an odd dim silently leaves the last element of every
+        // row unrotated (the same messages the wrapper raises)
+        if (dim % 2 != 0)
+            throw std::invalid_argument("dim must be even (RoPE pairs elements)");
+        if (pos_offset < 0)
+            throw std::invalid_argument("pos_offset must be >= 0");
         if (neox)
             ft::rope_neox_launch(df(in), dfm(out), seq, dim, (float)theta, pos_offset, stream);
         else
@@ -1661,6 +1670,26 @@ PYBIND11_MODULE(_fusedtok, m) {
             k_pool.size() != (py::ssize_t)num_blocks * hkv * page * dim ||
             v_pool.size() != k_pool.size())
             throw std::invalid_argument("kv append operand size mismatch");
+        if (page < 1)
+            throw std::invalid_argument("page size must be >= 1");
+        // host-side lens/table validation, matching the CPU reference
+        // exactly: each row's write lands at table[bi*tw + pos/page],
+        // so a bad pos or a bad USED block id is a persistent OOB
+        // device write (the in-place scatter makes it stick). The
+        // zero-copy launch path trusts device values, same boundary
+        // as the attention twins. Unused table slots are not checked
+        // - the CPU reference accepts them, and rejecting them here
+        // would make the staged path stricter than the CPU path.
+        for (py::ssize_t bi = 0; bi < batch; ++bi) {
+            const int pos = (int)lens.data()[bi];
+            if (pos < 0 || pos >= tbl_width * page)
+                throw std::invalid_argument(
+                    "lens entries must be within [0, table width * page)");
+            const int blk = table.data()[bi * tbl_width + pos / page];
+            if (blk < 0 || blk >= num_blocks)
+                throw std::invalid_argument(
+                    "block table entries must be valid pool block ids");
+        }
         const size_t kv_bytes =
             (size_t)num_blocks * hkv * page * dim * 4;
         DevBuf dk_new(k_new.size() * 4), dv_new(v_new.size() * 4),
@@ -1763,6 +1792,15 @@ PYBIND11_MODULE(_fusedtok, m) {
             k_cache.size() != (py::ssize_t)batch * hkv * t_rows * dim ||
             v_cache.size() != k_cache.size())
             throw std::invalid_argument("kv append operand size mismatch");
+        // host-side lens validation, matching the CPU reference: the
+        // in-place scatter writes at row lens[bi], so a bad value is a
+        // persistent OOB device write (zero-copy trusts device values)
+        for (py::ssize_t bi = 0; bi < batch; ++bi) {
+            const int pos = (int)lens.data()[bi];
+            if (pos < 0 || pos >= t_rows)
+                throw std::invalid_argument(
+                    "lens entries must be within [0, cache rows)");
+        }
         const size_t cache_bytes = (size_t)batch * hkv * t_rows * dim * 4;
         DevBuf dk_new(k_new.size() * 4), dv_new(v_new.size() * 4),
               dl((size_t)batch * 4), dkc(cache_bytes), dvc(cache_bytes);

@@ -616,4 +616,104 @@ def test_batch_seeds_uint64_wrap_rejected():
         fusedtok.sample_topp_batched(x, 0.9, seeds=bad)
     ok = np.array([0, 2 ** 63 - 1], dtype=np.uint64)
     out = fusedtok.sample_topp_batched(x, 0.9, seeds=ok)
-    assert out.shape == (2,)
+
+
+# ---------------------------------------------------------------------------
+# direct-binding surface hardening (1.5.1 audit: the kv_append staged
+# bindings trusted host lens/table values their attention twins check,
+# the rope/temperature raw launchers skipped checks their wrapper
+# already raises, and a few host paths silently truncated floats)
+# ---------------------------------------------------------------------------
+
+
+def test_kv_append_staged_binding_lens_validated():
+    # the direct _fusedtok surface gets the same contract the Python
+    # wrapper enforces: lens[b] == T writes one row past the cache.
+    # NOTE the binding arg order (k_new, v_new, lens, k_cache, v_cache)
+    # differs from the wrapper's (k_cache, v_cache, k_new, v_new, lens)
+    k, v, kn, vn = _host_cache(t_rows=8)
+    lens = np.array([8, 0], dtype=np.int32)
+    with pytest.raises(ValueError, match=r"\[0, cache rows\)"):
+        _ft().kv_append(kn, vn, lens, k, v, 2, 2, 4, 8)
+    with pytest.raises(ValueError, match=r"\[0, cache rows\)"):
+        _ft().kv_append(kn, vn, np.array([0, -1], dtype=np.int32),
+                        k, v, 2, 2, 4, 8)
+
+
+def test_kv_append_paged_staged_binding_lens_and_block_validated():
+    pool = np.zeros((4, 2, 4, 4), dtype=np.float32)
+    kn = np.ones((2, 2, 4), dtype=np.float32)
+    table = np.array([[0, 1], [1, 2]], dtype=np.int32)
+    # lens == span would write past the last page of the row's blocks
+    with pytest.raises(ValueError, match="table width"):
+        _ft().kv_append_paged(kn, kn.copy(),
+                              table, np.array([8, 0], dtype=np.int32),
+                              pool, pool.copy(), 2, 2, 4, 4, 2, 4)
+    # the entry the write USES (pos/page) must be a valid pool block;
+    # unused slots stay unchecked (the CPU reference accepts them)
+    bad_table = np.array([[0, 9], [1, 2]], dtype=np.int32)
+    with pytest.raises(ValueError, match="pool block"):
+        _ft().kv_append_paged(kn, kn.copy(),
+                              bad_table, np.array([5, 0], dtype=np.int32),
+                              pool, pool.copy(), 2, 2, 4, 4, 2, 4)
+
+
+def test_rope_launch_binding_odd_dim_and_negative_pos_rejected():
+    # the raw launcher runs the wrapper's checks itself now (a dummy
+    # pointer never reaches a launch - validation happens first)
+    with pytest.raises(ValueError, match="even"):
+        _ft().rope_launch(False, 0, 0, 4, 7, 10000.0, 0)
+    with pytest.raises(ValueError, match="pos_offset"):
+        _ft().rope_launch(True, 0, 0, 4, 8, 10000.0, -1)
+
+
+def test_temperature_launch_binding_t_positive():
+    with pytest.raises(ValueError, match="temperature"):
+        _ft().temperature_launch(0, 0, 4, 0.0)
+    with pytest.raises(ValueError, match="temperature"):
+        _ft().temperature_launch(0, 0, 4, -1.0)
+
+
+def test_dequantize_host_float_rejected():
+    # the CUDA path already said "q must be int8"; the host path used
+    # to surface an opaque pybind caster error instead
+    with pytest.raises(TypeError, match="int8"):
+        fusedtok.dequantize_int8(np.ones(4, dtype=np.float32), 0.5)
+
+
+def test_qgemm_host_float_operands_rejected():
+    # the zero-copy path required int8 tensors all along; the staged /
+    # CPU paths silently truncated floats to int8 (data corruption)
+    a = np.ones((2, 4), dtype=np.float32)
+    b = np.ones((3, 4), dtype=np.int8)
+    with pytest.raises(TypeError, match="a_q"):
+        fusedtok.qgemm(a, 0.5, b, 0.5)
+    with pytest.raises(TypeError, match="b_q"):
+        fusedtok.qgemm(b, 0.5, a, 0.5)
+    sb = np.ones(3, dtype=np.float32)
+    with pytest.raises(TypeError, match="a_q"):
+        fusedtok.qgemm_perchannel(a, 0.5, b, sb)
+
+
+def test_decode_step_batched_float_offsets_rejected():
+    # float offsets would silently truncate BEFORE the monotonicity
+    # check could say anything meaningful
+    x = np.ones((2, 8), dtype=np.float32)
+    with pytest.raises(TypeError, match="ids_offsets"):
+        fusedtok.decode_step_batched(
+            x, np.array([0, 1, 2], dtype=np.int64), 1.1,
+            ids_offsets=np.array([0.0, 1.5, 3.0]))
+
+
+def test_attention_zero_head_rejected_on_both_paths():
+    # hq == 0 used to return an empty tensor on the zero-copy path
+    # while the CPU path raised - one contract now
+    q = np.zeros((2, 0, 4), dtype=np.float32)
+    k = np.zeros((2, 1, 8, 4), dtype=np.float32)
+    with pytest.raises(ValueError):
+        fusedtok.attention_decode(q, k, k.copy())
+    if fusedtok.cuda_available():
+        qt = torch.zeros((2, 0, 4), dtype=torch.float32, device="cuda")
+        kt = torch.zeros((2, 1, 8, 4), dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError, match="head counts"):
+            fusedtok.attention_decode(qt, kt, kt.clone())

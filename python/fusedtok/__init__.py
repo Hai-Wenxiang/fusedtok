@@ -725,6 +725,11 @@ def attention_decode(q, k_cache, v_cache, lens=None, *, cuda=False):
         b2, hkv, t_rows, d2 = k_cache.shape
         if (b2, d2) != (b, d) or v_cache.shape != k_cache.shape:
             raise ValueError("k_cache/v_cache must match q's batch and dim")
+        if hq < 1 or hkv < 1:
+            # the C++ attention_check rejects these on the CPU path;
+            # keep both paths on the same contract (a zero head count
+            # would otherwise return an empty tensor here)
+            raise ValueError("head counts must be >= 1")
         if hq % hkv:
             raise ValueError("q heads must be a multiple of kv heads")
         lens_ptr = None
@@ -795,6 +800,8 @@ def attention_prefill(q, k, v, causal=True, *, cuda=False):
         b2, hkv, s2, d2 = k.shape
         if (b2, s2, d2) != (b, s, d) or v.shape != k.shape:
             raise ValueError("k/v must match q's batch, seq and dim")
+        if hq < 1 or hkv < 1:
+            raise ValueError("head counts must be >= 1")
         if hq % hkv:
             raise ValueError("q heads must be a multiple of kv heads")
         out = torch.empty((b, hq, s, d), dtype=q.dtype, device=q.device)
@@ -858,6 +865,8 @@ def attention_decode_paged(q, k_pool, v_pool, block_table, lens=None,
         nb, hkv, page, d2 = k_pool.shape
         if d2 != d or v_pool.shape != k_pool.shape:
             raise ValueError("pools must match q's dim and each other")
+        if hq < 1 or hkv < 1:
+            raise ValueError("head counts must be >= 1")
         if hq % hkv:
             raise ValueError("q heads must be a multiple of kv heads")
         if hq // hkv not in (1, 2, 4, 8, 16):
@@ -1259,6 +1268,10 @@ def dequantize_int8(q, scale):
                                     _cuda_stream())
         return x
     arr = np.asarray(q)
+    if arr.size and not np.issubdtype(arr.dtype, np.integer):
+        # mirror the CUDA path's clear message instead of the opaque
+        # pybind caster error a float array would produce
+        raise TypeError(f"q must be int8, got {arr.dtype}")
     out = _fusedtok.dequantize_int8_cpu(arr, float(scale))
     return _numpy_to_torch_like(out) if _is_torch(q) else out
 
@@ -1304,6 +1317,23 @@ def _qgemm_operands(a_q, b_q):
     return m, n, k
 
 
+def _int8_operand(arr, name):
+    """Host int8 operand for the qgemm family: reject non-integer
+    dtypes instead of silently truncating (the same policy as
+    ``_host_int_array`` - a silent float->int8 truncation corrupts
+    data) and reject CUDA tensors (the host paths take host operands;
+    a CUDA tensor here is the mixed-device-family TypeError), then
+    coerce to contiguous int8."""
+    if _is_torch(arr):
+        if arr.is_cuda:
+            raise TypeError(f"{name} must be a host tensor on this path")
+        arr = arr.detach().numpy()
+    a = np.asarray(arr)
+    if a.size and not np.issubdtype(a.dtype, np.integer):
+        raise TypeError(f"{name} must be an integer array, got {a.dtype}")
+    return np.ascontiguousarray(a, dtype=np.int8)
+
+
 def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
     """INT8 matmul with int32-exact accumulation:
 
@@ -1326,8 +1356,8 @@ def qgemm(a_q, a_scale, b_q, b_scale, *, cuda=False):
                                    float(a_scale), float(b_scale),
                                    _cuda_stream())
         return y
-    a = np.ascontiguousarray(a_q, dtype=np.int8)
-    b = np.ascontiguousarray(b_q, dtype=np.int8)
+    a = _int8_operand(a_q, "a_q")
+    b = _int8_operand(b_q, "b_q")
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError("operands must be 2-D [rows, K]")
     m, k = a.shape
@@ -1377,8 +1407,8 @@ def qgemm_perchannel(a_q, a_scale, b_q, b_scales, *, cuda=False):
                 a_q.data_ptr(), b_q.data_ptr(), b_scales.data_ptr(),
                 y.data_ptr(), m, n, k, float(a_scale), _cuda_stream())
         return y
-    a = np.ascontiguousarray(a_q, dtype=np.int8)
-    b = np.ascontiguousarray(b_q, dtype=np.int8)
+    a = _int8_operand(a_q, "a_q")
+    b = _int8_operand(b_q, "b_q")
     sb = np.ascontiguousarray(b_scales, dtype=np.float32)
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError("operands must be 2-D [rows, K]")
@@ -1683,6 +1713,10 @@ def _batch_ids_arg(sampled_ids, ids_offsets, rows, n):
                 "ids_offsets must be 1-D with rows + 1 entries")
         if not np.issubdtype(ids.dtype, np.integer):
             raise TypeError("sampled_ids entries must be integers")
+        if offs.size and not np.issubdtype(offs.dtype, np.integer):
+            # a float offsets array would silently truncate before the
+            # monotonicity check - same policy as the ids themselves
+            raise TypeError("ids_offsets entries must be integers")
         ids = ids.astype(np.int64, copy=False)
         if ids.size and (ids.min() < 0 or ids.max() >= n):
             raise ValueError(f"sampled_ids values must be in [0, {n})")
