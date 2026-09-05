@@ -33,20 +33,12 @@ inline long long grid_for(long long n) { return (n + kBlock - 1) / kBlock; }
 // ---------------------------------------------------------------------------
 // Shared sampler RNG: splitmix64 finalized to a float uniform in [0, 1).
 // Every fused sampler (device) and every CPU reference (host) draws
-// through these twins so both sides produce identical bits per seed.
-// Reproducible, NOT cryptographically secure (documented contract).
+// through the same function so both sides produce identical bits per
+// seed. Reproducible, NOT cryptographically secure (documented
+// contract).
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ float splitmix_uniform_device(
+__host__ __device__ __forceinline__ float splitmix_uniform(
         unsigned long long seed) {
-    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    z ^= z >> 31;
-    return (float)((z >> 11) * (1.0 / 9007199254740992.0));
-}
-
-inline float splitmix_uniform_host(unsigned long long seed) {
-    // identical hash chain and float conversion to the device twin
     unsigned long long z = seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;

@@ -1,7 +1,9 @@
 // INT8 symmetric per-tensor quantization utilities.
 //
 //   scale = max(|x|) / 127
-//   q[i]  = round(x[i] / scale)  clamped to [-127, 127]
+//   q[i]  = round(x[i] * (1/scale))  clamped to [-127, 127]
+//           (both paths multiply by the same pre-computed f32
+//            reciprocal, so codes are bit-identical CPU vs GPU)
 //   dequant: x ~= q[i] * scale
 //
 // Fused variant (qadd): dequantize two int8 operands, add in float,
@@ -79,16 +81,19 @@ __global__ void absmax_kernel(const float* __restrict__ x,
     }
     m = block_reduce_max<kBlock>(m, shared);
     if (threadIdx.x == 0 && m > 0.0f)
-        atomicMax(reinterpret_cast<int*>(out_max), __float_as_int(m));
         // bit-pattern compare is order-preserving for non-negative floats
+        atomicMax(reinterpret_cast<int*>(out_max), __float_as_int(m));
 }
 
 __global__ void quantize_kernel(const float* __restrict__ x,
                                 signed char* __restrict__ q,
-                                float scale, long long n) {
+                                float inv_scale, long long n) {
+    // inv_scale is the PRE-COMPUTED 1/scale (the caller folds the
+    // division once); the CPU reference multiplies by the same f32
+    // reciprocal, so near-tie codes stay bit-identical across paths
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (long long)gridDim.x * blockDim.x) {
-        float v = fmaxf(-kInt8Max, fminf(kInt8Max, rintf(x[i] * scale)));
+        float v = fmaxf(-kInt8Max, fminf(kInt8Max, rintf(x[i] * inv_scale)));
         q[i] = (signed char)v;
     }
 }
@@ -166,9 +171,13 @@ quantize_int8_cpu(const std::vector<float>& x) {
     float m = 0.0f;
     for (float v : x) m = std::fmax(m, std::fabs(v));
     const float scale = make_scale(m);
+    // multiply by the same pre-computed f32 reciprocal the GPU kernel
+    // uses - dividing here would round near-tie values differently and
+    // flip codes by one against the GPU path
+    const float inv_scale = 1.0f / scale;
     std::vector<signed char> q(x.size());
     for (size_t i = 0; i < x.size(); ++i) {
-        float v = std::rint(x[i] / scale);
+        float v = std::rint(x[i] * inv_scale);
         if (v > kInt8Max) v = kInt8Max;
         if (v < -kInt8Max) v = -kInt8Max;
         q[i] = (signed char)v;

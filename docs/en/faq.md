@@ -85,16 +85,18 @@ application needs one.
 
 Yes, library-wide, with warm-up first. Exceptions: the fused samplers
 return host ints (each call ends in a readback) - the `_batched`
-variants additionally re-launch kernels from a readback inside their
-widening loop, so int64 arrays or not, they stay outside graphs - and
-`quantize_int8`/`qadd_int8` sync once mid-call to compose their
-scales. The selection pipeline captures its own internal graph
-automatically - you do not manage it.
+samplers and `decode_step_batched` additionally re-launch kernels from
+a readback inside their widening loop, so int64 arrays or not, they
+stay outside graphs - and `quantize_int8`/`qadd_int8` sync once
+mid-call to compose their scales. The selection pipeline captures its
+own internal graph automatically - you do not manage it.
 
 ## Windows-specific timing notes
 
 Windows runs GeForce drivers in WDDM mode: kernel submissions cost
-tens of microseconds and host-side timing is noisy. Benchmarks use
+tens of microseconds and host-side timing is noisy. (Linux's driver
+model has no such submission overhead, so numbers there are usually
+steadier.) Benchmarks use
 CUDA events (see [benchmarks](benchmarks.md#the-protocol)); if you
 micro-benchmark yourself, prefer events over wall clock and expect
 `argmax`-class tiny ops to swing.
@@ -121,6 +123,14 @@ micro-benchmark yourself, prefer events over wall clock and expect
   runs the single-row pipeline verbatim with its own seed; the speedup
   over a per-row loop comes from collapsing launch/submission
   overhead, not from different math.
+- **Ragged histories** - per-row sequences of different lengths
+  (generation histories grow per row), accepted by
+  `decode_step_batched` as a list of per-row lists, a 2-D array, or a
+  flat id array plus row offsets.
+- **ulp** - "unit in the last place", the spacing of float32 numbers
+  near a given value; a ~1 ulp difference is the smallest rounding
+  error two float computations of the same quantity can differ by
+  (the documented CPU/GPU and cross-process boundary).
 - **multinomial** - torch's probability-weighted draw
   (`torch.multinomial`); the reference implementation this library's
   samplers are benchmarked against (composed with softmax, and with

@@ -60,7 +60,7 @@ yt = fusedtok.rmsnorm(xt, wt)       # zero-copy CUDA, output on GPU
 
 ## A taste of the fast paths
 
-The two headline operators, both one call on the zero-copy path:
+The headline operators, each one call on the zero-copy path:
 
 ```python
 # attention over a GQA kv-cache: one launch streams the whole cache
@@ -82,6 +82,13 @@ batch_logits = torch.randn(8, 131072, device="cuda")
 batch_logits[torch.arange(8, device="cuda"),
              batch_logits.argmax(dim=1)] += 20.0
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9)
+
+# ...with per-row repetition penalties included: ragged histories
+# (a list of per-row id lists), one call, one token per row
+histories = [[5, 9], [], [1, 2, 2], [7] * 16,
+             [3], [], [0], [4, 4]]
+tokens = fusedtok.decode_step_batched(batch_logits, histories,
+                                      penalty=1.3, p=0.9)
 ```
 
 `examples/demo.py` in the repository tours every operator with

@@ -100,16 +100,24 @@ event 而不是墙上时钟，并预期 argmax 这类微小算子的数字会摆
   （vLLM 的设计）。序列增长、收缩、驱逐都不会产生碎片。
 - **flash-decoding**——长序列解码策略：把 cache 切成片、并行算
   出各片的部分 softmax、再归并。
-- **nucleus（核）**——采样的截断集合：top-p 按"累计概率质量达到
-  p"取前缀，min-p 按"概率不低于 min_p × 最大概率"取前缀。
+- **nucleus（核）**——采样的截断集合：top-p 取"累计概率质量刚好
+  达到 p"的前缀，min-p 取"概率不低于 min_p × 最大概率"的前缀。
 - **批量采样（batched sampling）**——一次调用采样整个
   `[行数, 词表]` 批（`_batched` 系列采样器与
-  `decode_step_batched`）：每行用自己的种子跑单行管线原样；
-  对比逐行循环的提速来自省掉每行的启动/提交开销，数学本身
-  不变。
+  `decode_step_batched`）：每行都用自己的种子原样跑一遍单行
+  管线；对比逐行循环的提速来自省掉每行的启动/提交开销，数学
+  本身不变。
+- **不等长历史（ragged histories）**——各行长短不一的序列
+  （生成式历史每行增长速度不同）。`decode_step_batched` 接受
+  三种形态：逐行列表的嵌套列表、二维数组、扁平 id 数组加行
+  偏移。
+- **ulp**——float32 在某个数值附近的最低有效位间隔，约 1 ulp
+  是同一条浮点算式两次计算所能差出的最小舍入误差（即文档化的
+  CPU/GPU 与跨进程边界）。
 - **multinomial**——torch 的按概率加权抽样算子
-  （`torch.multinomial`），本库采样器的基准参考实现（按行标注
-  与 softmax、top-k 或布尔掩码组合使用）。
+  （`torch.multinomial`），本库采样器的基准参考实现（表中每行
+  都标明参考实现用的组合：在 softmax 之外另加 top-k 或布尔
+  掩码）。
 - **radix（基数）**——选择管线按 key 的高位字节逐轮分桶的排序
   手法（radix sort 的思想）。
 - **SDPA**——PyTorch 的 `scaled_dot_product_attention`，attention

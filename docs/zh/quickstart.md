@@ -55,7 +55,7 @@ yt = fusedtok.rmsnorm(xt, wt)           # 零拷贝 CUDA，输出也在 GPU 上
 
 ## 体验一下快在哪
 
-两个代表性算子，零拷贝路径上各只需一次调用：
+几个代表性算子，零拷贝路径上各只需一次调用：
 
 ```python
 # GQA kv-cache 上的解码注意力：一次启动把整个 cache 顺序读一遍
@@ -77,6 +77,13 @@ batch_logits = torch.randn(8, 131072, device="cuda")
 batch_logits[torch.arange(8, device="cuda"),
              batch_logits.argmax(dim=1)] += 20.0
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9)
+
+# ……连逐行重复惩罚也一并算掉：不等长历史（每行一个 id 列表），
+# 一次调用，每行一个 token
+histories = [[5, 9], [], [1, 2, 2], [7] * 16,
+             [3], [], [0], [4, 4]]
+tokens = fusedtok.decode_step_batched(batch_logits, histories,
+                                      penalty=1.3, p=0.9)
 ```
 
 仓库里的 `examples/demo.py` 会把每个算子都逐个演示一遍并与解析

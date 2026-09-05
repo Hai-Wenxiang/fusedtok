@@ -85,7 +85,7 @@ Paged-specific rules:
 - CUDA-graph capture needs one warm-up call outside the capture.
 
 The measured cost of the indirection (3060, b=1, GQA 32/8, D=128,
-T=16384, P=16) is **1.13x** the contiguous op (1.09x on the 5060 Ti;
+T=16384, P=16) is **1.11x** the contiguous op (1.09x on the 5060 Ti;
 same protocol as the benchmark tables), with bit-identical output on
 matching slice schedules.
 
@@ -184,7 +184,7 @@ kv-cache once. What to expect:
   inefficiency there).
 - bf16/fp16 caches halve the bytes. At batch 1 the kernel is
   latency-bound, so the absolute win is modest and grows with batch.
-- The paged indirection costs 1.09-1.13x over the contiguous op.
+- The paged indirection costs 1.09-1.11x over the contiguous op.
 - Prefill is deliberately not competitive with flash backends.
 
 See [benchmarks.md](benchmarks.md) for the measurement protocol and

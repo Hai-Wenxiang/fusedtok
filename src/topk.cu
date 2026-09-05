@@ -632,7 +632,7 @@ __global__ void emit_finish_kernel(const SelArgs* __restrict__ a,
             nucleus_mass = cum;
         }
         // splitmix64-finalized uniform in [0, 1): deterministic per seed
-        const float u = splitmix_uniform_device(seed);
+        const float u = splitmix_uniform(seed);
         const float target = u * nucleus_mass;
         cum = 0.0f;
         int hit = -1;
@@ -1103,7 +1103,7 @@ __global__ void sample_serial_kernel(const unsigned long long* __restrict__ keys
     // case too: full-window cum, exactly what the forced-coverage path
     // used)
     const float nucleus_mass = cum;
-    const float u = splitmix_uniform_device(seed);
+    const float u = splitmix_uniform(seed);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
     // a float-boundary draw that never reaches target takes the last
@@ -1843,7 +1843,7 @@ __global__ void sample_topk_serial_kernel(
     float window_mass = 0.0f;
     int ncp = 0;
     walk_until_cp(exps, k, INFINITY, &window_mass, cps, stride, &ncp);
-    const float u = splitmix_uniform_device(seed);
+    const float u = splitmix_uniform(seed);
     const float target = u * window_mass;
     const int hit = walk_from_cp(exps, k, target, cps, ncp, stride);
     const int idx = (hit >= 0) ? hit : k - 1;      // rounding fallback
@@ -1997,7 +1997,7 @@ __global__ void sample_minp_serial_kernel(
     const int nucleus = (edge < 0) ? k : edge;
     // exps[0] == 1.0 >= min_p for a valid min_p, so the nucleus is
     // never empty and nucleus_mass > 0
-    const float u = splitmix_uniform_device(seed);
+    const float u = splitmix_uniform(seed);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
     // float-boundary fallback: the last nucleus element, same as the
@@ -2467,7 +2467,7 @@ __global__ void emit_finish_b_kernel(
         nucleus = k;
         nucleus_mass = cum;
     }
-    const float u = splitmix_uniform_device(seeds[row]);
+    const float u = splitmix_uniform(seeds[row]);
     const float target = u * nucleus_mass;
     cum = 0.0f;
     int hit = -1;
@@ -2690,7 +2690,7 @@ __global__ void sample_serial_b_kernel(
     }
     const int nucleus = (edge < 0) ? k : edge + 1;
     const float nucleus_mass = cum;
-    const float u = splitmix_uniform_device(seeds[row]);
+    const float u = splitmix_uniform(seeds[row]);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
                                  cps_stride);
@@ -2726,7 +2726,7 @@ __global__ void sample_minp_serial_b_kernel(
         return;
     }
     const int nucleus = (edge < 0) ? k : edge;
-    const float u = splitmix_uniform_device(seeds[row]);
+    const float u = splitmix_uniform(seeds[row]);
     const float target = u * nucleus_mass;
     const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
                                  cps_stride);
@@ -2754,7 +2754,7 @@ __global__ void sample_topk_serial_b_kernel(
     float window_mass = 0.0f;
     int ncp = 0;
     walk_until_cp(exps, k, INFINITY, &window_mass, cps, cps_stride, &ncp);
-    const float u = splitmix_uniform_device(seeds[row]);
+    const float u = splitmix_uniform(seeds[row]);
     const float target = u * window_mass;
     const int hit = walk_from_cp(exps, k, target, cps, ncp, cps_stride);
     const int idx = (hit >= 0) ? hit : k - 1;

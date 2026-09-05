@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-09-05
+
+Audit-driven hardening (the 1.2.1/1.3.1/1.4.1 playbook): one real
+kernel bug, a sweep of direct-binding validation gaps, 64-bit index
+promotion in the scalar fallbacks, and a full docs pass (stale
+numbers, stiff phrasing in both languages, v1.5 coverage gaps).
+No API changes; 525 tests green on RTX 3060 (Windows, CUDA 13.3)
+and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Fixed
+- **qgemv dropped the head of every misaligned row** (int8 GEMV,
+  M == 1): the char4 vector loop gates on 4-byte row alignment, and
+  any `k % 4 != 0` misaligns rows 1..n-1 (row r starts at r*k
+  bytes); when the gate failed, the scalar tail still started at
+  `k4 + lane`, so the first `k4` elements never entered the
+  accumulator and the output was `x[k4:] . w[k4:]`. The scalar pass
+  now covers the whole row whenever the vector branch is skipped.
+  Pinned bit-exact by odd-K GEMV tests in both qgemm test files
+  (every published benchmark row uses `k % 4 == 0`, so no reported
+  number changes).
+
+### Hardened
+- `kv_append` / `kv_append_paged` staged bindings validate host-side
+  `lens` (and the paged write's used block-table entry) per the CPU
+  reference before any upload - a bad value was a persistent
+  out-of-bounds device write on an in-place scatter. The attention
+  twins already did this; the zero-copy launchers keep the
+  device-trust boundary.
+- `rope_launch` rejects odd `dim` and negative `pos_offset` (an odd
+  dim silently left the last element of every row unrotated);
+  `temperature_launch` rejects `t <= 0` like every sibling.
+- The qgemm family's host paths reject non-integer operand dtypes
+  instead of silently truncating floats to int8, and explicitly
+  reject CUDA tensors (restoring the mixed-device TypeError the
+  numpy conversion used to enforce by accident);
+  `dequantize_int8`'s host path rejects non-int8 input with the CUDA
+  path's message; `decode_step_batched` rejects float `ids_offsets`
+  before they truncate; the attention zero-copy wrappers reject zero
+  head counts like the CPU path.
+- quantize: the CPU reference multiplies by the same pre-computed
+  f32 reciprocal as the GPU kernel (it divided before, so near-tie
+  codes could differ by one between paths); the kernel parameter is
+  renamed `inv_scale` and both header formulas agree.
+
+### Changed
+- Scalar-fallback elementwise, axpy and RoPE kernels promote their
+  item index math to 64-bit (their vectorized siblings already were;
+  anything beyond INT_MAX silently truncated).
+- The GEMV/PC K == 0 zero-fill checks its `cudaMemsetAsync`; the
+  paged launcher computes `table_width * page` in 64-bit and rejects
+  absurd pairs instead of overflowing; the GQA mapping, splitmix
+  twin merge and the quantize/qadd concurrency contract are
+  documented/unified.
+
+### Docs
+- Both languages resynced to the 1.5.0 JSONs (headline 8.8x,
+  sampling.md 2.33x/1.25x -> 1.54x/1.21x, attention 1.13x ->
+  1.11x, wide-nucleus min-p 0.28-0.45x, INT8 0.40-0.58x, the
+  roadmap's 1.2 entry - whose en/zh numbers disagreed - and more);
+  the 5060 Ti decode_step loop probe (4.5x) replaces an
+  unsupported "~4x". Chinese phrasing rewrites (draw mis-rendered
+  as 画, literal 发射底价/构造性地/精确退化为 and friends),
+  墙钟/墙上时钟 and 如实/诚实 unified, ragged/ulp glossary
+  entries, decode_step_batched added to both quickstarts and the
+  graph-capture exception lists.
+
 ## [1.5.0] - 2026-09-05
 
 Batched decode steps: the whole penalize -> temperature -> sample chain
@@ -28,13 +94,13 @@ stamp.
   Id values are validated on every path - the histories ride a small
   per-attempt host upload, so there is no device-resident form to
   trust. `penalty=1.0` or all-empty histories degenerate exactly to
-  `sample_topp_batched`. Rows process in chunks of 32; not CUDA-graph
-  capturable (the widening loop's per-attempt readback, same contract
-  as the other batched samplers). At B=8 @ 131k with ~64-token
-  histories: 5.2x over looping `decode_step` on peaked rows
-  (1676 -> 321 us on a 3060, on par with torch's native penalize +
-  softmax + batched-multinomial at 266 us) and 3.1x on mid-tail rows
-  (17.3 -> 5.5 ms).
+  `sample_topp_batched`. Rows are processed in chunks of 32; the op is
+  not CUDA-graph capturable (the widening loop's per-attempt readback,
+  same contract as the other batched samplers). At B=8 @ 131k with
+  ~64-token histories: 5.2x over looping `decode_step` on peaked rows
+  (1676 -> 321 us on a 3060, within ~20% of torch's native penalize +
+  softmax + batched-multinomial composite at 266 us) and 3.1x on
+  mid-tail rows (17.3 -> 5.5 ms).
 - Eleven mixed-widen-class tests over the existing batched samplers
   (rows spanning first-window / moderate / full-vocabulary widen
   classes in one batch, each row equal to itself sampled as a B = 1
@@ -45,17 +111,19 @@ stamp.
 - **Per-row window sizes inside one batched attempt** (the roadmap's
   other 1.5 item): three implementations (per-row windows through a
   tail array; host-side bucketing by window; a hybrid with one shared
-  launch per stage and bucketed sort ladders) all measured a net loss
-  or parity on an RTX 3060 at B = 8 and B = 32 - the serial
+  launch per stage and bucketed sort ladders) all measured as a net
+  loss or parity on an RTX 3060 at B = 8 and B = 32 - the serial
   inverse-CDF walk (~1.5 ms per full-vocabulary round at 131k)
-  dominates every attempt round a wide row survives, top-p's widen
-  bound is only necessary (mid rows under-shoot and re-walk more than
-  right-sizing saves), and merge levels carry a ~75-200 us per-launch
+  dominates every attempt round that reaches the walk, top-p's widen
+  bound is only necessary (mid-sized rows under-shoot their windows
+  and pay more re-walk time than right-sizing would save), and merge
+  levels carry a ~75-200 us per-launch
   floor that bucketing multiplies. Token batteries stayed within the
   documented ulp boundary throughout - the feature is correct, just
   not profitable on this cost structure. The uniform shared window
   stays; revisit if the walk goes parallel or launch floors drop. The
-  hardening tests above are what survived from the investigation.
+  mixed-widen-class tests above are what survived from the
+  investigation.
 
 ### Fixed
 - The GPU topp/minp walkers (single-row, the emit_finish tails, and

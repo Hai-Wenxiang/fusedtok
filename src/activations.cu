@@ -90,8 +90,8 @@ __global__ void unary_f4_kernel(const float4* __restrict__ in,
 
 template <typename T, typename F>
 __global__ void unary_f1_kernel(const T* __restrict__ in,
-                                T* __restrict__ out, int n, F f) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+                                T* __restrict__ out, long long n, F f) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) st_f(out, i, f(ld_f(in, i)));
 }
 
@@ -115,8 +115,8 @@ __global__ void binary_f4_kernel(const float4* __restrict__ a,
 template <typename T, typename F>
 __global__ void binary_f1_kernel(const T* __restrict__ a,
                                  const T* __restrict__ b,
-                                 T* __restrict__ out, int n, F f) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+                                 T* __restrict__ out, long long n, F f) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) st_f(out, i, f(ld_f(a, i), ld_f(b, i)));
 }
 
@@ -218,7 +218,7 @@ void launch_unary(const float* x, float* y, long long n, F f, std::uintptr_t str
                 x + n4 * 4, y + n4 * 4, tail, f);
     } else {
         unary_f1_kernel<float, F><<<(unsigned)grid_for(n),
-                                    kBlock, 0, (cudaStream_t)stream>>>(x, y, (int)n, f);
+                                    kBlock, 0, (cudaStream_t)stream>>>(x, y, n, f);
     }
     check_launch("elementwise kernel launch");
 }
@@ -256,7 +256,7 @@ void launch_unary_bf16(const __nv_bfloat16* x, __nv_bfloat16* y,
     } else {
         unary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n),
                                             kBlock, 0, (cudaStream_t)stream>>>(
-            x, y, (int)n, f);
+            x, y, n, f);
     }
     check_launch("elementwise bf16 kernel launch");
 }
@@ -281,7 +281,7 @@ void launch_binary(const float* a, const float* b, float* y, long long n,
                 a + n4 * 4, b + n4 * 4, y + n4 * 4, tail, f);
     } else {
         binary_f1_kernel<float, F><<<(unsigned)grid_for(n),
-                                     kBlock, 0, (cudaStream_t)stream>>>(a, b, y, (int)n, f);
+                                     kBlock, 0, (cudaStream_t)stream>>>(a, b, y, n, f);
     }
     check_launch("elementwise kernel launch");
 }
@@ -320,7 +320,7 @@ void launch_binary_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
     } else {
         binary_f1_kernel<__nv_bfloat16, F><<<(unsigned)grid_for(n),
                                              kBlock, 0, (cudaStream_t)stream>>>(
-            a, b, y, (int)n, f);
+            a, b, y, n, f);
     }
     check_launch("elementwise bf16 kernel launch");
 }

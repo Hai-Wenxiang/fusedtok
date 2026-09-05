@@ -215,7 +215,7 @@ __global__ void attn_decode_kernel(const T* __restrict__ q,
     }
 
     // GQA: q heads form contiguous groups over kv heads
-    const int kv = (int)((long long)h * hkv / hq);
+    const int kv = h / (hq / hkv);
     const float scale = 1.0f / sqrtf((float)dim);
     const T* qp = q + ((size_t)bi * hq + h) * dim;
     const T* kp = k + (((size_t)bi * hkv + kv) * t_seq) * dim;
@@ -1401,7 +1401,13 @@ void attention_decode_paged_launch_t(const T* q, const T* k_pool,
                                      int batch, int hq, int hkv, int page,
                                      int tbl_width, int dim,
                                      std::uintptr_t stream) {
-    attention_check(batch, hq, hkv, tbl_width * page, dim);
+    // t_seq spans table_width * pages; computed in 64-bit and bounded
+    // so an absurd (tbl_width, page) pair overflows into a clear
+    // rejection instead of undefined behavior before the check
+    const long long t_seq_wide = (long long)tbl_width * page;
+    if (t_seq_wide > (1LL << 30))
+        throw std::invalid_argument("table capacity too large");
+    attention_check(batch, hq, hkv, (int)t_seq_wide, dim);
     if (page < 1)
         throw std::invalid_argument("page size must be >= 1");
     const int group = hq / hkv;

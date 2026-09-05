@@ -29,7 +29,7 @@ xt, wt = torch.from_numpy(x).cuda(), torch.from_numpy(w).cuda()
 yt = fusedtok.rmsnorm(xt, wt)              # 零拷贝：CUDA torch 进出
 ```
 
-输出跟随输入的"家族"：numpy 进 numpy 出，CUDA torch 进 CUDA torch
+输出与输入同类：numpy 进 numpy 出，CUDA torch 进 CUDA torch
 出（CPU torch 进则经参考路径出 CPU torch）。
 
 推理循环要的就是零拷贝路径：kernel 挂在 torch 的**当前流**上
@@ -71,9 +71,9 @@ CPU 参考实现是正确性的基准：它实现的是同一套算法（在需�
 实操要点：
 
 1. **捕获前先热身。** 首次调用可能会为该形状分配 workspace
-   （attention 切分路径、选择管线）或微基准测试启动配置（行
-   kernel 的线程块大小、qgemm tile）。这些动作设计上只发生在
-   捕获之外，热身一次就把它们解决掉。
+   （attention 切分路径、选择管线），或对启动配置做一次微基准
+   调优（行 kernel 的线程块大小、qgemm tile）。这些动作设计上
+   只发生在捕获之外，热身一次就把它们解决掉。
 2. **进图的 kernel 从设备内存读取每次调用的参数。** 两次 replay
    之间写进张量的新内容，下一次 replay 能看到；原地改写 +
    replay 会重新计算（测试钉住了这一点）。而以 kernel 参数形式
@@ -97,9 +97,9 @@ g.replay()                                  # 整批一次 replay
 
 - 融合采样器返回主机端的 `int`，每次调用以一次很小的
   设备到主机回读收尾——它们本来就不打算被捕获。
-- 批量采样器（`sample_*_batched`）返回主机侧 int64 张量/数组，
-  而且扩窗循环要根据回读结果重新发射 kernel——同样不可捕获
-  （契约一致）。
+- 批量采样器（`sample_*_batched`）与 `decode_step_batched` 返回
+  主机侧 int64 张量/数组，而且扩窗循环要根据回读结果重新发射
+  kernel——同样不可捕获（契约一致）。
 - `quantize_int8` / `qadd_int8` 必须把归约出的 scale 读回主机
   才能组织第二遍 kernel，所以调用中途会同步一次调用方的流。
 - 零拷贝路径上，整数输入（attention 的 `lens`、分页的
