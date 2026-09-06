@@ -842,6 +842,62 @@ PYBIND11_MODULE(_fusedtok, m) {
        py::arg("m"), py::arg("penalty"), py::arg("stream") = 0);
 
     // ==================================================================
+    // HF-style combined logit penalties (repetition/presence/frequency)
+    // ==================================================================
+    m.def("logit_penalties_cpu", [](FArray logits, py::sequence ids, double repetition,
+                                    double presence, double frequency) {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(repetition > 0.0))
+            throw std::invalid_argument("repetition must be > 0");
+        std::vector<long long> token_ids;
+        for (auto item : ids) token_ids.push_back(item.cast<long long>());
+        return wrap_vec(ft::logit_penalties_cpu(to_vec(logits), token_ids,
+                                                (float)repetition, (float)presence,
+                                                (float)frequency),
+                        shape_of(logits));
+    }, py::arg("logits"), py::arg("token_ids"), py::arg("repetition"),
+       py::arg("presence"), py::arg("frequency"));
+
+    m.def("logit_penalties", [](FArray logits, py::sequence ids, double repetition,
+                                double presence, double frequency) {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(repetition > 0.0))
+            throw std::invalid_argument("repetition must be > 0");
+        std::vector<long long> token_ids;
+        for (auto item : ids) token_ids.push_back(item.cast<long long>());
+        for (long long id : token_ids)
+            if (id < 0 || id >= (long long)logits.size())
+                throw std::invalid_argument("token id out of range");
+        const int n = (int)logits.size();
+        const int m = (int)token_ids.size();
+        py::array_t<float> y(std::vector<py::ssize_t>{(py::ssize_t)n});
+        if (n == 0) return y;
+        DevBuf dxl(n * 4), dids((size_t)m * sizeof(long long)), dy(n * 4);
+        h2d(dxl.get(), logits.data(), n * 4);
+        if (m > 0)
+            h2d(dids.get(), token_ids.data(), (size_t)m * sizeof(long long));
+        ft::logit_penalties_launch(dxl.fget(),
+                                   static_cast<const long long*>(dids.get()),
+                                   n, m, (float)repetition, (float)presence,
+                                   (float)frequency, dy.fget());
+        d2h(y.mutable_data(), dy.get(), n * 4);
+        sync_device("logit_penalties kernel");
+        return y;
+    }, py::arg("logits"), py::arg("token_ids"), py::arg("repetition"),
+       py::arg("presence"), py::arg("frequency"));
+
+    m.def("logit_penalties_launch", [](py::int_ logits, py::int_ ids, py::int_ out,
+                                       int n, int m, float repetition, float presence,
+                                       float frequency, std::uintptr_t stream) {
+        ft::logit_penalties_launch(df(logits), dll(ids), n, m, repetition,
+                                   presence, frequency, dfm(out), stream);
+    }, py::arg("logits"), py::arg("token_ids"), py::arg("out"), py::arg("n"),
+       py::arg("m"), py::arg("repetition"), py::arg("presence"),
+       py::arg("frequency"), py::arg("stream") = 0);
+
+    // ==================================================================
     // fused nucleus sampling: softmax -> nucleus -> inverse-CDF draw
     // ==================================================================
     m.def("sample_topp_cpu", [](FArray logits, double p, double t,

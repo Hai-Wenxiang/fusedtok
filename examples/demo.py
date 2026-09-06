@@ -165,6 +165,16 @@ def main():
     y = fusedtok.repetition_penalty(lg, [0, 2], 2.0, cuda=True) if have_cuda \
         else fusedtok.repetition_penalty(lg, [0, 2], 2.0)
     check("repetition penalty", y, [2.0, 4.0, 2.0, 4.0, 4.0])
+    # combined HF penalties: id 0 twice (c = 2), id 2 once; the CTRL
+    # scale, then presence, then count-weighted frequency
+    pl = np.ones(5, dtype=np.float32) * 4.0
+    py_ = fusedtok.logit_penalties(pl, [0, 0, 2], repetition=2.0,
+                                   presence=0.5, frequency=0.25,
+                                   cuda=True) if have_cuda \
+        else fusedtok.logit_penalties(pl, [0, 0, 2], repetition=2.0,
+                                      presence=0.5, frequency=0.25)
+    check("logit penalties", py_,
+          [2.0 - 0.5 - 0.5, 4.0, 2.0 - 0.5 - 0.25, 4.0, 4.0])
 
     print(SEP)
     print("sample_topp: fused nucleus sampling (softmax -> top-p -> draw)")

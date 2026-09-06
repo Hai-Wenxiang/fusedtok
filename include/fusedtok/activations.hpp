@@ -65,6 +65,12 @@ topp_cpu(const std::vector<float>& probs, float p);
 // repetition_penalty(logits, ids, p) -> logits with every listed token id
 //     scaled by 1/p if positive, p if negative (CTRL-style penalty applied
 //     to previously generated tokens before sampling).
+// logit_penalties(logits, ids, rep, pres, freq) -> HF-style combined
+//     penalties on every listed token id, composed in that order:
+//     repetition scale (v > 0 -> v/rep, else v*rep; rep > 0), then a
+//     presence shift (v -= pres), then a count-weighted frequency shift
+//     (v -= c * freq, c = occurrences of the id in ids). Each distinct
+//     id is penalized exactly once no matter how often it appears in ids.
 // ---------------------------------------------------------------------------
 
 long long argmax_cpu(const std::vector<float>& x);
@@ -74,6 +80,11 @@ std::vector<float> temperature_cpu(const std::vector<float>& x, float t);
 std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
                                           const std::vector<long long>& token_ids,
                                           float penalty);
+
+std::vector<float> logit_penalties_cpu(const std::vector<float>& logits,
+                                       const std::vector<long long>& token_ids,
+                                       float repetition, float presence,
+                                       float frequency);
 
 // ---------------------------------------------------------------------------
 // Fused nucleus sampling (deterministic per seed):

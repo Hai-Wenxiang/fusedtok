@@ -89,6 +89,12 @@ histories = [[5, 9], [], [1, 2, 2], [7] * 16,
              [3], [], [0], [4, 4]]
 tokens = fusedtok.decode_step_batched(batch_logits, histories,
                                       penalty=1.3, p=0.9)
+
+# entropy-adaptive cutoffs (v1.6): the truncation threshold is
+# derived from the distribution's own entropy, not fixed
+token = fusedtok.sample_eta(logits, eta=1e-3, temperature=0.8, seed=0)
+token = fusedtok.sample_typical(logits, typical=0.9,
+                                temperature=0.8, seed=0)
 ```
 
 `examples/demo.py` in the repository tours every operator with
@@ -100,8 +106,9 @@ closed-form checks - it doubles as executable documentation.
   streams, CUDA graphs, and the error contract
 - [Attention operators](attention.md) - decode, paged caches, the
   contiguous and paged append write sides, prefill
-- [Sampling and selection](sampling.md) - top-k/top-p/min-p, fused
-  samplers, and the determinism contract
+- [Sampling and selection](sampling.md) - top-k/top-p/min-p, the
+  entropy-adaptive samplers (eta, typical), fused samplers, and the
+  determinism contract
 - [The INT8 path](int8.md) - quantization and integer-exact GEMM
 - [Benchmarks](benchmarks.md) - how the numbers are measured and how to
   read them

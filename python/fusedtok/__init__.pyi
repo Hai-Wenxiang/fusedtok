@@ -51,6 +51,7 @@ __all__ = [
     "mul",
     "temperature",
     "repetition_penalty",
+    "logit_penalties",
     "argmax",
     "topk",
     "topp",
@@ -61,7 +62,6 @@ __all__ = [
     "sample_eta_batched",
     "sample_typical",
     "sample_typical_batched",
-    "sample_typical",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
@@ -102,6 +102,10 @@ def mul(a: Array, b: Array, *, cuda: bool = False) -> Array: ...
 def temperature(x: Array, t: float, *, cuda: bool = False) -> Array: ...
 def repetition_penalty(logits: Array, token_ids: Array, penalty: float,
                        *, cuda: bool = False) -> Array: ...
+def logit_penalties(logits: Array, token_ids: Array, *,
+                    repetition: float = 1.0, presence: float = 0.0,
+                    frequency: float = 0.0,
+                    cuda: bool = False) -> Array: ...
 def argmax(x: Array, *, cuda: bool = False) -> int: ...
 def topk(x: Array, k: int, *,
          cuda: bool = False) -> "tuple[Array, Array]": ...
@@ -121,15 +125,11 @@ def sample_eta_batched(logits: Array, eta: float, *,
                        cuda: bool = False) -> Array: ...
 def sample_typical(logits: Array, typical: float, *,
                    temperature: float = 1.0,
-                   seeds: Optional[Array] = None,
-                   cuda: bool = False) -> Array: ...
+                   seed: int = 0, cuda: bool = False) -> int: ...
 def sample_typical_batched(logits: Array, typical: float, *,
                            temperature: float = 1.0,
                            seeds: Optional[Array] = None,
                            cuda: bool = False) -> Array: ...
-def sample_typical(logits: Array, typical: float, *,
-                   temperature: float = 1.0,
-                   seed: int = 0, cuda: bool = False) -> int: ...
 def sample_topp_batched(logits: Array, p: float, *,
                         temperature: float = 1.0,
                         seeds: Optional[Array] = None,
@@ -141,14 +141,6 @@ def sample_minp_batched(logits: Array, min_p: float, *,
                         temperature: float = 1.0,
                         seeds: Optional[Array] = None,
                         cuda: bool = False) -> Array: ...
-def sample_eta_batched(logits: Array, eta: float, *,
-                       temperature: float = 1.0,
-                       seeds: Optional[Array] = None,
-                       cuda: bool = False) -> Array: ...
-def sample_typical_batched(logits: Array, typical: float, *,
-                           temperature: float = 1.0,
-                           seeds: Optional[Array] = None,
-                           cuda: bool = False) -> Array: ...
 def quantize_int8(x: Array) -> "tuple[Array, float]": ...
 def dequantize_int8(q: Array, scale: float) -> Array: ...
 def qadd_int8(qa: Array, sa: float, qb: Array,

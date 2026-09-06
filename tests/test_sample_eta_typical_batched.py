@@ -153,3 +153,58 @@ class TestCuda:
         out_np = fusedtok.sample_eta_batched(x, 0.3)
         assert isinstance(out_np, np.ndarray)
         assert out_np.dtype == np.int64
+
+
+def test_batched_cpu_paths_match_single_rows():
+    # the numpy-input route (the *_batched_cpu references) with real
+    # rows was never exercised; each row must equal the single-row CPU
+    # reference bit-for-bit - that is the batched contract by
+    # construction
+    rng = np.random.default_rng(120)
+    b, n = 4, 2048
+    x = rng.standard_normal((b, n)).astype(np.float32)
+    x[1] *= 1e-3
+    x[2, 5] += 9.0
+    seeds = np.arange(b, dtype=np.int64)
+    got_e = fusedtok.sample_eta_batched(x, 0.3, seeds=seeds)
+    got_t = fusedtok.sample_typical_batched(x, 0.9, seeds=seeds)
+    for r in range(b):
+        want_e = int(fusedtok.sample_eta(x[r], 0.3, seed=int(seeds[r])))
+        want_t = int(fusedtok.sample_typical(x[r], 0.9,
+                                             seed=int(seeds[r])))
+        assert int(got_e[r]) == want_e
+        assert int(got_t[r]) == want_t
+
+
+def test_batched_cpu_direct_surface_shape_contract():
+    # the direct _fusedtok surface rejects mis-shaped host buffers
+    # instead of trusting rows * n (same contract as the 1.4 siblings;
+    # the 1.6 pair now carries the C++-level rows * n guard too)
+    from fusedtok import _fusedtok
+    with pytest.raises(ValueError):
+        _fusedtok.sample_eta_batched_cpu(
+            np.zeros(8, dtype=np.float32), 2, 8, 0.3, 1.0,
+            np.zeros(2, dtype=np.int64))
+    with pytest.raises(ValueError):
+        _fusedtok.sample_typical_batched_cpu(
+            np.zeros(8, dtype=np.float32), 2, 8, 0.9, 1.0,
+            np.zeros(2, dtype=np.int64))
+    # a right-shaped call draws deterministically (the flat row is a
+    # 4-way tie, so only in-range + repeat-stability can be pinned)
+    x = np.zeros((2, 4), dtype=np.float32)
+    seeds = np.zeros(2, dtype=np.int64)
+    out = _fusedtok.sample_eta_batched_cpu(x, 2, 4, 0.5, 1.0, seeds)
+    again = _fusedtok.sample_eta_batched_cpu(x, 2, 4, 0.5, 1.0, seeds)
+    assert [int(v) for v in out] == [int(v) for v in again]
+    assert all(0 <= int(v) < 4 for v in out)
+
+
+@needs_gpu
+def test_batched_single_token_rows():
+    # n = 1 rows through the batched pipeline: every row returns 0
+    x = np.zeros((3, 1), dtype=np.float32)
+    got_e = fusedtok.sample_eta_batched(torch.from_numpy(x).cuda(), 0.5)
+    got_t = fusedtok.sample_typical_batched(
+        torch.from_numpy(x).cuda(), 0.5)
+    assert [int(v) for v in got_e] == [0, 0, 0]
+    assert [int(v) for v in got_t] == [0, 0, 0]

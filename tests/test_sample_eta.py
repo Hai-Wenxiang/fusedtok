@@ -9,8 +9,10 @@ whose global total rides the same atomic-accumulation class). Cases:
 
 - CPU matches a numpy-composed reference across distributions, eta
   values and temperatures (exact)
-- staged / zero-copy match CPU (exact-or-neighbor-rank); zero-copy
-  and staged agree exactly (same GPU arithmetic)
+- staged / zero-copy match CPU (exact-or-neighbor-rank); staged vs
+  zero-copy is neighbor-rank too - the entropy accumulator's atomic
+  arrival order depends on the input buffer's address, so the two GPU
+  paths can sit a boundary apart
 - the nucleus always keeps at least one token (eta = 1, one-hot and
   flat logits)
 - adaptive widening: flat/near-uniform logits push the cutoff window
@@ -201,3 +203,36 @@ class TestCuda:
         assert t == int(fusedtok.sample_topp(x, 0.9, seed=2))
         assert m == int(fusedtok.sample_minp(x, 0.05, seed=4))
         assert 0 <= int(k) < 65536
+
+
+def test_single_token_vocabulary_and_temperature_extremes():
+    # n = 1: H = 0, the cutoff is eta itself and the single token
+    # survives (host reference here; the CUDA path has its own gated
+    # test below)
+    x = np.zeros(1, dtype=np.float32)
+    for t in (0.05, 1.0, 20.0):
+        assert int(fusedtok.sample_eta(x, 0.5, temperature=t)) == 0
+    # temperature extremes on a real distribution: H moves a lot, the
+    # cutoff with it; the CPU reference is the exact mirror
+    rng = np.random.default_rng(96)
+    x = rng.standard_normal(2048).astype(np.float32)
+    for t in (0.05, 20.0):
+        got = int(fusedtok.sample_eta(x, 0.3, temperature=t, seed=3))
+        assert 0 <= got < 2048
+
+
+@needs_gpu
+def test_single_token_and_extremes_gpu():
+    # the same shapes through the CUDA path: n = 1 survives, and the
+    # extremes land exact-or-neighbor-rank against the CPU reference
+    x = np.zeros(1, dtype=np.float32)
+    for t in (0.05, 1.0, 20.0):
+        assert int(fusedtok.sample_eta(x, 0.5, temperature=t,
+                                       cuda=True)) == 0
+    rng = np.random.default_rng(96)
+    x = rng.standard_normal(2048).astype(np.float32)
+    for t in (0.05, 20.0):
+        want = int(fusedtok.sample_eta(x, 0.3, temperature=t, seed=3))
+        got = int(fusedtok.sample_eta(x, 0.3, temperature=t, seed=3,
+                                      cuda=True))
+        _assert_neighbor(x, got, want, ("eta", t))

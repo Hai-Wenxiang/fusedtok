@@ -1,9 +1,11 @@
 # Sampling and selection
 
 The selection operators (top-k, top-p, argmax) and the fused samplers
-(`sample_topp`, `sample_topk`, `sample_minp`, `decode_step`, plus the
-v1.4 `_batched` variants) share one pipeline and one determinism
-contract. This page explains both, plus the exact boundary where CPU
+(`sample_topp`, `sample_topk`, `sample_minp`, `sample_eta`,
+`sample_typical`, `decode_step`, plus the `_batched` variants) share
+one pipeline and one determinism
+contract, and `logit_penalties` applies the HF penalty trio in one
+call. This page explains both, plus the exact boundary where CPU
 and GPU draws may differ.
 
 **Other languages:** [中文：采样与选择](../zh/sampling.md)
@@ -13,6 +15,7 @@ and GPU draws may differ.
 - [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp---threshold-by-max-sampling-v13)
 - [sample_eta - entropy-adaptive cutoff sampling (v1.6)](#sample_eta---entropy-adaptive-cutoff-sampling-v16)
 - [sample_typical - locally typical sampling (v1.6)](#sample_typical---locally-typical-sampling-v16)
+- [logit_penalties - the HF penalty trio in one call (v1.6.1)](#logit_penalties---the-hf-penalty-trio-in-one-call-v161)
 - [Batched sampling - one call per decode step (v1.4)](#batched-sampling---one-call-per-decode-step-v14)
 - [Batched decode steps - penalties included (v1.5)](#batched-decode-steps---penalties-included-v15)
 - [The same-token guarantee](#the-same-token-guarantee)
@@ -59,11 +62,15 @@ tok = fusedtok.decode_step(logits, history, penalty=1.1,
   greedy; `k >= vocab` samples the whole distribution.
 - `decode_step`: CTRL-style `repetition_penalty` over `history`, then
   temperature, then nucleus sampling - one call, one readback, and the
-  identical result as composing the three ops in that order with the
+  identical result to composing the three ops in that order with the
   same seed.
 - `repetition_penalty(logits, token_ids, penalty)` is also exposed
   standalone: positive logits are divided by `penalty`, negative
   logits multiplied (`penalty=1.0` disables it).
+- `logit_penalties(logits, token_ids, *, repetition, presence,
+  frequency)` composes that CTRL rule with the presence and frequency
+  shifts in one call - see [its section](#logit_penalties---the-hf-penalty-trio-in-one-call-v161)
+  below.
 
 Sampling is **deterministic per seed**: the draw uses a splitmix-style
 hash uniform (reproducible, not cryptographically secure). Host-origin
@@ -111,18 +118,23 @@ nucleus, draw with the same seeded hash.
 tok = fusedtok.sample_eta(logits, eta=0.3, temperature=0.8, seed=step)
 ```
 
-Eta-cutoff (Hewitt et al. 2022, "Trickle-down" - deployed in
-llama.cpp and vLLM as `eta_cutoff`) truncates by a value threshold
-derived from the distribution's OWN shape: compute the entropy H (in
-nats), keep every token whose probability is at least
-`eta * min(1, exp(-H))`, renormalize within that nucleus, draw with
-the same seeded hash. Flat distributions raise the bar (heavy
-truncation), confident ones lower it toward zero (nearly everything
-survives) - the cutoff adapts where `min_p` and `top_p` use fixed
-or mass-relative bars.
+Eta-cutoff (Hewitt et al. 2022, "Truncation Sampling as Language
+Model Desmoothing" - deployed in llama.cpp and vLLM as `eta_cutoff`)
+truncates by a value threshold derived from the distribution's own
+shape: compute the entropy H (in nats), keep every token whose
+probability is at least `eta * min(1, exp(-H))`, renormalize within
+that nucleus, draw with the same seeded hash. The bar moves opposite
+to the entropy: confident distributions keep H near zero, so the bar
+rises toward `eta` itself and the low-probability tail is trimmed,
+while flat distributions push `exp(-H)` toward zero and the bar drops
+with it (nearly everything survives) - the cutoff adapts where
+`min_p` and `top_p` use fixed or mass-relative bars. (This library
+implements the simplified threshold `eta * min(1, exp(-H))` that
+llama.cpp and HF ship; the paper's original form is
+`min(eps, sqrt(eps) * exp(-H))` - same direction, different values.)
 
 - `eta` must be in `(0, 1]` (`ValueError` otherwise); `temperature`
-  must be greater than 0. Typical serving values are tiny
+  must be greater than 0. Commonly used `eta` values are tiny
   (`1e-3`-ish) - the entropy factor does the shaping.
 - The nucleus always keeps at least one token: the cutoff is bounded
   by the maximum probability (the weighted geometric mean of the
@@ -149,9 +161,9 @@ tok = fusedtok.sample_typical(logits, typical=0.9, temperature=0.8,
 ```
 
 Locally typical sampling (Meister et al. 2022) keeps the smallest set
-of tokens, ordered by how CLOSE each token's surprise
-(`-log p_i`) is to the distribution's entropy `H`, whose mass reaches
-`typical` - then renormalizes inside that set and draws with the same
+of tokens whose total mass reaches `typical`, ordered by how close
+each token's surprise (`-log p_i`) is to the distribution's entropy
+`H` - then renormalizes inside that set and draws with the same
 seeded hash. Unlike top-p/min-p the kept set is not a prefix of the
 ranked distribution: too-confident and too-surprising tokens are
 trimmed symmetrically, which is the design's point.
@@ -167,16 +179,65 @@ trimmed symmetrically, which is the design's point.
   (CPU-vs-GPU neighbor-rank on rounding boundaries; bit-stable within
   one process and input buffer).
 - Implementation note: on the value-sorted window the kept set is a
-  contiguous BAND (the shifted surprise `|log p_i + H|` is U-shaped
+  contiguous band (the shifted surprise `|log p_i + H|` is U-shaped
   along the value order, descending to a valley at `log p_i = -H` and
   rising again). The serial walker expands the band from the valley
-    in ascending shifted order (merging the two monotone arms) and
-  rejects any band that touches the window tail before the mass is
-  reached - canonical members may live past the edge, so the host
-  widens instead of drawing a wrong band. There is no analytic
-  widening bound for the band: the honest x8 ladder is the whole
-  story (the full window always covers, since the band mass at the
-  full vocabulary is the total).
+  in ascending shifted order (merging the two monotone arms) and
+  rejects any band that touches the window tail while the window is
+  smaller than the vocabulary, mass reached or not - canonical
+  members may live past the edge, so the host widens instead of
+  drawing a wrong band. At the full window the walked band's mass is
+  the row total up to summation order, so the draw proceeds (the
+  full-vocabulary fallback, as in the other samplers). There is no
+  analytic widening bound for the band: the honest x8 ladder is the
+  whole story (the full window always covers, since the band mass at
+  the full vocabulary is the total).
+
+## logit_penalties - the HF penalty trio in one call (v1.6.1)
+
+```python
+penalized = fusedtok.logit_penalties(logits, history,
+                                     repetition=1.2, presence=0.1,
+                                     frequency=0.05)
+```
+
+`logit_penalties` applies the three HF-style sampling penalties to a
+logit row in one call. For every distinct id in `token_ids`, with `c`
+its number of occurrences:
+
+```
+v = logit[id]
+if repetition != 1.0:  v = v / repetition if v > 0 else v * repetition
+if presence    != 0.0: v -= presence
+if frequency   != 0.0: v -= c * frequency
+penalized[id] = v
+```
+
+- The composition order matches the HF processors: the CTRL scale
+  first, then the presence shift, then the count-weighted frequency
+  shift. `repetition` must be greater than 0 (`ValueError` otherwise);
+  `presence` and `frequency` are plain shifts with no range limit.
+- Duplicates never stack: an id listed three times is penalized exactly
+  once, with `c = 3` entering only the frequency term. This mirrors the
+  GPU histogram (each id contributes one count) and the
+  once-per-distinct-id CPU reference - the fix that landed in v1.5.2.
+- Unlisted logits pass through unchanged; an empty `token_ids` row is
+  an exact no-op. `logit_penalties(..., repetition=1.2)` with the other
+  parameters at their defaults matches the standalone
+  `repetition_penalty` bit-for-bit.
+- **Exact contract, not the samplers' boundary class**: counts are
+  integers and no output value is touched by more than one thread, so
+  there is no atomics-order rounding and no entropy-derived threshold -
+  the CPU reference and every GPU path (staged, zero-copy, in-place)
+  agree bit-for-bit, including across processes.
+- The id histogram rides a cached per-vocab workspace allocated outside
+  stream captures (the attention-workspace pattern), so the op is CUDA
+  graph capturable; a first call that races a capture borrows the
+  output buffer for the histogram instead, which is the one case where
+  `out` may not alias `logits` (the launcher raises a clear error on
+  that rare path). Warm up before capturing to keep in-place calls
+  available.
+- Single-row only; a batched variant is a future candidate.
 
 ## Batched sampling - one call per decode step (v1.4)
 
@@ -184,7 +245,8 @@ trimmed symmetrically, which is the design's point.
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 ```
 
-`sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched`
+`sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched` /
+`sample_eta_batched` / `sample_typical_batched`
 sample a whole `[rows, vocab]` batch in one call and return one token
 per row. The return is int64 on the HOST: a CPU torch tensor for torch
 input, a numpy array otherwise. The widening loop's host readback is
@@ -201,7 +263,10 @@ inherent to returning tokens at all, so - like the single-row samplers
 - Every row runs the single-row pipeline **verbatim** - same kernels,
   same accumulation order, per-row parity including the widening loop
   (rows finish at their own window sizes; finished rows are skipped
-  while wider-nucleus rows retry).
+  while wider-nucleus rows retry). The v1.6 pair keeps that property
+  after 1.6.1: batched typical widens on a band-touching-window-tail
+  exactly like the single-row kernel (before 1.6.1 it drew from a
+  truncated tail band - fixed in this release).
 - Rows are processed in fixed chunks of 32, so very large batches
   stream through a bounded workspace.
 - What batching buys: the per-row Python/launch overhead collapses.
@@ -211,7 +276,7 @@ inherent to returning tokens at all, so - like the single-row samplers
   benchmark tables in the README measure GPU time, a different
   protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
-  (1.54x / 1.21x). The flat worst case keeps the singles' honest
+  (1.51x / 1.17x). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05-0.06x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.
@@ -290,7 +355,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.16-0.37x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.15-0.27x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its
