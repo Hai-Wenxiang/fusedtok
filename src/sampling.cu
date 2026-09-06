@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 
 namespace fusedtok {
@@ -41,6 +43,57 @@ __global__ void copy_kernel(const float* x, float* y, long long n) {
     if (i < n) y[i] = x[i];
 }
 
+// ---------------------------------------------------------------------------
+// HF-style combined logit penalties (repetition / presence / frequency):
+//
+//   c[i] = number of occurrences of id i in token_ids
+//   y[i] = x[i]                                                   if c[i] == 0
+//   y[i]: v = x[i]
+//         if repetition != 1: v = v > 0 ? v / repetition : v * repetition
+//         if presence    != 0: v -= presence
+//         if frequency   != 0: v -= c[i] * frequency
+//         y[i] = v                                        (applied once per id)
+//
+// The composition order (repetition scale, then presence shift, then
+// count-weighted frequency shift) matches the HF processors and is shared
+// verbatim by the CPU reference, so the two paths agree bit-exactly: the
+// counts are integers, no output value is touched by more than one thread,
+// and every arithmetic op is a correctly rounded IEEE single op on both
+// sides. Duplicate ids must not stack: the histogram counts each id once
+// and the apply pass reads the ORIGINAL logit, so every duplicate computes
+// the identical value (the 1.5.2 per-distinct-id lesson, kernel side).
+// ---------------------------------------------------------------------------
+
+// One thread per id: bump the id's histogram bucket. Host-side validation
+// already rejected out-of-range ids; the guard keeps a bad device-resident
+// tensor (trusted, not synced - see _ids_arg) from corrupting memory.
+__global__ void penalty_count_kernel(const long long* ids, int n, int m,
+                                     int* counts) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    long long id = ids[j];
+    if (id < 0 || id >= (long long)n) return;   // validated on host; defensive guard
+    atomicAdd(&counts[id], 1);
+}
+
+// One thread per vocab slot: penalized slots rewrite the logit in the HF
+// composition order, every other slot passes through. Reads x (never y),
+// so in-place out == logits stays safe on the cached-workspace path.
+__global__ void logit_penalties_kernel(const float* x, const int* counts,
+                                       int n, float repetition, float presence,
+                                       float frequency, float* y) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    int c = counts[i];
+    if (c > 0) {
+        if (repetition != 1.0f) v = v > 0.0f ? v / repetition : v * repetition;
+        if (presence != 0.0f) v -= presence;
+        if (frequency != 0.0f) v -= (float)c * frequency;
+    }
+    y[i] = v;
+}
+
 } // namespace
 
 std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
@@ -61,6 +114,105 @@ std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
         y[(size_t)id] = v > 0.0f ? v / penalty : v * penalty;
     }
     return y;
+}
+
+std::vector<float> logit_penalties_cpu(const std::vector<float>& logits,
+                                       const std::vector<long long>& token_ids,
+                                       float repetition, float presence,
+                                       float frequency) {
+    if (!(repetition > 0.0f))
+        throw std::invalid_argument("repetition must be > 0");
+    for (long long id : token_ids)
+        if (id < 0 || id >= (long long)logits.size())
+            throw std::invalid_argument("token id out of range");
+    std::vector<float> y = logits;
+    // one entry per DISTINCT id: the apply formula depends on the total
+    // count only, mirroring the GPU histogram (per-occurrence stacking
+    // would diverge on repeated ids - see repetition_penalty_cpu)
+    std::map<long long, int> counts;
+    for (long long id : token_ids) counts[id] += 1;
+    for (const auto& kv : counts) {
+        float v = logits[(size_t)kv.first];
+        if (repetition != 1.0f) v = v > 0.0f ? v / repetition : v * repetition;
+        if (presence != 0.0f) v -= presence;
+        if (frequency != 0.0f) v -= (float)kv.second * frequency;
+        y[(size_t)kv.first] = v;
+    }
+    return y;
+}
+
+namespace {
+
+// Per-vocab-size histogram buffers (int per vocab slot, <= 512 KiB at the
+// 131072 cap). Allocated OUTSIDE stream captures (the attention-workspace
+// pattern); a first use that races an active capture runs the histogram
+// through the caller's output buffer instead - same byte count (n * 4),
+// cleared before the histogram and rewritten by the apply pass, so the
+// buffer is back to logits by the time the caller reads it. That fallback
+// borrows y, hence the out != logits requirement there.
+std::mutex& pen_ws_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::map<int, int*>& pen_ws_cache() {
+    static std::map<int, int*> c;
+    return c;
+}
+
+} // namespace
+
+void logit_penalties_launch(const float* logits, const long long* ids,
+                            int n, int m, float repetition, float presence,
+                            float frequency, float* y, std::uintptr_t stream) {
+    if (n <= 0) return;
+    if (!(repetition > 0.0f))
+        throw std::invalid_argument("repetition must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    int* counts = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(pen_ws_mutex());
+        auto it = pen_ws_cache().find(n);
+        if (it != pen_ws_cache().end()) {
+            counts = it->second;
+        } else if (stream_is_capturing(cs)) {
+            // first use raced an active capture: histogram through the
+            // output buffer for THIS call; later uncaptured calls
+            // populate the cache
+            if (y == logits)
+                throw std::invalid_argument(
+                    "logit_penalties: out must not alias logits when capture "
+                    "races first use; call once outside capture first");
+            counts = reinterpret_cast<int*>(y);
+        } else {
+            int* buf = nullptr;
+            if (cudaMalloc(&buf, (size_t)n * sizeof(int)) != cudaSuccess) {
+                cudaGetLastError();
+                // allocation failed: same output-buffer fallback, stay correct
+                if (y == logits)
+                    throw std::invalid_argument(
+                        "logit_penalties: out must not alias logits when the "
+                        "counts workspace cannot be allocated");
+                counts = reinterpret_cast<int*>(y);
+            } else {
+                counts = buf;
+                pen_ws_cache().emplace(n, buf);
+            }
+        }
+    }
+    // zero the histogram, count the ids, then rewrite the logits (all
+    // stream-ordered, still async)
+    cudaError_t err = cudaMemsetAsync(counts, 0, (size_t)n * sizeof(int), cs);
+    if (err == cudaSuccess && m > 0)
+        penalty_count_kernel<<<(unsigned)grid_for(m), kBlock, 0, cs>>>(
+            ids, n, m, counts);
+    if (err == cudaSuccess)
+        logit_penalties_kernel<<<(unsigned)grid_for(n), kBlock, 0, cs>>>(
+            logits, counts, n, repetition, presence, frequency, y);
+    if (err == cudaSuccess)
+        err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("logit_penalties kernel launch: ") +
+                                 cudaGetErrorString(err));
 }
 
 void repetition_penalty_launch(const float* logits, const long long* ids,
@@ -413,6 +565,9 @@ std::vector<long long> sample_eta_batched_cpu(
     const std::vector<unsigned long long>& seeds) {
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
     std::vector<long long> out;
     out.reserve((size_t)rows);
     for (int r = 0; r < rows; ++r) {
@@ -428,6 +583,9 @@ std::vector<long long> sample_typical_batched_cpu(
     float t, const std::vector<unsigned long long>& seeds) {
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
     std::vector<long long> out;
     out.reserve((size_t)rows);
     for (int r = 0; r < rows; ++r) {

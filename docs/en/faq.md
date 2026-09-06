@@ -68,9 +68,9 @@ case may pick a neighboring token after a process restart. Details:
 
 `torch.multinomial` never sorts - it draws against the full
 distribution with a boolean-mask pass. The fusedtok samplers must
-ORDER the nucleus (the selection pipeline), and on near-uniform
+sort the nucleus (the selection pipeline), and on near-uniform
 logits the nucleus is ~90% of the vocabulary, so they honestly lose
-that regime (0.05-0.06x batched, 0.16-0.37x single-row). Real decode
+that regime (0.05-0.06x batched, 0.15-0.27x single-row). Real decode
 logits are peaked, where the samplers sit at native-multinomial
 level or better. Details:
 [sampling - flat distributions](sampling.md#flat-distributions---the-honest-worst-case).
@@ -86,9 +86,10 @@ application needs one.
 Yes, library-wide, with warm-up first. Exceptions: the fused samplers
 return host ints (each call ends in a readback) - the `_batched`
 samplers and `decode_step_batched` additionally re-launch kernels from
-a readback inside their widening loop, so int64 arrays or not, they
-stay outside graphs - and `quantize_int8`/`qadd_int8` sync once
-mid-call to compose their scales. The selection pipeline captures its
+a readback inside their widening loop, so whether they return
+int64 arrays or not, they stay outside graphs - and
+`quantize_int8`/`qadd_int8` sync once mid-call to compose their
+scales. The selection pipeline captures its
 own internal graph automatically - you do not manage it.
 
 ## Windows-specific timing notes
@@ -120,12 +121,14 @@ micro-benchmark yourself, prefer events over wall clock and expect
   maximum.
 - **eta-cutoff** - a sampling truncation whose threshold derives from
   the distribution's own entropy (keep every token with
-  `p_i >= eta * min(1, exp(-H))`): flat distributions get heavy
-  truncation, confident ones almost none.
+  `p_i >= eta * min(1, exp(-H))`): confident distributions get the
+  heavy truncation (the bar rises toward `eta`), flat ones almost
+  none (the bar drops toward zero).
 - **Locally typical sampling** - a truncation that keeps the smallest
-  set of tokens whose "surprise" (`-log p_i`) is closest to the
-  distribution entropy, mass reaching `typical`: too-confident and
-  too-surprising tokens are trimmed symmetrically.
+  set of tokens whose total mass reaches `typical`, ordered by how
+  close each token's "surprise" (`-log p_i`) is to the distribution
+  entropy: too-confident and too-surprising tokens are trimmed
+  symmetrically.
 - **Batched sampling** - sampling a whole `[rows, vocab]` batch in one
   call (the `_batched` samplers and `decode_step_batched`): every row
   runs the single-row pipeline verbatim with its own seed; the speedup

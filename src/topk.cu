@@ -1679,7 +1679,10 @@ static int widen_window_minp(int window, int n, float min_p, double total,
 // Adaptive widening jump for eta-cutoff (v1.6): the nucleus is again a
 // VALUE threshold on the normalized probability
 // (p_i >= eta * min(1, exp(-H))), so min-p's sufficient mass bound
-// transfers directly with min_p replaced by that cutoff. The host
+// transfers with min_p replaced by the cutoff IN EXP UNITS - the
+// bound's divisor is the per-element exp contribution, i.e. the
+// probability cutoff times the global total (for min-p that product
+// is exactly min_p because the max exp is 1). The host
 // derives the cutoff from the same quantities the walker used, all
 // host-cached after the one-time mass pass (global total T, entropy
 // accumulator s: H = log(T) - s / T); the only fresh readback is the
@@ -1695,7 +1698,8 @@ static int widen_window_eta(int window, int n, float eta, double total,
     const double c = (double)*reinterpret_cast<const float*>(&cw);
     const double h = std::log(total) - s_acc / total;
     const double thr = (double)eta * std::fmin(1.0, std::exp(-h));
-    const long long lb = minp_widen_bound(window, thr, total, c);
+    const long long lb =
+        minp_widen_bound(window, thr * total, total, c);
     const long long want = std::max<long long>((long long)window * 8, lb);
     if (want >= n) return n;
     int mp = 1;                       // pow2 headroom over the bound
@@ -2219,10 +2223,17 @@ __global__ void sample_typical_serial_kernel(
             }
         }
     }
-    if (mass < need || (hi == k - 1 && k < n)) {
+    if ((mass < need || hi == k - 1) && k < n) {
         // short mass, or the band touches the window tail where
         // canonical members may live past the edge - widen (lo == 0
-        // is a true edge; nothing precedes the global max)
+        // is a true edge; nothing precedes the global max). At
+        // k == n there is nothing to widen to: the band was walked
+        // over the whole window, so its mass IS the row total up to
+        // summation-order ulp - never let that ulp shortfall
+        // (possible when typical == 1.0, whose need equals the
+        // parallel-reduction total exactly) turn into a spurious
+        // "not covered"; draw from the band like the topp/minp/eta
+        // full-window fallbacks do.
         *reinterpret_cast<float*>(&ws[kWsCumW]) = mass;
         return;
     }
@@ -2526,7 +2537,8 @@ long long sample_typical_launch(const float* x, int n, float typical,
                                            sizeof(float),
                                        cs>>>(
             sorted, exps, ws, token_out, window, n, typical, seed);
-        check_launch("typical tail launch");        cudaError_t err = cudaDeviceSynchronize();
+        check_launch("typical tail launch");
+        cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("typical kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -2538,7 +2550,7 @@ long long sample_typical_launch(const float* x, int n, float typical,
         if (window == n)
             throw std::runtime_error("typical nucleus not covered");
         // honest x8 ladder: the band has no analytic widening bound
-        window = std::min(n, window * 8);
+        window = (int)std::min<long long>(n, (long long)window * 8);
     }
 }
 
@@ -3255,10 +3267,13 @@ __global__ void sample_eta_serial_b_kernel(
 
 // locally typical sampling tail (v1.6), row-decomposed: the smallest
 // band of the value-sorted window (contiguous, because the shifted
-// surprise is U-shaped) whose mass reaches typical * total. The
-// band-touching-window-tail check (hi == k - 1 && k < n && mass short)
-// sends the row back for widening — same trust boundary as the
-// single-row version.
+// surprise is U-shaped) whose mass reaches typical * total. A band
+// touching the window tail is sent back for widening regardless of
+// whether its mass already reached the target - canonical members may
+// live past the edge in value order - same trust boundary as the
+// single-row version (at k == n there is nothing to widen to: the
+// walked band's mass is the row total up to summation-order ulp, and
+// drawing proceeds as in the topp/minp/eta full-window fallbacks).
 __global__ void sample_typical_serial_b_kernel(
     const unsigned long long* __restrict__ ws, long long stride,
     int keys_off, int exps_off, int k, int n, float typical,
@@ -3293,7 +3308,7 @@ __global__ void sample_typical_serial_b_kernel(
         if (dl <= dr) { --blo; band_mass += exps[blo]; }
         else { ++bhi; band_mass += exps[bhi]; }
     }
-    if (band_mass < need && k < n) {
+    if ((band_mass < need || bhi == k - 1) && k < n) {
         cumws[row] = band_mass;
         return;
     }
@@ -3534,10 +3549,13 @@ std::vector<long long> sample_nucleus_batched_chunk(
                     std::log(total[r]) - (double)sv_h[r] / total[r];
                 const double cut =
                     (double)thr * std::fmin(1.0, std::exp(-h_r));
-                lb = minp_widen_bound(window, cut, total[r],
+                // the bound's divisor is the per-element exp
+                // contribution: the probability cutoff times the
+                // row's global total
+                lb = minp_widen_bound(window, cut * total[r], total[r],
                                       (double)cum_h[r]);
             }
-            // mode 3 (typical): no analytic bound — x8 ladder floor
+            // mode 3 (typical): no analytic bound - x8 ladder floor
             want = std::max<long long>(want, lb);
         }
         if (want >= n) {

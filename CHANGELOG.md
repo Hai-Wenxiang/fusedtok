@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] - 2026-09-07
+
+The combined HF penalty operator, plus audit-driven hardening of the
+v1.6.0 samplers. 43 public names; 579 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Added
+- **`logit_penalties(logits, token_ids, *, repetition, presence,
+  frequency)`** - the HF sampling-penalty trio in one call, single-row.
+  For every distinct id, with `c` its occurrence count: the CTRL
+  repetition scale (`v > 0 -> v / rep`, else `v * rep`; `rep > 0`),
+  then the presence shift (`v -= pres`), then the count-weighted
+  frequency shift (`v -= c * freq`). Duplicates never stack - a
+  histogram kernel counts occurrences and the apply pass reads the
+  original logit, the kernel-side twin of the 1.5.2 CPU fix. Exact
+  contract, not the samplers' boundary class: integer counts, no
+  output atomics, same-order IEEE float ops - CPU reference and every
+  GPU path agree bit-for-bit, across processes included. The id
+  histogram rides a cached per-vocab workspace allocated outside
+  stream captures (CUDA-graph capturable; a cold capture borrows the
+  output buffer, the one case where `out` may not alias `logits`).
+  API count 42 -> 43.
+
+### Fixed
+- **single-row `sample_typical` could throw "typical nucleus not
+  covered" at `typical = 1.0`**: `need = typical * total` reproduces
+  the parallel-reduction total exactly while the walked band mass
+  sums the same values in valley order, so a 1-ulp shortfall at the
+  full window widened past the last ladder rung and threw. At `k ==
+  n` the walked band's mass IS the row total up to summation order;
+  the draw now proceeds like the topp/minp/eta full-window fallbacks.
+- **`sample_typical_batched` was missing the single-row trust
+  boundary**: a band touching the window tail drew from the truncated
+  band (systematically high-probability-biased) whenever its mass
+  reached the target at the edge. The batched tail now widens on
+  `bhi == k - 1` with `k < n` regardless of mass, matching the
+  single-row kernel - and the kernel comment that described a check
+  that did not exist now describes the real one.
+- `sample_eta_batched_cpu` / `sample_typical_batched_cpu` gained the
+  `logits.size() >= rows * n` guard their four 1.4 siblings have
+  (direct-surface undersized buffers read out of bounds without it).
+
+### Hardened
+- `widen_window_eta` (single-row and batched mode 2) passed the
+  probability cutoff to `minp_widen_bound`, whose divisor is an
+  exp-unit threshold - never wrong (the bound was only ever larger),
+  but the dimension mismatch could cost a ladder rung on wide
+  nuclei; both now pass `cutoff * total`.
+- The single-row typical x8 ladder multiplies in 64-bit like its
+  batched twin (`window * 8` overflowed int past 2^28 vocabs); a
+  two-statement launcher line split; non-ASCII dashes in new comments
+  normalized.
+
+### Docs
+- Audit resync of both languages: the eta-cutoff direction was
+  documented backwards in six places (confident distributions get the
+  heavy truncation, flat ones almost none - not the reverse); the
+  Hewitt 2022 paper is "Truncation Sampling as Language Model
+  Desmoothing" (with a note that the shipped threshold is the
+  llama.cpp/HF variant); the typical trust boundary, the batched
+  sampler enumerations, the v1.6 quickstart examples, the README
+  roadmap rows and a stiff-phrasing/translationese sweep.
+
 ## [1.6.0] - 2026-09-05
 
 Two new entropy-adaptive samplers: eta-cutoff and locally typical
@@ -17,8 +80,9 @@ sampling, both single-row and batched. Four new API names (38 -> 42);
   2022; deployed in llama.cpp / vLLM as `eta_cutoff`). Keep every
   token whose probability `p_i >= eta * min(1, exp(-H))`, where H is
   the distribution entropy in nats. The cutoff adapts to the
-  distribution's own shape: flat logits get heavy truncation, peaked
-  logits nearly none. Implemented via a new entropy accumulator
+  distribution's own shape: peaked logits get the heavy truncation
+  (the bar rises toward `eta`), flat logits nearly none (it drops
+  toward zero). Implemented via a new entropy accumulator
   kernel (`s = sum e_i * (l_i - max)`, with `H = log(total) - s /
   total`) that runs per attempt alongside the existing global-total
   pass. The cutoff is a value-threshold prefix exactly like min-p's,
@@ -26,9 +90,9 @@ sampling, both single-row and batched. Four new API names (38 -> 42);
   derived cutoff.
 - **`sample_typical(logits, typical, *, temperature, seed)`** and
   **`sample_typical_batched`** - locally typical sampling (Meister
-  et al. 2022). Keep the smallest set of tokens, ordered by how
-  close each token's surprise is to the distribution entropy, whose
-  mass reaches `typical`; renormalize and draw. The kept set is a
+  et al. 2022). Keep the smallest set of tokens whose total mass
+  reaches `typical`, ordered by how close each token's surprise is to
+  the distribution entropy; renormalize and draw. The kept set is a
   contiguous band of the value-sorted window (the shifted surprise
   is U-shaped along the value order), found by two-pointer expansion
   from the valley. The band has no analytic widening bound; the

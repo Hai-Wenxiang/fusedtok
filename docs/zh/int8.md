@@ -56,7 +56,7 @@ y = fusedtok.qgemm_perchannel(a_q, a_scale, b_q, b_scales)
   TensorRT-LLM 风格的 W8A8）：激活带一个逐张量 scale，权重带
   **每个输出通道一个** scale（`b_scales[j]`，长度 N 的 float32
   向量）。逐通道 scale 能吃掉单一逐张量 scale 消化不了的权重
-  离群值——端到端测试实测，尖刺权重上的量化误差降到约 1/5 以下。
+  离群值——端到端测试实测，离群值上的量化误差降到约 1/5。
 
 零拷贝路径要求 int8 且 C 连续的操作数（scale 向量为 float32）；
 非连续张量会被拒绝，而不是被读错。

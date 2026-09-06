@@ -5,9 +5,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/Hai-Wenxiang/fusedtok/blob/main/pyproject.toml)
 
-**Fused CUDA kernels for LLM inference** — RMSNorm / RoPE / SwiGLU / attention
+**Fused CUDA kernels for LLM inference** - RMSNorm / RoPE / SwiGLU / attention
 decode and friends, with **zero-copy torch tensor support**: up to
-**8.8x faster than PyTorch SDPA** (attention decode, RTX 3060, see
+**9.0x faster than PyTorch SDPA** (attention decode, RTX 3060, see
 [Benchmarks](#benchmarks)).
 
 **中文文档请看 [README_zh.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/README_zh.md)** | English below.
@@ -20,7 +20,7 @@ traffic and launch overhead.
 
 ## Operators
 
-38 operators + helpers (`fusedtok.__all__`; 34 were frozen at 1.0, the
+43 operators + helpers (`fusedtok.__all__`; 34 were frozen at 1.0, the
 rest arrived in minor releases - see "API stability" below). `axpy` is
 the hello-world demo op kept from
 the v0.x skeleton - functional, but not a performance feature.
@@ -39,8 +39,11 @@ the v0.x skeleton - functional, but not a performance feature.
 | ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, global-mass threshold |
 | ✅ | sample_topk | fused top-k sampling: softmax -> top-k -> renormalize within the window -> seeded draw (1.8-2.1x vs the topk+multinomial composite @131k) |
 | ✅ | sample_minp | fused min-p sampling (v1.3): keep every token with p >= min_p * p_max -> renormalize -> seeded draw - a value threshold, so no global-mass reduction; adaptive nucleus by construction |
-| ✅ | sample_topp/minp/topk_batched | batched sampling (v1.4): one call, `[rows, vocab]` logits in, one seeded token per row out - every row runs the single-row pipeline verbatim; 4-6x faster in wall time than looping per row on submission-bound hosts, at native batched-multinomial level on peaked decode logits |
+| ✅ | sample_eta / sample_eta_batched | fused eta-cutoff sampling (v1.6, Hewitt 2022): keep every token with p >= eta * min(1, exp(-H)) - the threshold derives from the distribution's own entropy; adaptive by construction |
+| ✅ | sample_typical / sample_typical_batched | fused locally typical sampling (v1.6, Meister 2022): keep the smallest set whose mass reaches `typical`, ordered by surprise-vs-entropy closeness - a contiguous band of the value-sorted window |
+| ✅ | sample_topp/minp/topk_batched | batched sampling (v1.4): one call, `[rows, vocab]` logits in, one seeded token per row out - every row runs the single-row pipeline verbatim; the batched call is 4-6x faster in wall time than looping per row on submission-bound hosts, and sits at native batched-multinomial level on peaked decode logits |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
+| ✅ | logit_penalties | the HF penalty trio in one call (v1.6.1): CTRL repetition scale, then presence, then count-weighted frequency shifts - once per distinct id, duplicates never stack; bit-exact across CPU and GPU |
 | ✅ | decode_step | the whole decode step fused: penalty -> temperature -> nucleus sample, one call, one readback |
 | ✅ | decode_step_batched | the fused decode step for a whole batch (v1.5): per-row ragged histories through per-row penalty bitmaps, one seeded token per row - every row runs the single-row `decode_step` pipeline up to the documented ulp boundary |
 | ✅ | quantize_int8 / dequantize_int8 / qadd_int8 | symmetric per-tensor INT8, fused dequant-add-requant |
@@ -48,7 +51,7 @@ the v0.x skeleton - functional, but not a performance feature.
 | ✅ | qgemm_perchannel | the W8A8 layout real INT8 inference uses: per-output-channel weight scales fused into the same kernel's epilogue at zero cost |
 | ✅ | attention_decode | single-token causal attention with GQA over a contiguous kv-cache: online softmax, flash-decoding split over long caches, per-sequence lengths; **float32 / bfloat16 / float16 storage** (half-precision cache = half the decode bytes, softmax stays float32) |
 | ✅ | kv_append | the cache-write side of the contiguous decode loop (v1.3): one fresh token's k/v rows per sequence scattered in place into the cache at row `lens[b]` (one tiny kernel, f32/bf16/fp16) |
-| ✅ | attention_decode_paged | the v1.2 headline: the same decode attention over a **vLLM-style block-pool kv-cache** `[Nb, Hkv, P, D]` walked through a per-sequence block table - fragmentation-free cache memory; any valid table honored, f32/bf16/fp16 storage, ~1.09-1.11x the contiguous op (7.89x / 4.28x vs SDPA on the pre-expanded-heads reference) |
+| ✅ | attention_decode_paged | the v1.2 headline: the same decode attention over a **vLLM-style block-pool kv-cache** `[Nb, Hkv, P, D]` walked through a per-sequence block table - fragmentation-free cache memory; any valid table honored, f32/bf16/fp16 storage, ~1.09-1.14x the contiguous op (7.89x / 4.28x vs SDPA on the pre-expanded-heads reference) |
 | ✅ | kv_append_paged | the cache-write side of the paged loop: one fresh token's k/v rows per sequence scattered in place into the pool at position `lens[b]` (one tiny kernel, f32/bf16/fp16) |
 | ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional), float32 / bf16 / fp16 storage; convenience path - heavyweight prefill stays SDPA/flash territory (honest ~0.45x f32) |
 | ✅ | axpy | `a*x + b` - the v0.x hello-world demo op, kept for API compatibility |
@@ -71,14 +74,14 @@ pip install .
 
 **Requirements:**
 
-- an NVIDIA GPU of the **RTX 30 series (Ampere) or newer** — e.g. RTX 3060/3090, RTX 4080, RTX 5090, A100, H100
+- an NVIDIA GPU of the **RTX 30 series (Ampere) or newer** - e.g. RTX 3060/3090, RTX 4080, RTX 5090, A100, H100
 - CUDA Toolkit >= 12.0
 - A C++17 compiler (MSVC on Windows, GCC/Clang on Linux); Python 3.10+
 
 <details>
 <summary>What is "compute capability"? (click to expand)</summary>
 
-Compute capability is NVIDIA's version number for a GPU architecture generation — not a
+Compute capability is NVIDIA's version number for a GPU architecture generation - not a
 performance score. CUDA code must be compiled for a specific architecture to run on it.
 The wheel builds native cubins for compute capability 8.0 (A100) and 8.6 (RTX 30) plus a
 compute_86 PTX fallback, so Ampere runs natively and newer architectures (RTX 40/50, ...)
@@ -99,7 +102,7 @@ https://developer.nvidia.com/cuda-gpus
 
 ## Usage
 
-numpy in / numpy out, or torch in / torch out — including **zero-copy CUDA**:
+numpy in / numpy out, or torch in / torch out - including **zero-copy CUDA**:
 kernels read and write torch device buffers directly via `data_ptr()`, with
 no staging copies and no host synchronization.
 
@@ -183,7 +186,7 @@ Every function accepts float32 numpy arrays or torch tensors (other dtypes
 are converted with a copy) and returns float32 outputs of the same family.
 CUDA torch tensors may be **bfloat16** on every operator that moves tensor
 data (elementwise / norms / RoPE / attention), and the attention operators
-additionally take **float16** — kernels compute in float32 and convert at
+additionally take **float16** - kernels compute in float32 and convert at
 the load/store boundary (norm weights are upcast to float32 automatically;
 sampling/selection ops stay float32).
 CUDA torch tensors select the zero-copy path automatically.
@@ -203,7 +206,7 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 ## API stability
 
 1.0 froze the public surface at 34 names; new operators arrive in
-minor releases (38 as of v1.5), and every name in `fusedtok.__all__`
+minor releases (43 as of v1.6.1), and every name in `fusedtok.__all__`
 keeps its signature across the 1.x series.
 Type stubs (`__init__.pyi`, PEP 561 `py.typed`) ship with the package.
 Breaking changes require a new major version and a deprecation window.
@@ -221,27 +224,27 @@ timed region). Largest shape per op; full data:
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| attention_decode (GQA) | T=16384, D=128 | 874 µs | 7698 µs (SDPA) | **8.81x** |
-| attention_decode_paged (GQA) | T=16384, D=128, P=16 | 972 µs | 7667 µs (SDPA) | **7.89x** |
-| RoPE NeoX (q+k) | [8192×4096] | 1636 µs | 10013 µs | **6.12x** |
-| kv_append (contiguous cache write) | B=8, T=4096 | 14 µs | 46 µs (advanced indexing) | **3.31x** |
-| RMSNorm (+residual) | [4096×4096] | 610 µs | 2052 µs | **3.36x** |
-| sample_topp p=0.9 (peaked) | [131072] | 148 µs | 382 µs (sort+mask+multinomial) | **2.59x** |
-| attention_decode bf16 | T=16384, D=128 | 856 µs | 1813 µs (SDPA bf16) | **2.12x** |
-| sample_minp p=0.05 (peaked) | [131072] | 144 µs | 209 µs (mask+multinomial) | **1.45x** |
-| SwiGLU | [4096×4096] | 609 µs | 1026 µs | **1.68x** |
-| sample_topk k=50 | [131072] | 160 µs | 294 µs (topk+multinomial) | **1.84x** |
-| top-k (k=50) | [131072] | 83 µs | 127 µs (CUB) | **1.54x** |
-| LayerNorm | [4096×4096] | 449 µs | 612 µs | **1.36x** |
-| top-k (k=4096, mid-k) | [131072] | 109 µs | 129 µs | **1.18x** |
-| Softmax | [4096×4096] | 410 µs | 431 µs | **1.05x** |
-| SiLU / GeLU / add | [4096×4096] | ~412-614 µs | ~408-607 µs | ~1.0x |
-| argmax | [131072] | 56 µs | 46 µs | 0.81x (event-timed, noisy on WDDM; wall probe 1.12x - see below) |
-| int8 qgemm pc (W8A8) | [4096×4096×4096] | 3573 µs (38.5 TOPS) | 2061 µs (cuBLASLt + broadcast) | 0.58x (honest) |
-| int8 qgemm (IMMA) | [4096×11008×4096] | 9582 µs (38.5 TOPS) | 4510 µs (cuBLASLt) | 0.47x (honest) |
-| attention_prefill (causal) | S=1024, D=128 | 5802 µs | 2612 µs (SDPA flash) | 0.45x (honest) |
-| sample_minp p=0.05 (wide nucleus) | [131072] | 484 µs | 216 µs | 0.45x (honest: one widening retry plus a 32-64k sort; the torch boolean-mask composite never sorts - see the peaked min-p row for min-p's win scenario) |
-| sample_topp p=0.9 (flat worst case) | [131072] | 1357 µs | 496 µs | 0.37x (honest, see below) |
+| attention_decode (GQA) | T=16384, D=128 | 873 µs | 7845 µs (SDPA) | **8.99x** |
+| attention_decode_paged (GQA) | T=16384, D=128, P=16 | 991 µs | 7819 µs (SDPA) | **7.89x** |
+| RoPE NeoX (q+k) | [8192×4096] | 1674 µs | 10278 µs | **6.14x** |
+| kv_append (contiguous cache write) | B=8, T=4096 | 16 µs | 50 µs (advanced indexing) | **3.18x** |
+| RMSNorm (+residual) | [4096×4096] | 637 µs | 2105 µs | **3.31x** |
+| sample_topp p=0.9 (peaked) | [131072] | 164 µs | 402 µs (sort+mask+multinomial) | **2.45x** |
+| attention_decode bf16 | T=16384, D=128 | 869 µs | 1834 µs (SDPA bf16) | **2.11x** |
+| sample_minp p=0.05 (peaked) | [131072] | 159 µs | 208 µs (mask+multinomial) | **1.31x** |
+| SwiGLU | [4096×4096] | 622 µs | 1043 µs | **1.68x** |
+| sample_topk k=50 | [131072] | 156 µs | 308 µs (topk+multinomial) | **1.98x** |
+| top-k (k=50) | [131072] | 78 µs | 135 µs (CUB) | **1.73x** |
+| LayerNorm | [4096×4096] | 458 µs | 629 µs | **1.37x** |
+| top-k (k=4096, mid-k) | [131072] | 119 µs | 114 µs | 0.96x (honest) |
+| Softmax | [4096×4096] | 422 µs | 441 µs | **1.05x** |
+| SiLU / GeLU / add | [4096×4096] | ~419-637 µs | ~418-624 µs | ~1.0x |
+| argmax | [131072] | 52 µs | 56 µs | 1.09x (event-timed, noisy on WDDM; across-run spread 0.76-1.09x - see below) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 3632 µs (37.8 TOPS) | 2121 µs (cuBLASLt + broadcast) | 0.58x (honest) |
+| int8 qgemm (IMMA) | [4096×11008×4096] | 9735 µs (37.9 TOPS) | 4644 µs (cuBLASLt) | 0.48x (honest) |
+| attention_prefill (causal) | S=1024, D=128 | 5950 µs | 2621 µs (SDPA flash) | 0.44x (honest) |
+| sample_minp p=0.05 (wide nucleus) | [131072] | 629 µs | 284 µs | 0.45x (honest: one widening retry plus a 32-64k sort; the torch boolean-mask composite never sorts - see the peaked min-p row for min-p's win scenario) |
+| sample_topp p=0.9 (flat worst case) | [131072] | 1487 µs | 407 µs | 0.27x (honest, see below) |
 
 Batched samplers (v1.4) and batched decode steps (v1.5) - one call for
 the whole `[8, 131072]` batch, referenced against torch's native
@@ -250,18 +253,18 @@ row adds the gather-penalty; per-round values in the JSON):
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| sample_topk_batched k=50 | [8×131072] | 199 µs | 307 µs (topk+multinomial) | **1.54x** |
-| sample_minp_batched p=0.05 | [8×131072] | 224 µs | 300 µs (mask+multinomial) | **1.34x** |
-| sample_topp_batched p=0.9 | [8×131072] | 268 µs | 219 µs (multinomial) | 0.82x (reference-side WDDM swing; see below) |
-| decode_step_batched (penalty 1.3, ~64-token histories) | [8×131072] | 315 µs | 269 µs (penalize+softmax+multinomial) | 0.86x (but **5.2x** vs looping the single row, wall time - see below) |
-| sample_topp_batched (flat worst case) | [8×131072] | 3608 µs | 215 µs | 0.06x (honest, same caveat as the single row) |
+| sample_topk_batched k=50 | [8×131072] | 209 µs | 315 µs (topk+multinomial) | **1.51x** |
+| sample_minp_batched p=0.05 | [8×131072] | 236 µs | 304 µs (mask+multinomial) | **1.29x** |
+| sample_topp_batched p=0.9 | [8×131072] | 288 µs | 223 µs (multinomial) | 0.77x (reference-side WDDM swing; see below) |
+| decode_step_batched (penalty 1.3, ~64-token histories) | [8×131072] | 316 µs | 289 µs (penalize+softmax+multinomial) | 0.92x (but **5.2x** vs looping the single row, wall time - see below) |
+| sample_topp_batched (flat worst case) | [8×131072] | 3749 µs | 217 µs | 0.06x (honest, same caveat as the single row) |
 
 Row-wise kernels (norms, softmax) autotune their thread-block size per
 shape at first call (v0.4.1); the table reflects the tuned choices.
 
 ![fusedtok vs PyTorch reference](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx3060.png)
 
-**RTX 5060 Ti (Blackwell, sm_120)** — same suite, largest shape per op
+**RTX 5060 Ti (Blackwell, sm_120)** - same suite, largest shape per op
 (full data: `docs/benchmarks/benchmark_rtx5060ti.json`):
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
@@ -269,32 +272,32 @@ shape at first call (v0.4.1); the table reflects the tuned choices.
 | RoPE NeoX (q+k) | [8192×4096] | 1385 µs | 8371 µs | **6.05x** |
 | attention_decode (GQA) | T=16384, D=128 | 574 µs | 2682 µs (SDPA) | **4.67x** |
 | attention_decode_paged (GQA) | T=16384, D=128, P=16 | 627 µs | 2681 µs (SDPA) | **4.28x** |
-| RMSNorm (+residual) | [4096×4096] | 505 µs | 1657 µs | **3.28x** |
+| RMSNorm (+residual) | [4096×4096] | 504 µs | 1658 µs | **3.29x** |
 | sample_topp p=0.9 (peaked) | [131072] | 62 µs | 155 µs (sort+mask+multinomial) | **2.48x** |
-| kv_append (contiguous cache write) | B=8, T=4096 | 9 µs | 21 µs (advanced indexing) | **2.20x** |
-| sample_topk k=50 | [131072] | 45 µs | 93 µs (topk+multinomial) | **2.06x** |
+| kv_append (contiguous cache write) | B=8, T=4096 | 9 µs | 21 µs (advanced indexing) | **2.22x** |
+| sample_topk k=50 | [131072] | 45 µs | 91 µs (topk+multinomial) | **2.01x** |
 | SwiGLU | [4096×4096] | 504 µs | 858 µs | **1.70x** |
 | top-k (k=50) | [131072] | 27 µs | 41 µs (CUB) | **1.51x** |
-| attention_decode bf16 | T=16384, D=128 | 546 µs | 641 µs (SDPA bf16) | **1.17x** |
-| sample_minp p=0.05 (peaked) | [131072] | 62 µs | 73 µs (mask+multinomial) | **1.19x** |
+| attention_decode bf16 | T=16384, D=128 | 544 µs | 641 µs (SDPA bf16) | **1.18x** |
+| sample_minp p=0.05 (peaked) | [131072] | 62 µs | 72 µs (mask+multinomial) | **1.17x** |
 | top-k (k=4096, mid-k) | [131072] | 50 µs | 54 µs (CUB) | 1.09x |
 | LayerNorm / Softmax | [4096×4096] | ~346 µs | ~344-350 µs | ~1.0x |
 | argmax | [131072] | 17 µs | 14 µs | 0.81x (event-timed, noisy; wall probe 0.96x) |
-| int8 qgemm pc (W8A8) | [4096×4096×4096] | 2071 µs (66.4 TOPS) | 1139 µs (cuBLASLt + broadcast) | 0.55x (honest) |
-| attention_prefill (causal) | S=1024, D=128 | 3301 µs | 1421 µs (SDPA flash) | 0.43x (honest) |
-| int8 qgemm (IMMA) | [4096×11008×4096] | 5465 µs (67.6 TOPS) | 2178 µs (cuBLASLt) | 0.40x (honest) |
-| sample_minp p=0.05 (wide nucleus) | [131072] | 262 µs | 74 µs | 0.28x (honest: same wide-nucleus caveat as the 3060 row) |
-| sample_topp p=0.9 (flat worst case) | [131072] | 1053 µs | 165 µs | 0.16x (honest, see below) |
+| int8 qgemm pc (W8A8) | [4096×4096×4096] | 2078 µs (66.1 TOPS) | 1146 µs (cuBLASLt + broadcast) | 0.55x (honest) |
+| attention_prefill (causal) | S=1024, D=128 | 3301 µs | 1425 µs (SDPA flash) | 0.43x (honest) |
+| int8 qgemm (IMMA) | [4096×11008×4096] | 5484 µs (67.4 TOPS) | 2198 µs (cuBLASLt) | 0.40x (honest) |
+| sample_minp p=0.05 (wide nucleus) | [131072] | 263 µs | 72 µs | 0.27x (honest: same wide-nucleus caveat as the 3060 row) |
+| sample_topp p=0.9 (flat worst case) | [131072] | 1079 µs | 164 µs | 0.15x (honest, see below) |
 
 Batched samplers (v1.4) and batched decode steps (v1.5) on the same
 `[8, 131072]` shapes:
 
 | Op | Shape | fusedtok | PyTorch reference | Speedup |
 |---|---|---:|---:|---:|
-| sample_topk_batched k=50 | [8×131072] | 95 µs | 115 µs (topk+multinomial) | **1.21x** |
-| sample_minp_batched p=0.05 | [8×131072] | 118 µs | 112 µs (mask+multinomial) | 0.95x (parity) |
-| sample_topp_batched p=0.9 | [8×131072] | 131 µs | 83 µs (multinomial) | 0.63x |
-| decode_step_batched (penalty 1.3, ~64-token histories) | [8×131072] | 142 µs | 99 µs (penalize+softmax+multinomial) | 0.70x (but **4.5x** vs looping the single row, wall time - see below) |
+| sample_topk_batched k=50 | [8×131072] | 97 µs | 113 µs (topk+multinomial) | **1.17x** |
+| sample_minp_batched p=0.05 | [8×131072] | 120 µs | 113 µs (mask+multinomial) | 0.94x (parity) |
+| sample_topp_batched p=0.9 | [8×131072] | 132 µs | 83 µs (multinomial) | 0.63x |
+| decode_step_batched (penalty 1.3, ~64-token histories) | [8×131072] | 147 µs | 100 µs (penalize+softmax+multinomial) | 0.68x (but **4.5x** vs looping the single row, wall time - see below) |
 | sample_topp_batched (flat worst case) | [8×131072] | 1755 µs | 83 µs | 0.05x (honest) |
 
 On smaller shapes the Blackwell card shows bigger wins (softmax 1.7x,
@@ -304,7 +307,7 @@ sweep in the JSON.
 
 ![fusedtok vs PyTorch reference (RTX 5060 Ti)](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx5060ti.png)
 
-The PyPI wheel ships sm_80/sm_86 cubins plus a compute_86 PTX fallback —
+The PyPI wheel ships sm_80/sm_86 cubins plus a compute_86 PTX fallback -
 verified to JIT and run correctly on Blackwell (sm_120) drivers.
 
 Fusions win big (RoPE / RMSNorm / SwiGLU) because eager mode round-trips
@@ -316,11 +319,11 @@ dropped 2048 -> 1024 - a single block bitonic-sorting 2048 keys was the
 whole mid-k regression) brings the mid-k window to parity-or-winning
 as well. The fused samplers win against the
 eager composites when the logits look like real decode output
-(sample_topp peaked: 2.59x / 2.48x; sample_topk: 1.84x / 2.06x; the
+(sample_topp peaked: 2.45x / 2.48x; sample_topk: 1.98x / 2.01x; the
 composites themselves swing run-to-run on WDDM - per-round values in
 the JSON). On a flat distribution sample_topp is honestly 0.16x on a
 5060 Ti and 0.37x on a 3060 (the fusedtok side is stable; the
-reference's rounds carry WDDM noise) — the nucleus then
+reference's rounds carry WDDM noise) - the nucleus then
 spans ~90% of the vocabulary and the pipeline must effectively order
 the whole thing. v1.2 cut that worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three token-preserving changes - an adaptive
@@ -332,11 +335,11 @@ contract; only the loads got pipelined); v1.3 cut it another ~1.6x
 first walk record prefix-sum checkpoints that the inverse-CDF walk
 binary-searches - still bit-identical tokens - but torch's fully parallel
 sort still owns that regime. sample_minp (v1.3) wins on peaked logits
-and honestly loses the wide-nucleus row (0.28-0.45x: one widening
+and honestly loses the wide-nucleus row (0.27-0.45x: one widening
 retry plus a 32-64k sort; the torch boolean-mask composite never
 sorts) - v1.4 gave min-p the same adaptive jump top-p has had since
 v1.2 (a sufficient bound from the one-time global total:
-wide-nucleus rows skip the ladder's intermediate stops, -28-30% on
+wide-nucleus rows skip the ladder's intermediate stops, 28-30% faster on
 that row, tokens bit-identical).
 
 The v1.4 batched samplers put the whole `[rows, vocab]` batch through
@@ -347,7 +350,7 @@ time at B=8 on submission-bound hosts (3060: topp 1340 -> 274 µs,
 minp 1399 -> 237 µs; 5060 Ti: 3.9x / 4.3x). On peaked logits the
 batched calls sit at torch's native batched-multinomial level
 (the batched min-p and top-k calls win on this benchmark:
-1.34x/1.54x and 0.95x/1.21x on the two GPUs), and the flat worst case
+1.29x/1.51x and 0.94x/1.17x on the two GPUs), and the flat worst case
 keeps the singles' honest caveat one tier lower (0.05-0.06x). v1.5
 extends batching to the whole decode step: `decode_step_batched` runs
 per-row repetition penalties through per-row vocab bitmaps inside the
@@ -358,11 +361,11 @@ native penalize+softmax+multinomial composite: 266 µs) and 4.5x on a
 
 attention_decode wins big at decode (one launch streams the GQA cache
 once, while SDPA pays head expansion or small-query inefficiency);
-attention_decode_paged (v1.2) pays only ~1.09-1.11x for the
+attention_decode_paged (v1.2) pays only ~1.09-1.14x for the
 block-table indirection of the fragmentation-free vLLM-style cache
 layout, with bit-identical output on matching slice schedules;
 attention_prefill is the honest convenience path at ~0.45x of SDPA's
-flash backend — no tensor cores by design, so heavyweight prefill stays
+flash backend - no tensor cores by design, so heavyweight prefill stays
 with SDPA/FlashAttention. kv_append (v1.3) writes one token's k/v rows
 into the contiguous cache in a single launch (a multi-x win over the
 advanced-indexing scatter whose exact factor tracks that reference's
@@ -371,25 +374,25 @@ step). The INT8 decode GEMV moves half the bytes of
 an fp16 projection and runs at full memory bandwidth (2x); the pipelined
 IMMA GEMM (v1.0 rework: cp.async double-buffered slabs, runtime-tuned
 64x64 / 128x128 tiles) reaches ~38 TOPS on a 3060 and ~67 TOPS on a
-5060 Ti — 2x-4x the v0.4 kernel — but cuBLASLt (`torch._int_mm`) still
-holds a ~2.1-2.5x lead on the per-tensor rows (its tiles pipeline
+5060 Ti - 2x-4x the v0.4 kernel - but cuBLASLt (`torch._int_mm`) still
+holds a ~2.1-2.6x lead on the per-tensor rows (its tiles pipeline
 deeper and its epilogue is tuned per-arch); the W8A8 rows' gap is only
 ~1.7-1.8x. For now qgemm is the exact / graph-capturable /
 zero-copy INT8 path, not the fastest one; honest numbers, a
 CUTLASS-class schedule stays future work. The per-channel variant
 (`qgemm_perchannel`, the W8A8 layout INT8 inference actually uses)
 fuses the per-output-channel scale multiply into the same epilogue at
-zero kernel cost — the composite torch reference pays for that
+zero kernel cost - the composite torch reference pays for that
 broadcast separately, which is where its 0.55-0.58x comes from.
 
 All sampling rows above have measured fixed logits since 1.1.1 (the bench
 seeds torch's RNG); since v1.2 the peaked row spikes +20 and the flat
-row uses near-uniform logits — both regimes are now deterministically
+row uses near-uniform logits - both regimes are now deterministically
 what their labels say (the v1.1 peaked row sat on the coverage boundary
 at n=131072 and flipped regimes per seed). The argmax rows are
 event-timed over a host-synchronized call and swing on WDDM
 (0.73-1.24x across runs); wall-clock probes with the sync excluded
-from the timed loop measure 1.12x (3060) / 0.96x (5060 Ti) — v1.2
+from the timed loop measure 1.12x (3060) / 0.96x (5060 Ti) - v1.2
 removed one CUDA submission and one allocation per call.
 
 ## Development
@@ -434,13 +437,13 @@ nvcc, and CI builds and runs the CPU test suite on every push.
   topk+multinomial composite), top-k mid-range-k parity, text hygiene
   gate, wheel matrix expansion (Linux cp310-313, Windows cp311-313),
   API freeze
-- 1.1 (released): half-precision attention — `attention_decode` /
+- 1.1 (released): half-precision attention - `attention_decode` /
   `attention_prefill` accept bfloat16 and float16 caches (float32
   compute, half the decode bytes); parallel exp precompute halves the
   flat-distribution sampling worst case with bit-identical tokens
-- 1.2 (released): paged kv-cache attention — `attention_decode_paged`
+- 1.2 (released): paged kv-cache attention - `attention_decode_paged`
   over a vLLM-style block pool `[Nb, Hkv, P, D]` + per-sequence block
-  tables (1.09-1.11x the contiguous op, any valid table honored) and
+  tables (~1.09-1.14x the contiguous op, any valid table honored) and
   `kv_append_paged` (the in-place cache-write side); flat-distribution
   sampling worst case cut ~8.5x (adaptive widening jump + full-vocab
   fast path + batched-load serial walk, tokens bit-identical); argmax
@@ -504,6 +507,21 @@ nvcc, and CI builds and runs the CPU test suite on every push.
   in 64-bit; duplicate penalty ids can no longer diverge between
   the CPU and GPU paths; rope grids, launcher guards and the batched
   CPU references got the same checks their siblings have
+- 1.6.1 (released): `logit_penalties` - the HF penalty trio (CTRL
+  repetition scale, presence shift, count-weighted frequency shift)
+  in one call, once per distinct id, duplicates never stack,
+  bit-exact across CPU and GPU - plus audit-driven hardening: the
+  spurious "typical nucleus not covered" throw at `typical = 1.0`,
+  the batched typical trust-boundary gap, and the eta widening
+  bound's unit mismatch (42 -> 43 public names)
+- 1.6 (released): entropy-adaptive sampling - `sample_eta` (eta
+  cutoff, Hewitt 2022: keep every token with
+  `p_i >= eta * min(1, exp(-H))`, a value-threshold prefix like min-p,
+  reusing min-p's adaptive widening bound) and `sample_typical`
+  (locally typical, Meister 2022: the smallest set whose mass reaches
+  `typical`, ordered by `|surprise - H|` - a contiguous band of the
+  value-sorted window, no analytic widening bound so the honest x8
+  ladder), each single-row and batched (38 -> 42 public names)
 - future candidates (unscheduled): bf16/fp16 tensor-core prefill
   (rewrite-level), a CUTLASS-class INT8 GEMM schedule (the current
   qgemm is the exact/graph-capturable/zero-copy path, not the fastest
@@ -511,11 +529,11 @@ nvcc, and CI builds and runs the CPU test suite on every push.
 
 ## Community
 
-- [Contributing guide](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CONTRIBUTING.md) — setup, rules of the road, PR process
+- [Contributing guide](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CONTRIBUTING.md) - setup, rules of the road, PR process
 - [Code of conduct](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CODE_OF_CONDUCT.md)
 - [Security policy](https://github.com/Hai-Wenxiang/fusedtok/blob/main/SECURITY.md)
 - [Changelog](https://github.com/Hai-Wenxiang/fusedtok/blob/main/CHANGELOG.md)
 
 ## License
 
-MIT — see [LICENSE](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE). Third-party notices: [NOTICES.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/NOTICES.md).
+MIT - see [LICENSE](https://github.com/Hai-Wenxiang/fusedtok/blob/main/LICENSE). Third-party notices: [NOTICES.md](https://github.com/Hai-Wenxiang/fusedtok/blob/main/NOTICES.md).

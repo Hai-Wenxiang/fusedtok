@@ -23,7 +23,7 @@ https://developer.nvidia.com/cuda-gpus 查计算能力。
 ## 明明有 GPU 却提示 "no CUDA device"？
 
 - `fusedtok.cuda_available()` 返回 False 说明 CUDA 上下文建不起
-  来：确认 `nvidia-smi` 能跑、驱动版本配得上你的 CUDA 运行时
+  来：确认 `nvidia-smi` 能跑、驱动版本要满足 CUDA 运行时的要求
   （12.0 级以上）、机器上确实看得到设备。
 - 没有 GPU 时 CPU 参考功能全部可用——只有 CUDA 路径需要卡。
 
@@ -61,10 +61,11 @@ GPU 用约 2 ulp 的 `__expf`），两边各抽到相邻的一个元素，两个
 
 ## 为什么批量采样在平坦分布上比 torch 慢？
 
-`torch.multinomial` 从不排序——它对整个分布做一次布尔掩码就直接
-抽签。fusedtok 的采样器必须给核**排序**（选择管线的职责），而接近
+torch 的组合参考（softmax、必要时布尔掩码，再加 multinomial）从不
+排序——multinomial 直接对整个分布做前缀和抽签。fusedtok 的采样器
+必须给核**排序**（选择管线的职责），而接近
 均匀的 logits 下核约占九成词表，所以这个场景下如实落后（批量
-0.05-0.06x、单行 0.16-0.37x）。真实解码的 logits 是尖峰状的，那
+0.05-0.06x、单行 0.15-0.27x）。真实解码的 logits 是尖峰状的，那
 才是采样器与原生 multinomial 同档甚至更快的场景。细节见
 [采样——平坦分布](sampling.md#平坦分布如实的最坏情况)。
 
@@ -77,7 +78,7 @@ GPU 用约 2 ulp 的 `__expf`），两边各抽到相邻的一个元素，两个
 
 能，全库都行，先热身。例外：融合采样器返回主机 int（每次调用
 以一次回读收尾）；批量采样器（`_batched` 系列）的扩窗循环还要
-根据回读结果重新发射 kernel，返回 int64 张量也一样进不了图；
+根据回读结果重新启动 kernel，返回 int64 张量也一样进不了图；
 `quantize_int8` / `qadd_int8` 中途同步一次以合成 scale。选择管线
 自己维护内部 CUDA graph——不需要你管。
 
@@ -104,10 +105,11 @@ event 而不是墙上时钟，并预期 argmax 这类微小算子的数字会摆
   达到 p"的前缀，min-p 取"概率不低于 min_p × 最大概率"的前缀。
 - **eta 截断（eta-cutoff）**——阈值由分布自身熵决定的采样截断：
   保留所有 `p_i >= eta × min(1, exp(-H))` 的 token（H 为分布熵，
-  单位 nat）——平坦分布重截断，自信分布几乎不截。
-- **局部典型采样（locally typical sampling）**——按"意外度
-  （`-log p_i`）与分布熵的接近程度"保留质量达到 `typical` 的最小
-  集合：过自信与过意外的 token 被对称剪掉。
+  单位 nat）——自信分布重截断（门槛抬向 `eta`），平坦分布几乎不截
+  （门槛沉向零）。
+- **局部典型采样（locally typical sampling）**——保留质量达到
+  `typical` 的最小集合，按"意外度（`-log p_i`）与分布熵的接近
+  程度"排序：过自信与过意外的 token 被对称剪掉。
 - **批量采样（batched sampling）**——一次调用采样整个
   `[行数, 词表]` 批（`_batched` 系列采样器与
   `decode_step_batched`）：每行都用自己的种子原样跑一遍单行

@@ -199,3 +199,64 @@ class TestCuda:
         assert t1 == int(fusedtok.sample_typical(x, 0.5, seed=1))
         assert 0 <= int(kk) < 65536
         assert 0 <= int(e) < 65536
+
+
+def test_typical_one_full_vocabulary_no_spurious_throw():
+    # typical = 1.0 makes need equal the parallel-reduction total
+    # exactly; a summation-order ulp shortfall in the serially walked
+    # band mass used to surface as a spurious "typical nucleus not
+    # covered" at the full window - the k == n draw must proceed
+    # instead (v1.6.1 fix). Several shapes/seeds/temperatures to shake
+    # the rounding: flat-ish rows park the band edges in dense rank
+    # territory where the ulp wobble is largest.
+    rng = np.random.default_rng(97)
+    for i in range(8):
+        n = 4096 * (1 + (i % 3))
+        x = rng.standard_normal(n).astype(np.float32)
+        if i % 2:
+            x[: n // 2] *= 1e-3
+        for t in (0.05, 1.0, 20.0):
+            want = int(fusedtok.sample_typical(x, 1.0, temperature=t,
+                                               seed=i))
+            assert 0 <= want < n
+            # cross-path equality is NOT asserted: with typical = 1 the
+            # draw target can sit within an ulp of the top mass atom on
+            # peaked rows (t = 0.05), where a rounding wobble legally
+            # moves the token across thousands of zero-mass ranks - the
+            # documented boundary class in probability space. The point
+            # here is that the host path never throws.
+
+
+def test_single_token_vocabulary():
+    # n = 1: H = 0, the band is the whole (one-element) window, no
+    # widening anywhere (host path; CUDA covered by the gated test)
+    x = np.zeros(1, dtype=np.float32)
+    for t in (0.05, 1.0, 20.0):
+        assert int(fusedtok.sample_typical(x, 0.5, temperature=t)) == 0
+
+
+@needs_gpu
+def test_typical_one_full_vocabulary_gpu():
+    # the CUDA side of the no-spurious-throw fix: same sweep, same
+    # no-throw + stability contract, cross-path equality deliberately
+    # not asserted (see the host test above)
+    rng = np.random.default_rng(97)
+    for i in range(8):
+        n = 4096 * (1 + (i % 3))
+        x = rng.standard_normal(n).astype(np.float32)
+        if i % 2:
+            x[: n // 2] *= 1e-3
+        for t in (0.05, 1.0, 20.0):
+            got = int(fusedtok.sample_typical(x, 1.0, temperature=t,
+                                              seed=i, cuda=True))
+            assert 0 <= got < n
+            assert got == int(fusedtok.sample_typical(
+                x, 1.0, temperature=t, seed=i, cuda=True))
+
+
+@needs_gpu
+def test_single_token_vocabulary_gpu():
+    x = np.zeros(1, dtype=np.float32)
+    for t in (0.05, 1.0, 20.0):
+        assert int(fusedtok.sample_typical(x, 1.0, temperature=t,
+                                           cuda=True)) == 0

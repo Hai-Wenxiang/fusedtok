@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 __all__ = [
     "cuda_available",
@@ -52,6 +52,7 @@ __all__ = [
     "mul",
     "temperature",
     "repetition_penalty",
+    "logit_penalties",
     "argmax",
     "topk",
     "topp",
@@ -61,8 +62,6 @@ __all__ = [
     "sample_eta",
     "sample_eta_batched",
     "sample_typical",
-    "sample_typical_batched",
-    "sample_eta_batched",
     "sample_typical_batched",
     "sample_topp_batched",
     "sample_topk_batched",
@@ -1230,6 +1229,59 @@ def repetition_penalty(logits, token_ids, penalty, *, cuda=False):
     return _numpy_to_torch_like(res) if _is_torch(logits) else res
 
 
+def logit_penalties(logits, token_ids, *, repetition=1.0, presence=0.0,
+                    frequency=0.0, cuda=False):
+    """HF-style combined logit penalties before sampling, one call.
+
+    For every distinct id in ``token_ids`` (previously generated tokens),
+    with ``c`` = how often that id occurs in ``token_ids``:
+
+    ``logit = logit / repetition`` if positive, ``logit * repetition``
+    otherwise (CTRL rule, ``repetition`` > 0, 1.0 = disabled); then
+    ``logit -= presence`` (0.0 = disabled); then
+    ``logit -= c * frequency`` (0.0 = disabled).
+
+    The composition order matches the HF processors; each distinct id is
+    penalized exactly once no matter how often it appears, so duplicates
+    never stack (the count only enters the frequency term). Unlisted
+    logits pass through unchanged.
+
+    logits: 1-D [vocab]; token_ids: 1-D ints (host values are validated
+    against the vocab; a CUDA ids tensor is trusted - no stream sync, see
+    the lens note in :func:`attention_decode`). CPU and GPU paths agree
+    bit-exactly (integer counts, no atomics on the output).
+    """
+    if not repetition > 0.0:
+        raise ValueError("repetition must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        n = logits.numel()
+        ids = _ids_arg(token_ids, n, logits.device, "token_ids")
+        out = torch.empty_like(logits)
+        _fusedtok.logit_penalties_launch(
+            logits.data_ptr(), ids.data_ptr(), out.data_ptr(),
+            n, ids.numel(), repetition, presence, frequency, _cuda_stream())
+        return out
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    # host ids: integral dtype + 1-D (no silent ravel); value range is
+    # validated by the binding before the upload
+    ids_host = _host_int_array(token_ids, "token_ids")
+    if ids_host is None:
+        raise TypeError("token_ids must be a host array on this path")
+    ids = np.ascontiguousarray(ids_host, dtype=np.int64)
+    if ids.ndim != 1:
+        raise ValueError("token_ids must be 1-D")
+    call = (_fusedtok.logit_penalties if path == "staged"
+            else _fusedtok.logit_penalties_cpu)
+    res = call(arr, ids, repetition, presence, frequency)
+    return _numpy_to_torch_like(res) if _is_torch(logits) else res
+
+
 def quantize_int8(x):
     """Symmetric per-tensor INT8 quantization (storage path).
 
@@ -1540,8 +1592,8 @@ def sample_eta(logits, eta, *, temperature=1.0, seed=0, cuda=False):
     probability is at least ``eta * min(1, exp(-H))`` ->
     renormalize within that nucleus -> inverse-CDF draw using a
     hash-uniform of ``seed`` (Hewitt et al. 2022). The cutoff adapts
-    to the distribution's own shape: flat distributions raise the bar,
-    confident ones lower it toward zero. Deterministic per seed; the
+    to the distribution's own shape: confident distributions raise the
+    bar toward ``eta`` itself, flat ones lower it toward zero. Deterministic per seed; the
     RNG is a splitmix-style hash (reproducible, NOT cryptographically
     secure).
 

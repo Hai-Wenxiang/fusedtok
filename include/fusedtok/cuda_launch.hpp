@@ -194,6 +194,17 @@ void temperature_launch(const float* x, float* y, long long n, float t, std::uin
 // logits/y: [n], ids: [m] unique token ids.
 void repetition_penalty_launch(const float* logits, const long long* ids,
                                int n, int m, float penalty, float* y, std::uintptr_t stream = 0);
+// HF-style combined penalties on every id in ids[0..m), composed in this
+// order: repetition scale (v > 0 -> v/rep, else v*rep; rep > 0), presence
+// shift (v -= pres), count-weighted frequency shift (v -= c * freq, c =
+// the id's occurrence count in ids). Non-listed slots pass through.
+// logits/y: [n], ids: [m] (duplicates allowed, penalized once). y must
+// not alias logits only when the counts workspace cannot be used (first
+// call racing a stream capture or an allocation failure) - the launcher
+// throws a clear error in that case.
+void logit_penalties_launch(const float* logits, const long long* ids,
+                            int n, int m, float repetition, float presence,
+                            float frequency, float* y, std::uintptr_t stream = 0);
 
 
 // --- attention (decode step) -------------------------------------------------

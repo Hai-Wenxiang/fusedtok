@@ -2,7 +2,8 @@
 
 选择类算子（top-k、top-p、argmax）和融合采样器（`sample_topp`、
 `sample_topk`、`sample_minp`、`decode_step`，以及 v1.4 的 `_batched`
-批量变体）共用一条管线和一份确定性契约。这一页把两者讲清，包括
+批量变体）共用一条管线和一份确定性契约，`logit_penalties` 则把 HF
+的三件惩罚合并成一次调用。这一页把两者讲清，包括
 CPU 与 GPU 抽签可能不一致的精确边界。
 
 **其他语言：** [English: sampling and selection](../en/sampling.md)
@@ -12,6 +13,7 @@ CPU 与 GPU 抽签可能不一致的精确边界。
 - [sample_minp——按最大值阈值截断的采样（v1.3）](#sample_minp按最大值阈值截断的采样v13)
 - [sample_eta——熵自适应截断采样（v1.6）](#sample_eta熵自适应截断采样v16)
 - [sample_typical——局部典型采样（v1.6）](#sample_typical局部典型采样v16)
+- [logit_penalties——一次调用套齐 HF 三件惩罚（v1.6.1）](#logit_penalties一次调用套齐-hf-三件惩罚v161)
 - [批量采样——每个解码步一次调用（v1.4）](#批量采样每个解码步一次调用v14)
 - [批量解码步——含重复惩罚（v1.5）](#批量解码步含重复惩罚v15)
 - [同 token 保证](#同-token-保证)
@@ -61,6 +63,9 @@ tok = fusedtok.decode_step(logits, history, penalty=1.1,
 - `repetition_penalty(logits, token_ids, penalty)` 也单独暴露：
   正 logit 除以 `penalty`、负 logit 乘以 `penalty`
   （`penalty=1.0` 即关闭）。
+- `logit_penalties(logits, token_ids, *, repetition, presence,
+  frequency)` 把上面的 CTRL 规则与出现惩罚、频率惩罚合并成一次
+  调用——详见[下面的小节](#logit_penalties一次调用套齐-hf-三件惩罚v161)。
 
 采样**按种子确定**：抽签用的均匀数来自 splitmix 风格的哈希
 （可复现，但不是密码学安全的随机源）。主机侧来源的 token id
@@ -100,22 +105,28 @@ min-p（出自 2024 年的 Min-P Sampling 论文，llama.cpp、vLLM 等推理栈
 tok = fusedtok.sample_eta(logits, eta=0.3, temperature=0.8, seed=step)
 ```
 
-eta 截断（Hewitt 等 2022 年的 Trickle-down 论文，llama.cpp、vLLM
-以 `eta_cutoff` 之名支持）的截断阈值由分布**自身形状**决定：先算
-分布的熵 H（单位 nat），保留所有概率不低于 `eta × min(1, exp(-H))`
-的 token，在核内重新归一化，再用同一个种子哈希抽签。平坦分布会
-抬高门槛（重截断），自信分布把门槛降到接近零（几乎全保留）——
-`min_p` 和 `top_p` 的门槛是固定或相对质量的，eta 的门槛跟着熵走。
+（示例取 `0.3` 是为了演示 API；实际服务端常用 `1e-3` 量级。）
+
+eta 截断（Hewitt 等 2022 年的论文 *Truncation Sampling as Language
+Model Desmoothing*，llama.cpp、vLLM 以 `eta_cutoff` 之名支持）的截断
+阈值由分布**自身形状**决定：先算分布的熵 H（单位 nat），保留所有
+概率不低于 `eta × min(1, exp(-H))` 的 token，在核内重新归一化，再用
+同一个种子哈希抽签。门槛与熵反向移动：自信分布的熵接近零，门槛被
+抬到 `eta` 附近，低概率尾部被重剪；平坦分布把 `exp(-H)` 压向零，
+门槛跟着下沉（几乎全保留）——`min_p` 和 `top_p` 的门槛是固定或相对
+质量的，eta 的门槛跟着熵走。（本库实现的是 llama.cpp 与 HF 常用的
+简化阈值 `eta × min(1, exp(-H))`；论文原式为
+`min(ε, √ε·exp(-H))`，方向一致、数值不同。）
 
 - 取值范围：`eta` 必须在 `(0, 1]` 内（越界抛 `ValueError`），
-  `temperature` 必须大于 0。服务端常用值非常小（`1e-3` 量级）——
-  造型的活主要由熵因子完成。
+  `temperature` 必须大于 0。常用 `eta` 值非常小（`1e-3` 量级）——
+  真正的塑形工作由熵因子完成。
 - 核永远至少保留一个 token：截断阈值以最大概率为上界（概率的
-  加权几何平均不会超过最大值），实现里另有 min-token 守卫把这一
-  点对浮点漂移说死。
+  加权几何平均不会超过最大值），实现里另加 min-token 守卫，即使有
+  浮点误差这条下限也不会破。
 - 按种子确定，与其余采样器共用 RNG 与同 token 保证。截断阈值
-  来自熵累加器（浮点原子加）与全局总量，因此落在文档化的边界
-  类里：CPU 对 GPU、跨运行在同一边界上的抽签可能取相邻排名；
+  来自熵累加器（浮点原子加）与全局总量，因此属于文档记录的边界
+  情形：CPU 对 GPU、跨运行在同一边界上的抽签可能取相邻排名；
   同进程同输入缓冲内结果位稳定。
 - 实现说明：截断和 min-p 一样是值阈值前缀，但阈值需要熵 H——
   每次尝试多跑一遍全词表 pass（熵累加器 `s = Σ e_i × (l_i - max)`，
@@ -138,18 +149,61 @@ token 被对称地剪掉——这正是该设计的本意。
 - 取值范围：`typical` 必须在 `(0, 1]` 内（越界抛 `ValueError`），
   `temperature` 必须大于 0。取值接近 1 时趋近于对全词表的普通
   采样。
-- 带永远至少保留一个 token（由熵最匹配的 token 生根，实现里另有
-  min-token 守卫把这一点对浮点漂移说死）。
+- 保留带至少包含一个 token——以意外度最接近熵的 token 为起点，
+  实现里另加 min-token 守卫，浮点误差也动不了这条下限。
 - 按种子确定，与其余采样器共用 RNG 与同 token 保证。带成员关系
-  由熵累加器推导，因此同样落在文档化的边界类里（CPU 对 GPU 在
+  由熵累加器推导，因此同样属于文档记录的边界情形（CPU 对 GPU 在
   舍入边界上取相邻排名；同进程同输入缓冲内位稳定）。
 - 实现说明：在值排序的窗口上，保留集是一个**连续带**（意外度
   `|log p_i + H|` 沿值序呈 U 形——先降到谷底 `log p_i = -H` 再
   回升）。串行走查器从谷底出发按意外度升序扩带（合并两条单调
-  臂），若带触及窗口尾部且质量仍未达标则拒绝并扩窗——canonical
-  成员可能延伸到窗口之外，宁扩勿错。带没有解析的扩窗下界：
+  臂），只要窗口还没到全词表，带一旦触及窗口尾部就拒绝并扩窗
+  （质量达标与否都一样）——典型集的成员可能落在窗口之外，宁可
+  扩窗也不能截错；到了全词表窗口，走查得到的带质量就是整行总量
+  （求和顺序差在 ulp 以内），照常抽签，和其他采样器的全窗兜底
+  一致。带没有解析的扩窗下界：
   如实的 x8 阶梯就是全部（全词表窗口必然覆盖，此时带质量即
   全量）。
+
+## logit_penalties——一次调用套齐 HF 三件惩罚（v1.6.1）
+
+```python
+penalized = fusedtok.logit_penalties(logits, history,
+                                     repetition=1.2, presence=0.1,
+                                     frequency=0.05)
+```
+
+`logit_penalties` 把 HF 风格的三种采样惩罚一次施加到一行 logits
+上。对 `token_ids` 里每个**去重后**的 id（设它在 ids 里出现了
+`c` 次）：
+
+```
+v = logit[id]
+if repetition != 1.0:  v = v / repetition（v > 0 时）；否则 v * repetition
+if presence    != 0.0: v -= presence
+if frequency   != 0.0: v -= c * frequency
+penalized[id] = v
+```
+
+- 组合顺序与 HF 处理器一致：先 CTRL 缩放，再出现惩罚位移，再按
+  计数加权的频率位移。`repetition` 必须大于 0（越界抛
+  `ValueError`）；`presence` 和 `frequency` 是普通位移量，不限范围。
+- 重复的 id 不会叠加惩罚：同一个 id 写三遍也只罚一次，`c = 3`
+  只进频率项。这与 GPU 直方图（每个 id 计一个数）和"每个去重 id
+  恰好罚一次"的 CPU 参考一致——也就是 v1.5.2 落地的那个修复。
+- 没被点名的 logit 原样通过；空的 `token_ids` 是精确的空操作。
+  其余参数取默认值时，`logit_penalties(..., repetition=1.2)` 与单独
+  的 `repetition_penalty` 逐位一致。
+- **精确契约，不在采样器的边界类里**：计数是整数，输出没有任何
+  一个值被多个线程碰过——没有原子到达序的舍入、没有熵推导的
+  阈值，所以 CPU 参考与所有 GPU 路径（staged、零拷贝、原地）逐位
+  一致，跨进程也一样。
+- id 直方图走按词表大小缓存的 workspace，分配发生在流捕获之外
+  （attention workspace 的老套路），所以本算子可以进 CUDA graph；
+  唯一的例外是首次调用就撞上捕获的情形——这时直方图会借用输出
+  缓冲，也是唯一 `out` 不能与 `logits` 同址的场景（那种罕见路径上
+  launcher 会抛出明确的错误）。捕获前先热身一次即可继续用原地调用。
+- 仅单行；批量版是后续版本的候选。
 
 ## 批量采样——每个解码步一次调用（v1.4）
 
@@ -157,7 +211,8 @@ token 被对称地剪掉——这正是该设计的本意。
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 ```
 
-`sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched`
+`sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched` /
+`sample_eta_batched` / `sample_typical_batched`
 一次调用采样整个 `[行数, 词表]` 批，每行返回一个 token。返回值是
 **主机侧**的 int64：torch 输入回 CPU torch 张量，numpy 输入回 numpy
 数组——扩窗循环不可避免地要回读主机，因此与单行版一样不可做
@@ -171,7 +226,9 @@ CUDA graph捕获。
   都在复用同一套逐行随机流。
 - 每行原封不动地跑单行管线——同样的 kernel、同样的累加顺序、
   逐行一致（含扩窗循环：各行按自己的核宽度完成，先完成的行被
-  跳过，宽核的行继续加宽重试）。
+  跳过，宽核的行继续加宽重试）。1.6 的两个批量成员在 1.6.1 起
+  也保持这一性质：批量 typical 与单行 kernel 一样，带触及窗口
+  尾部就回去扩窗（1.6.1 之前会直接从截断带抽签——本版已修复）。
 - 行按固定 32 行一组分块处理，超大批次也只在有界的 workspace
   内流过。
 - 批处理换来的收益：把逐行的 Python/启动开销合并成一次。B=8 在
@@ -180,7 +237,7 @@ CUDA graph捕获。
   274 µs、minp 1399 -> 237 µs；README 中的事件计时基准表量的是
   GPU 时间，协议不同）。尖峰 logits 下与 torch 原生批量
   multinomial 处于同一档位，`sample_topk_batched` 明确胜出
-  （1.54x / 1.21x）；平坦最坏情况则比单行版再低一档
+  （1.51x / 1.17x）；平坦最坏情况则比单行版再低一档
   （0.05-0.06x），劣势同样如实标注。
 - `decode_step` 的批量版见下一节（v1.5）。
 
@@ -202,14 +259,14 @@ tokens = fusedtok.decode_step_batched(
   服务端快路径）。取值必须在 `[0, 词表)` 内。
 - 每行把自己的历史标进一行词表位图，每次读 logit 都先对**原始
   值**施加惩罚再做温度缩放——与 `decode_step` 的组合顺序一致，
-  因此逐行一致性保持到文档化的 ulp 边界为止。
+  因此除文档记录的 ulp 边界外逐行一致。
 - `penalty=1.0` 或历史全空时不会产生任何位图读写（此时调用与
   `sample_topp_batched` 完全等价）。
-- 逐（行, 种子）确定；不可 CUDA graph捕获；行按 32 行一组分块。
+- 逐（行, 种子）确定；不可 CUDA graph 捕获；行按 32 行一组分块。
 - 批处理收益：B=8 墙上时钟探针、约 64 token 历史下，尖峰
   logits 比逐行循环 `decode_step` 快 5.2 倍（3060：1676 ->
   321 µs；5060 Ti：646 -> 145 µs），与 torch 原生"惩罚 +
-  softmax + 批量 multinomial"组合相差不到两成；中尾 logits 快
+  softmax + 批量 multinomial"组合慢约两成；中尾 logits 快
   3.1 倍（3060：17.3 -> 5.5 ms）。
 
 ## 同 token 保证
@@ -229,7 +286,7 @@ tokens = fusedtok.decode_step_batched(
 softmax 总量靠逐 block 的浮点原子加累加，而 GPU 调度这些 block
 的到达顺序在进程之间可能不同——恰好落在 CDF 边界上的抽签因此
 可能在进程重启后抽到相邻 token。实测在 131k 词表下抽 8 行，其中
-1 行恰好压在边界上、多次运行间会翻转——八分之一每步的概率，
+1 行恰好压在边界上、多次运行间会翻转——每步八分之一的概率，
 落在真实某次抽签头上可以忽略不计。批量采样器每行用的是同一套
 累加模式，因此某行与它的单独调用也可能差这一个边界 token；
 对拍（parity）测试按"精确命中或仅差相邻排名"的标准加以验证。
@@ -243,7 +300,7 @@ softmax 总量靠逐 block 的浮点原子加累加，而 GPU 调度这些 block
 
 当核（nucleus）盖住几乎整个词表（接近均匀的 logits）时，
 `sample_topp` 实际上要给全词表排序，torch 的全并行排序仍然更快
-——基准表里如实标着 0.16-0.37x。v1.2 用三个不破坏契约的改动把
+——基准表里如实标着 0.15-0.27x。v1.2 用三个不破坏契约的改动把
 该最坏情况的耗时压到约 1/8.5（快约 8.5 倍；3060 上 n=131072
 实测 18.2ms -> 2.2ms）：
 

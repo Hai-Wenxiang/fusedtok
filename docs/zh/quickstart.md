@@ -84,6 +84,11 @@ histories = [[5, 9], [], [1, 2, 2], [7] * 16,
              [3], [], [0], [4, 4]]
 tokens = fusedtok.decode_step_batched(batch_logits, histories,
                                       penalty=1.3, p=0.9)
+
+# 熵自适应截断（v1.6）：阈值由分布自身的熵推导而来，不是固定值
+token = fusedtok.sample_eta(logits, eta=1e-3, temperature=0.8, seed=0)
+token = fusedtok.sample_typical(logits, typical=0.9,
+                                temperature=0.8, seed=0)
 ```
 
 仓库里的 `examples/demo.py` 会把每个算子都逐个演示一遍并与解析
@@ -94,7 +99,8 @@ tokens = fusedtok.decode_step_batched(batch_logits, histories,
 - [执行模型](execution.md) —— 三条执行路径、dtype 规则、流与
   CUDA graph、错误契约
 - [注意力算子](attention.md) —— 解码注意力、连续与分页 append 写侧、prefill
-- [采样与选择](sampling.md) —— top-k / top-p / min-p、融合采样器、确定性契约
+- [采样与选择](sampling.md) —— top-k / top-p / min-p、熵自适应采样器
+  （eta、typical）、融合采样器、确定性契约
 - [INT8 路径](int8.md) —— 量化工具与整数精确矩阵乘
 - [基准测试](benchmarks.md) —— 数字怎么测的、表格怎么读
 - [常见问题](faq.md) —— 排错与词汇表
