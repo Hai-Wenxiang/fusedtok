@@ -938,6 +938,98 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("n"), py::arg("min_p"), py::arg("t") = 1.0,
        py::arg("seed") = 0, py::arg("stream") = 0);
 
+    m.def("sample_eta_cpu", [](FArray logits, double eta, double t,
+                               unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_eta_cpu(to_vec(logits), (float)eta, (float)t,
+                                  seed);
+    }, py::arg("logits"), py::arg("eta"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_eta", [](FArray logits, double eta, double t,
+                           unsigned long long seed) -> long long {
+        // staged: copy logits up, run, read the token back
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(eta > 0.0 && eta <= 1.0))
+            throw std::invalid_argument("eta must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_eta_launch(dx.fget(), n,
+                                                      (float)eta,
+                                                      (float)t, seed);
+        sync_device("sample eta kernel");
+        return token;
+    }, py::arg("logits"), py::arg("eta"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_eta_launch", [](py::int_ x, int n, double eta,
+                                  double t, unsigned long long seed,
+                                  std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (!(eta > 0.0 && eta <= 1.0))
+            throw std::invalid_argument("eta must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_eta_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                     n, (float)eta, (float)t, seed,
+                                     stream);
+    }, py::arg("x"), py::arg("n"), py::arg("eta"), py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
+    m.def("sample_typical_cpu", [](FArray logits, double typical, double t,
+                                   unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_typical_cpu(to_vec(logits), (float)typical,
+                                      (float)t, seed);
+    }, py::arg("logits"), py::arg("typical"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_typical", [](FArray logits, double typical, double t,
+                               unsigned long long seed) -> long long {
+        // staged: copy logits up, run, read the token back
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(typical > 0.0 && typical <= 1.0))
+            throw std::invalid_argument("typical must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_typical_launch(dx.fget(), n,
+                                                          (float)typical,
+                                                          (float)t, seed);
+        sync_device("sample typical kernel");
+        return token;
+    }, py::arg("logits"), py::arg("typical"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_typical_launch", [](py::int_ x, int n, double typical,
+                                      double t, unsigned long long seed,
+                                      std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (!(typical > 0.0 && typical <= 1.0))
+            throw std::invalid_argument("typical must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_typical_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                         n, (float)typical, (float)t, seed,
+                                         stream);
+    }, py::arg("x"), py::arg("n"), py::arg("typical"), py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
     m.def("sample_topp", [](FArray logits, double p, double t,
                             unsigned long long seed) -> long long {
         if (logits.ndim() != 1)
@@ -1112,6 +1204,98 @@ PYBIND11_MODULE(_fusedtok, m) {
             df(x), rows, n, (float)min_p, (float)t, seeds_vec(seeds),
             stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("min_p"),
+       py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
+
+    m.def("sample_eta_batched_cpu",
+          [](FArray logits, int rows, int n, double eta, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_unit("eta", eta);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_eta_batched_cpu(
+            to_vec(logits), rows, n, (float)eta, (float)t,
+            seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("eta"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_eta_batched",
+          [](FArray logits, int rows, int n, double eta, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_unit("eta", eta);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return wrap_ivec({});
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const std::vector<long long> tokens = ft::sample_eta_batched_launch(
+            dx.fget(), rows, n, (float)eta, (float)t, seeds_vec(seeds));
+        sync_device("sample eta batched kernel");
+        return wrap_ivec(tokens);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("eta"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_eta_batched_launch",
+          [](py::int_ x, int rows, int n, double eta, double t,
+             const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        check_batch_rows_n(rows, n);
+        check_batch_unit("eta", eta);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_eta_batched_launch(
+            df(x), rows, n, (float)eta, (float)t, seeds_vec(seeds),
+            stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("eta"),
+       py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
+
+    m.def("sample_typical_batched_cpu",
+          [](FArray logits, int rows, int n, double typical, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_unit("typical", typical);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_typical_batched_cpu(
+            to_vec(logits), rows, n, (float)typical, (float)t,
+            seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("typical"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_typical_batched",
+          [](FArray logits, int rows, int n, double typical, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_unit("typical", typical);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return wrap_ivec({});
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const std::vector<long long> tokens =
+            ft::sample_typical_batched_launch(
+                dx.fget(), rows, n, (float)typical, (float)t,
+                seeds_vec(seeds));
+        sync_device("sample typical batched kernel");
+        return wrap_ivec(tokens);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("typical"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_typical_batched_launch",
+          [](py::int_ x, int rows, int n, double typical, double t,
+             const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        check_batch_rows_n(rows, n);
+        check_batch_unit("typical", typical);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_typical_batched_launch(
+            df(x), rows, n, (float)typical, (float)t, seeds_vec(seeds),
+            stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("typical"),
        py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
 
     // ==================================================================

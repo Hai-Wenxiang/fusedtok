@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 __all__ = [
     "cuda_available",
@@ -58,6 +58,12 @@ __all__ = [
     "sample_topp",
     "sample_topk",
     "sample_minp",
+    "sample_eta",
+    "sample_eta_batched",
+    "sample_typical",
+    "sample_typical_batched",
+    "sample_eta_batched",
+    "sample_typical_batched",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
@@ -1523,6 +1529,127 @@ def sample_minp(logits, min_p, *, temperature=1.0, seed=0, cuda=False):
     call = (_fusedtok.sample_minp if path == "staged"
             else _fusedtok.sample_minp_cpu)
     return int(call(arr, min_p, temperature, seed))
+
+
+def sample_eta(logits, eta, *, temperature=1.0, seed=0, cuda=False):
+    """Fused eta-cutoff sampling: one GPU round trip from raw logits to
+    a token.
+
+    Pipeline: softmax of ``logits / temperature`` -> compute the
+    distribution entropy H (in nats) -> keep every token whose
+    probability is at least ``eta * min(1, exp(-H))`` ->
+    renormalize within that nucleus -> inverse-CDF draw using a
+    hash-uniform of ``seed`` (Hewitt et al. 2022). The cutoff adapts
+    to the distribution's own shape: flat distributions raise the bar,
+    confident ones lower it toward zero. Deterministic per seed; the
+    RNG is a splitmix-style hash (reproducible, NOT cryptographically
+    secure).
+
+    Returns the sampled token id (int). ``eta`` in (0, 1]
+    (values near 1 keep only the most typical tokens of a peaked
+    distribution; tiny values approach plain sampling), temperature
+    > 0. The nucleus always keeps at least one token.
+    """
+    if not 0.0 < eta <= 1.0:
+        raise ValueError("eta must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_eta_launch(logits.data_ptr(),
+                                               logits.numel(), eta,
+                                               temperature, seed,
+                                               _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_eta if path == "staged"
+            else _fusedtok.sample_eta_cpu)
+    return int(call(arr, eta, temperature, seed))
+
+
+def sample_typical(logits, typical, *, temperature=1.0, seed=0, cuda=False):
+    """Fused locally typical sampling: one GPU round trip from raw
+    logits to a token.
+
+    Pipeline: softmax of ``logits / temperature`` -> compute the
+    distribution entropy H (in nats) -> keep the smallest band of
+    tokens whose |surprise - H| is smallest until the band's mass
+    reaches ``typical`` -> renormalize inside that band ->
+    inverse-CDF draw using a hash-uniform of ``seed`` (Meister et
+    al. 2022). Unlike top-p/min-p the kept set is not a prefix of the
+    ranked distribution: too-confident and too-surprising tokens are
+    trimmed symmetrically, which is the point. Deterministic per
+    seed; the RNG is a splitmix-style hash (reproducible, NOT
+    cryptographically secure).
+
+    Returns the sampled token id (int). ``typical`` in (0, 1]
+    (values near 1 approach plain sampling over the whole
+    vocabulary), temperature > 0. The band always keeps at least one
+    token.
+    """
+    if not 0.0 < typical <= 1.0:
+        raise ValueError("typical must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_typical_launch(logits.data_ptr(),
+                                                   logits.numel(), typical,
+                                                   temperature, seed,
+                                                   _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_typical if path == "staged"
+            else _fusedtok.sample_typical_cpu)
+    return int(call(arr, typical, temperature, seed))
+
+
+def sample_eta_batched(logits, eta, *, temperature=1.0, seeds=None,
+                       cuda=False):
+    """Fused eta-cutoff sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every
+    row runs the exact ``sample_eta`` pipeline and the call returns
+    one token id per row (int64 array / torch tensor on CPU).
+    ``eta`` in (0, 1], temperature > 0, seeds per row (``None``
+    defaults to 0..rows-1). Deterministic per (row, seed); not
+    CUDA-graph capturable.
+    """
+    if not 0.0 < eta <= 1.0:
+        raise ValueError("eta must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    return _sample_batched("sample_eta", logits, eta,
+                           temperature=temperature, seeds=seeds,
+                           cuda=cuda)
+
+
+def sample_typical_batched(logits, typical, *, temperature=1.0, seeds=None,
+                           cuda=False):
+    """Fused locally typical sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every
+    row runs the exact ``sample_typical`` pipeline and the call returns
+    one token id per row (int64 array / torch tensor on CPU).
+    ``typical`` in (0, 1], temperature > 0, seeds per row (``None``
+    defaults to 0..rows-1). Deterministic per (row, seed); not
+    CUDA-graph capturable.
+    """
+    if not 0.0 < typical <= 1.0:
+        raise ValueError("typical must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    return _sample_batched("sample_typical", logits, typical,
+                           temperature=temperature, seeds=seeds,
+                           cuda=cuda)
 
 
 def _sample_batched(kind, logits, arg, *, temperature, seeds, cuda):

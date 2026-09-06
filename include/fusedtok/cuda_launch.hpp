@@ -87,6 +87,30 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
                              unsigned long long seed,
                              std::uintptr_t stream = 0);
 
+// eta-cutoff sampling (v1.6, Hewitt et al. 2022): the cutoff derives
+// from the distribution entropy (H = log(total) - s / total), computed
+// by the entropy accumulator kernel per attempt - a value-threshold
+// prefix like min-p, but with one more full-vocabulary pass per
+// attempt. Deterministic per seed (same RNG).
+long long sample_eta_launch(const float* x, int n, float eta, float t,
+                            unsigned long long seed,
+                            std::uintptr_t stream = 0);
+
+// locally typical sampling (v1.6): the value-ordered band whose mass
+// reaches typical * total, renormalized inside. No analytic widening
+// bound - the honest x8 ladder; the full window always covers.
+long long sample_typical_launch(const float* x, int n, float typical,
+                                float t, unsigned long long seed,
+                                std::uintptr_t stream = 0);
+std::vector<long long> sample_eta_batched_launch(
+    const float* x, int rows, int n, float eta, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+std::vector<long long> sample_typical_batched_launch(
+    const float* x, int rows, int n, float typical, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+
 // Fused decode step: repetition penalty over the sampled ids (vocab
 // bitmap), temperature, then nucleus sampling - one call, one readback.
 // Returns the sampled token id.

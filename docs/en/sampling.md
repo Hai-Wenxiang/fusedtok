@@ -11,6 +11,8 @@ and GPU draws may differ.
 - [Selection operators](#selection-operators)
 - [The fused samplers](#the-fused-samplers)
 - [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp---threshold-by-max-sampling-v13)
+- [sample_eta - entropy-adaptive cutoff sampling (v1.6)](#sample_eta---entropy-adaptive-cutoff-sampling-v16)
+- [sample_typical - locally typical sampling (v1.6)](#sample_typical---locally-typical-sampling-v16)
 - [Batched sampling - one call per decode step (v1.4)](#batched-sampling---one-call-per-decode-step-v14)
 - [Batched decode steps - penalties included (v1.5)](#batched-decode-steps---penalties-included-v15)
 - [The same-token guarantee](#the-same-token-guarantee)
@@ -102,6 +104,79 @@ nucleus, draw with the same seeded hash.
   width, C its cumulated mass, and T the lazily-computed global
   total), so wide nuclei skip the x8 ladder's intermediate stops
   (~30% off the wide-nucleus row) with bit-identical tokens.
+
+## sample_eta - entropy-adaptive cutoff sampling (v1.6)
+
+```python
+tok = fusedtok.sample_eta(logits, eta=0.3, temperature=0.8, seed=step)
+```
+
+Eta-cutoff (Hewitt et al. 2022, "Trickle-down" - deployed in
+llama.cpp and vLLM as `eta_cutoff`) truncates by a value threshold
+derived from the distribution's OWN shape: compute the entropy H (in
+nats), keep every token whose probability is at least
+`eta * min(1, exp(-H))`, renormalize within that nucleus, draw with
+the same seeded hash. Flat distributions raise the bar (heavy
+truncation), confident ones lower it toward zero (nearly everything
+survives) - the cutoff adapts where `min_p` and `top_p` use fixed
+or mass-relative bars.
+
+- `eta` must be in `(0, 1]` (`ValueError` otherwise); `temperature`
+  must be greater than 0. Typical serving values are tiny
+  (`1e-3`-ish) - the entropy factor does the shaping.
+- The nucleus always keeps at least one token: the cutoff is bounded
+  by the maximum probability (the weighted geometric mean of the
+  probabilities bounds their max), and a min-token guard makes that
+  explicit against float drift.
+- Deterministic per seed, same RNG and same-token guarantee as the
+  other samplers. The cutoff derives from an entropy accumulator
+  (atomic float adds) plus the global total, so it lives in the
+  documented boundary class: CPU-vs-GPU and cross-run draws on a
+  rounding boundary may pick a neighboring rank; within one process
+  and one input buffer the result is bit-stable.
+- Implementation note: the cutoff is a value-threshold prefix exactly
+  like min-p's, but the threshold needs H - one extra full-vocabulary
+  pass (the entropy accumulator `s = sum e_i * (l_i - max)`, with
+  `H = log(total) - s / total`) runs per attempt alongside the
+  global-total pass, and the widening bound reuses min-p's sufficient
+  mass formula with the derived cutoff.
+
+## sample_typical - locally typical sampling (v1.6)
+
+```python
+tok = fusedtok.sample_typical(logits, typical=0.9, temperature=0.8,
+                              seed=step)
+```
+
+Locally typical sampling (Meister et al. 2022) keeps the smallest set
+of tokens, ordered by how CLOSE each token's surprise
+(`-log p_i`) is to the distribution's entropy `H`, whose mass reaches
+`typical` - then renormalizes inside that set and draws with the same
+seeded hash. Unlike top-p/min-p the kept set is not a prefix of the
+ranked distribution: too-confident and too-surprising tokens are
+trimmed symmetrically, which is the design's point.
+
+- `typical` must be in `(0, 1]` (`ValueError` otherwise);
+  `temperature` must be greater than 0. Values near 1 approach plain
+  sampling over the whole vocabulary.
+- The band always keeps at least one token (the entropy-matched token
+  seeds it, and a min-token guard makes that explicit).
+- Deterministic per seed, same RNG and same-token guarantee as the
+  other samplers. Like eta, the band membership derives from the
+  entropy accumulator, so it lives in the documented boundary class
+  (CPU-vs-GPU neighbor-rank on rounding boundaries; bit-stable within
+  one process and input buffer).
+- Implementation note: on the value-sorted window the kept set is a
+  contiguous BAND (the shifted surprise `|log p_i + H|` is U-shaped
+  along the value order, descending to a valley at `log p_i = -H` and
+  rising again). The serial walker expands the band from the valley
+    in ascending shifted order (merging the two monotone arms) and
+  rejects any band that touches the window tail before the mass is
+  reached - canonical members may live past the edge, so the host
+  widens instead of drawing a wrong band. There is no analytic
+  widening bound for the band: the honest x8 ladder is the whole
+  story (the full window always covers, since the band mass at the
+  full vocabulary is the total).
 
 ## Batched sampling - one call per decode step (v1.4)
 

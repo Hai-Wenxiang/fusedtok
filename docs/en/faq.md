@@ -118,6 +118,14 @@ micro-benchmark yourself, prefer events over wall clock and expect
   top-p takes the prefix whose cumulative probability mass reaches p;
   min-p takes the prefix of probabilities at least min_p times the
   maximum.
+- **eta-cutoff** - a sampling truncation whose threshold derives from
+  the distribution's own entropy (keep every token with
+  `p_i >= eta * min(1, exp(-H))`): flat distributions get heavy
+  truncation, confident ones almost none.
+- **Locally typical sampling** - a truncation that keeps the smallest
+  set of tokens whose "surprise" (`-log p_i`) is closest to the
+  distribution entropy, mass reaching `typical`: too-confident and
+  too-surprising tokens are trimmed symmetrically.
 - **Batched sampling** - sampling a whole `[rows, vocab]` batch in one
   call (the `_batched` samplers and `decode_step_batched`): every row
   runs the single-row pipeline verbatim with its own seed; the speedup
