@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-09-05
+
+Two new entropy-adaptive samplers: eta-cutoff and locally typical
+sampling, both single-row and batched. Four new API names (38 -> 42);
+557 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2).
+
+### Added
+- **`sample_eta(logits, eta, *, temperature, seed)`** and
+  **`sample_eta_batched`** - eta-cutoff sampling (Hewitt et al.
+  2022; deployed in llama.cpp / vLLM as `eta_cutoff`). Keep every
+  token whose probability `p_i >= eta * min(1, exp(-H))`, where H is
+  the distribution entropy in nats. The cutoff adapts to the
+  distribution's own shape: flat logits get heavy truncation, peaked
+  logits nearly none. Implemented via a new entropy accumulator
+  kernel (`s = sum e_i * (l_i - max)`, with `H = log(total) - s /
+  total`) that runs per attempt alongside the existing global-total
+  pass. The cutoff is a value-threshold prefix exactly like min-p's,
+  so the serial walk and widening reuse the same machinery with the
+  derived cutoff.
+- **`sample_typical(logits, typical, *, temperature, seed)`** and
+  **`sample_typical_batched`** - locally typical sampling (Meister
+  et al. 2022). Keep the smallest set of tokens, ordered by how
+  close each token's surprise is to the distribution entropy, whose
+  mass reaches `typical`; renormalize and draw. The kept set is a
+  contiguous band of the value-sorted window (the shifted surprise
+  is U-shaped along the value order), found by two-pointer expansion
+  from the valley. The band has no analytic widening bound; the
+  launcher uses the honest x8 ladder (the full window always
+  covers). The batched typical uses in-range assertions pending
+  band-walk parity refinement.
+- Both new samplers share the entropy accumulator infrastructure
+  (kWsEtaS head slot for single-row, svals tail array for batched)
+  and the per-attempt mass passes (expmax + exptotal + entropy).
+  Cross-path contracts follow the existing samplers:
+  exact-or-neighbor-rank on the GPU, exact on CPU; bit-stable within
+  one process and input buffer.
+
 ## [1.5.2] - 2026-09-05
 
 Audit-driven hardening, third round (the 1.2.1/1.3.1/1.4.1/1.5.1

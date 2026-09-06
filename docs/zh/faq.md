@@ -102,6 +102,12 @@ event 而不是墙上时钟，并预期 argmax 这类微小算子的数字会摆
   出各片的部分 softmax、再归并。
 - **nucleus（核）**——采样的截断集合：top-p 取"累计概率质量刚好
   达到 p"的前缀，min-p 取"概率不低于 min_p × 最大概率"的前缀。
+- **eta 截断（eta-cutoff）**——阈值由分布自身熵决定的采样截断：
+  保留所有 `p_i >= eta × min(1, exp(-H))` 的 token（H 为分布熵，
+  单位 nat）——平坦分布重截断，自信分布几乎不截。
+- **局部典型采样（locally typical sampling）**——按"意外度
+  （`-log p_i`）与分布熵的接近程度"保留质量达到 `typical` 的最小
+  集合：过自信与过意外的 token 被对称剪掉。
 - **批量采样（batched sampling）**——一次调用采样整个
   `[行数, 词表]` 批（`_batched` 系列采样器与
   `decode_step_batched`）：每行都用自己的种子原样跑一遍单行

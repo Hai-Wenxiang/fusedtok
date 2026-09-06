@@ -132,6 +132,9 @@ constexpr int kWsTotal = 265;       // global softmax total (float, sample)
 // 16-byte readback of the two words fetches both.
 constexpr int kWsCumW = 266;        // window cum mass (sample, float)
 constexpr int kWsLevelDone = 267;   // level of the last completed round
+// kWsEtaS (270) holds s = sum e_i * (l_i - max) for the eta-cutoff
+// sampler's entropy (H = log(total) - s / total) - same
+// float-in-the-low-half-of-its-own-u64-word layout as kWsTotal.
 // argmax-dedicated slots (NOT shared with the selection pipeline): the
 // selection ticket/emit counters can be non-zero after a call, so argmax
 // cannot rely on the per-call head memset alone. These two words hold the
@@ -142,7 +145,8 @@ constexpr int kWsLevelDone = 267;   // level of the last completed round
 // hosts; WDDM measured ~20-30us per extra launch).
 constexpr int kWsArgBest = 268;     // argmax packed-key max (self-resetting)
 constexpr int kWsArgCnt = 269;      // argmax arrival counter (self-resetting)
-constexpr int kWsHead = 270;
+constexpr int kWsEtaS = 270;        // eta entropy accumulator (float, sample)
+constexpr int kWsHead = 271;
 constexpr int kWsCand = kWsHead;               // candidates [0, kSelEarlyOut)
 constexpr int kWsKeys = kWsHead + kSelEarlyOut;  // key buffer A (m words)
 
@@ -1175,6 +1179,71 @@ __global__ void exptotal_kernel(const float* __restrict__ x,
     }
 }
 
+// eta/typical entropy accumulator (v1.6), row-decomposed: svals row
+// entry accumulates sum e_i * (l_i - max), like exptotal_b but with
+// the (l_i - max) factor. Zeroed by batch_preset per attempt.
+__global__ void entropy_b_kernel(const float* __restrict__ x,
+                                 unsigned long long* __restrict__ ws,
+                                 long long stride, int n, float inv_t,
+                                 float* __restrict__ svals, int gpr,
+                                 const int* __restrict__ active) {
+    const int row = blockIdx.x / gpr;
+    if (!active[row]) return;
+    const int lid = blockIdx.x % gpr;
+    const float* x_row = x + (size_t)row * n;
+    unsigned long long* ws_row = ws + (size_t)row * stride;
+    const float row_max = unfkey((unsigned)ws_row[kWsExpMax]);
+    float s = 0.0f;
+    for (int i = lid * blockDim.x + threadIdx.x; i < n;
+         i += gpr * blockDim.x) {
+        const float lv = x_row[i] * inv_t - row_max;
+        s += __expf(lv) * lv;
+    }
+    __shared__ float warp_sum[kSelWarps];
+    s = warp_reduce_sum(s);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sum[warp] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < kSelWarps; ++w) t += warp_sum[w];
+        atomicAdd(&svals[row], t);
+    }
+}
+
+// eta entropy accumulator (v1.6): s = sum e_i * (l_i - max) where
+// e_i = expf(l_i - max) and max is the expmax-published row max. With
+// the global total T from exptotal_kernel, the distribution entropy in
+// nats is H = log(T) - s / T (standard identity: H = ln Z - E[logit]
+// over p_i = e_i / Z). Accumulates exactly like exptotal (warp reduce,
+// one atomicAdd per block) into its own head slot; the eta serial
+// walker derives the cutoff threshold from (kWsTotal, kWsEtaS).
+__global__ void entropy_kernel(const float* __restrict__ x,
+                               unsigned long long* __restrict__ ws,
+                               int n, float inv_t, PenCtx pen) {
+    const float row_max = unfkey((unsigned)ws[kWsExpMax]);
+    float s = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        const float lv = step_logit(x, i, inv_t, pen) - row_max;
+        s += __expf(lv) * lv;
+    }
+    __shared__ float warp_sum[kSelWarps];
+    s = warp_reduce_sum(s);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sum[warp] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < kSelWarps; ++w) t += warp_sum[w];
+        atomicAdd(reinterpret_cast<float*>(&ws[kWsEtaS]), t);
+    }
+}
+
 // Finalize launch (after the eight round launches):
 //   stage 2 - nothing to do (early exit already settled k_min)
 //   stage 0 - eight full rounds completed: the prefix already IS the
@@ -1607,6 +1676,33 @@ static int widen_window_minp(int window, int n, float min_p, double total,
     return std::min(n, mp);
 }
 
+// Adaptive widening jump for eta-cutoff (v1.6): the nucleus is again a
+// VALUE threshold on the normalized probability
+// (p_i >= eta * min(1, exp(-H))), so min-p's sufficient mass bound
+// transfers directly with min_p replaced by that cutoff. The host
+// derives the cutoff from the same quantities the walker used, all
+// host-cached after the one-time mass pass (global total T, entropy
+// accumulator s: H = log(T) - s / T); the only fresh readback is the
+// failed window's cum mass C (kWsCumW). The cutoff derives from floats
+// the parallel tree produced, so the pow2 rounding adds slack against
+// a hair-miss (one more attempt, never correctness).
+static int widen_window_eta(int window, int n, float eta, double total,
+                            double s_acc, const unsigned long long* ws) {
+    unsigned long long cw = 0ULL;
+    if (cudaMemcpy(&cw, ws + kWsCumW, sizeof(cw),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("eta mass readback failed");
+    const double c = (double)*reinterpret_cast<const float*>(&cw);
+    const double h = std::log(total) - s_acc / total;
+    const double thr = (double)eta * std::fmin(1.0, std::exp(-h));
+    const long long lb = minp_widen_bound(window, thr, total, c);
+    const long long want = std::max<long long>((long long)window * 8, lb);
+    if (want >= n) return n;
+    int mp = 1;                       // pow2 headroom over the bound
+    while (mp < want) mp <<= 1;
+    return std::min(n, mp);
+}
+
 // ---------------------------------------------------------------------------
 // fused nucleus sampling: softmax(logits/T) -> nucleus(p) -> inverse-CDF
 // draw from a hash-derived uniform. The token comes back through a
@@ -2011,6 +2107,140 @@ __global__ void sample_minp_serial_kernel(
                        (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
+// eta-cutoff sampling tail (v1.6, Hewitt et al. 2022): keep every
+// element whose probability p_i >= eta * min(1, exp(-H)), H the
+// distribution entropy in nats - a VALUE threshold like min-p, so the
+// same prefix-walk machinery applies with the threshold derived
+// in-kernel from the workspace slots (global total T from
+// exptotal_kernel, entropy accumulator s from entropy_kernel:
+// H = log(T) - s / T, cutoff p = eta * min(1, exp(-H))). The cutoff is
+// bounded by p_max (the weighted geometric mean of the p_i bounds
+// their max), so the nucleus is never empty. An uncovered window
+// leaves the sentinel and the whole-window cum mass for the host's
+// widening bound (widen_window_eta).
+__global__ void sample_eta_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
+    int* __restrict__ token_out,
+    int k, int n, float eta, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const float total =
+        *reinterpret_cast<const float*>(&ws[kWsTotal]);
+    const float s =
+        *reinterpret_cast<const float*>(&ws[kWsEtaS]);
+    const float h = logf(total) - s / total;
+    const float threshold_e =
+        eta * fminf(1.0f, expf(-h)) * total;   // cutoff in exp units
+    extern __shared__ float cps[];   // walk checkpoints (walk_cp_slots)
+    const int stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, threshold_e, &nucleus_mass,
+                                      cps, stride, &ncp);
+    if (edge < 0 && k < n) {
+        // every window element passes: nucleus extends past the window -
+        // the host retries wider (token stays -1). Leave the whole-window
+        // cum mass for the host's next-jump bound (widen_window_eta)
+        *reinterpret_cast<float*>(&ws[kWsCumW]) = nucleus_mass;
+        return;
+    }
+    // nucleus is never empty (threshold_e <= exps[0]); the max(.., 1)
+    // makes the min-token guarantee explicit against float drift
+    const int nucleus = (edge < 0) ? k : (edge > 0 ? edge : 1);
+    const float u = splitmix_uniform(seed);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
+    // float-boundary fallback: the last nucleus element, same as the
+    // CPU reference and the topk walker
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// locally typical sampling tail (v1.6, Meister et al. 2022): keep the
+// smallest BAND of the value-sorted window whose mass reaches
+// typical * total, renormalize inside it, and draw. The band is
+// contiguous in the value order because the shifted surprise
+// |lv_i - m| is U-shaped along it (lv_i = log of the window exp,
+// m = s / total their p-weighted mean - both from the workspace slots
+// like eta): it descends to a valley at lv == m and rises again, so
+// {shifted <= b} crosses each level at most twice. The two-pointer
+// expansion below adds members in globally ascending shifted order
+// (merging the valley's two monotone arms), which yields the canonical
+// minimal band. No sufficient widening bound exists for the band (its
+// mass growth is data-shaped), so the host ladder is the honest x8;
+// the full window always covers (its band mass is the total, and
+// typical * total <= total).
+__global__ void sample_typical_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
+    int* __restrict__ token_out,
+    int k, int n, float typical, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const float total =
+        *reinterpret_cast<const float*>(&ws[kWsTotal]);
+    const float s =
+        *reinterpret_cast<const float*>(&ws[kWsEtaS]);
+    const float m = s / total;   // p-mean of lv; shifted = |lv - m|
+    // the U-shape's valley seeds the band
+    int amin = 0;
+    float best = fabsf(logf(exps[0]) - m);
+    for (int i = 1; i < k; ++i) {
+        const float d = fabsf(logf(exps[i]) - m);
+        if (d < best) { best = d; amin = i; }
+    }
+    int lo = amin, hi = amin;
+    float mass = exps[amin];
+    const float need = typical * total;
+    // grow the band in globally ascending shifted order (the two U
+    // arms are each monotone; merging by the smaller next shifted
+    // adds members in canonical order). lo == 0 is a TRUE edge -
+    // nothing precedes the global max - but hi == k - 1 only closes
+    // the band when k == n: otherwise canonical members may live
+    // past the window tail, and that band cannot be trusted (the
+    // post-loop check sends it back for widening).
+    while (mass < need) {
+        const float dl = (lo > 0) ? fabsf(logf(exps[lo - 1]) - m) : 1e30f;
+        const float dr = (hi < k - 1) ? fabsf(logf(exps[hi + 1]) - m)
+                                      : 1e30f;
+        if (dl == 1e30f && dr == 1e30f)
+            break;       // both true edges and still short (float edge)
+        if (dl <= dr) { --lo; mass += exps[lo]; }
+        else {
+            ++hi; mass += exps[hi];
+            if (hi == k - 1 && k < n && mass < need) {
+                // right arm truncated at the window edge with the
+                // mass still short: canonical members may live past
+                // the edge, so widen rather than draw a wrong band
+                *reinterpret_cast<float*>(&ws[kWsCumW]) = mass;
+                return;
+            }
+        }
+    }
+    if (mass < need || (hi == k - 1 && k < n)) {
+        // short mass, or the band touches the window tail where
+        // canonical members may live past the edge - widen (lo == 0
+        // is a true edge; nothing precedes the global max)
+        *reinterpret_cast<float*>(&ws[kWsCumW]) = mass;
+        return;
+    }
+    // draw inside [lo, hi] renormalized to the band mass, replaying
+    // the band's cumsum in ascending index order (same order as this
+    // walk - bit-stable per seed)
+    const float u = splitmix_uniform(seed);
+    const float target = u * mass;
+    float cum = 0.0f;
+    int idx = hi;
+    for (int i = lo; i <= hi; ++i) {
+        cum += exps[i];
+        if (cum >= target) { idx = i; break; }
+    }
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
 long long sample_minp_launch(const float* x, int n, float min_p, float t,
                              unsigned long long seed, std::uintptr_t stream) {
     if (n <= 0)
@@ -2109,6 +2339,210 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
 }
 
 // ---------------------------------------------------------------------------
+// fused eta-cutoff sampling (v1.6): softmax(logits/T) -> keep every token
+// with p_i >= eta * min(1, exp(-H)) -> inverse-CDF draw from a
+// hash-derived uniform. H (the distribution entropy in nats) comes from
+// the entropy_kernel accumulator + the exptotal total, both re-run per
+// attempt (the per-attempt head memset zeroes their slots). Same
+// windowing strategy and non-capturable contract as sample_minp.
+// ---------------------------------------------------------------------------
+long long sample_eta_launch(const float* x, int n, float eta, float t,
+                            unsigned long long seed, std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(eta > 0.0f && eta <= 1.0f))
+        throw std::invalid_argument("eta must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    // unlike min-p, the cutoff derives from workspace quantities (T, s)
+    // the serial walker reads - so the mass passes run on EVERY attempt
+    // (the head memset zeroes their slots), exactly like top-p's.
+    // The widening bound additionally needs them host-side; both are
+    // window-invariant, so they are read back once after the first
+    // failure and cached (same lazy pattern as min-p's total).
+    double total = -1.0;
+    double s_acc = 0.0;
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;                // sort pad size
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window,
+                    inv_t, kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, inv_t, kNoPen);
+        }
+        // the mass + entropy passes feed the serial walker's cutoff
+        // (kWsExpMax publishes the max before both consumers)
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                    kNoPen);
+        entropy_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                   kNoPen);
+        check_launch("eta mass launch");
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                 inv_t, kNoPen);
+        check_launch("eta selection launch");
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
+        sample_eta_serial_kernel<<<1, 32,
+                                   walk_cp_slots(window) * sizeof(float),
+                                   cs>>>(
+            sorted, exps, ws, token_out, window, n, eta, seed);
+        check_launch("eta tail launch");
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("eta kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("eta readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("eta nucleus not covered");
+        if (total < 0.0) {
+            // one-time global max + total + entropy accumulator for the
+            // adaptive bound (all three window-invariant; the head
+            // memset of THIS attempt zeroed the slots and the kernels
+            // run strictly after the failed attempt on the same stream)
+            expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                      kNoPen);
+            exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                        kNoPen);
+            entropy_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                       kNoPen);
+            check_launch("eta mass launch");
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess)
+                throw std::runtime_error(std::string("eta mass failed: ") +
+                                         cudaGetErrorString(err));
+            unsigned long long words[2] = {0ULL, 0ULL};
+            if (cudaMemcpy(words, ws + kWsTotal, sizeof(unsigned long long),
+                           cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(words + 1, ws + kWsEtaS,
+                           sizeof(unsigned long long),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("eta mass readback failed");
+            total = (double)*reinterpret_cast<const float*>(&words[0]);
+            s_acc = (double)*reinterpret_cast<const float*>(&words[1]);
+        }
+        window = widen_window_eta(window, n, eta, total, s_acc, ws);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fused locally typical sampling (v1.6): softmax(logits/T) -> keep the
+// smallest value-ordered band whose mass reaches typical * total (the
+// band groups tokens by |surprise - entropy|, so too-confident and
+// too-surprising tokens are trimmed symmetrically) -> renormalize
+// inside the band -> inverse-CDF draw from a hash-derived uniform.
+// Same windowing strategy as sample_minp/eta, but the band has no
+// analytic widening bound - the honest x8 ladder is the whole story.
+// Not CUDA-graph capturable (per-attempt readback).
+// ---------------------------------------------------------------------------
+long long sample_typical_launch(const float* x, int n, float typical,
+                                float t, unsigned long long seed,
+                                std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(typical > 0.0f && typical <= 1.0f))
+        throw std::invalid_argument("typical must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    // the band membership needs the global total and the entropy
+    // accumulator, so - like eta - the mass passes run on EVERY attempt
+    // (the head memset zeroes their slots). Nothing is read back for
+    // widening: the ladder is a plain x8 with the full window as the cap.
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;                // sort pad size
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window,
+                    inv_t, kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, inv_t, kNoPen);
+        }
+        // band membership needs the total and the entropy accumulator
+        // (kWsExpMax publishes the max before both consumers)
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                    kNoPen);
+        entropy_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                   kNoPen);
+        check_launch("typical mass launch");
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                 inv_t, kNoPen);
+        check_launch("typical selection launch");
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
+        sample_typical_serial_kernel<<<1, 32,
+                                       walk_cp_slots(window) *
+                                           sizeof(float),
+                                       cs>>>(
+            sorted, exps, ws, token_out, window, n, typical, seed);
+        check_launch("typical tail launch");        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("typical kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("typical readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("typical nucleus not covered");
+        // honest x8 ladder: the band has no analytic widening bound
+        window = std::min(n, window * 8);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // batched sampling (v1.4): sample_topp/minp/topk_batched (v1.5 adds
 // decode_step_batched) - [rows, n] logits in, one token per row out.
 //
@@ -2159,20 +2593,24 @@ constexpr int kBMaxBatch = 32;
 // compact per-row scalar tail after the B stripes. Word layout (all
 // ranges word-aligned so the comment IS the layout): seeds [0, B) |
 // tokens [B, 2B) | cumws [2B, 2B+C) | totals [2B+C, 2B+2C) | active
-// [2B+2C, 2B+3C), C = ceil(B / 2). Each float array occupies C words;
-// for odd B the half-word left by cumws stays unused (a padded gap,
-// never shared - the 1.4.0 overlap bug came from exactly such sharing).
+// [2B+2C, 2B+3C) | svals [2B+3C, 2B+4C), C = ceil(B / 2). Each
+// float/int array occupies C words; for odd B the half-word left by
+// one array stays unused (a padded gap, never shared - the 1.4.0
+// overlap bug came from exactly such sharing). svals holds the
+// eta/typical entropy accumulator per row (v1.6), zeroed by
+// batch_preset like the totals.
 struct BatchTail {
     unsigned long long* seeds;   // B u64
     long long* tokens;           // B i64, -1 = not yet sampled
     float* cumws;                // B f32, uncovered-window cum mass
     float* totals;               // B f32, max-normalized global total
     int* active;                 // B i32, 1 = row still needs a token
+    float* svals;                // B f32, eta/typical entropy acc
 };
 
 inline size_t batch_tail_words(int rows) {
     const size_t pairs = (size_t)((rows + 1) / 2);
-    return 2 * (size_t)rows + 3 * pairs;
+    return 2 * (size_t)rows + 4 * pairs;
 }
 
 inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
@@ -2186,6 +2624,8 @@ inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
                                        pairs);
     t.active = reinterpret_cast<int*>(ws + stripes + 2 * (size_t)rows +
                                       2 * pairs);
+    t.svals = reinterpret_cast<float*>(ws + stripes + 2 * (size_t)rows +
+                                       3 * pairs);
     return t;
 }
 
@@ -2205,6 +2645,7 @@ inline BatchTail batch_tail_at(unsigned long long* ws, size_t base,
 __global__ void batch_preset_kernel(long long* __restrict__ tokens,
                                     float* __restrict__ cumws,
                                     float* __restrict__ totals,
+                                    float* __restrict__ svals,
                                     const int* __restrict__ active,
                                     int rows) {
     for (int r = threadIdx.x; r < rows; r += blockDim.x)
@@ -2212,6 +2653,7 @@ __global__ void batch_preset_kernel(long long* __restrict__ tokens,
             tokens[r] = -1LL;
             cumws[r] = 0.0f;
             totals[r] = 0.0f;
+            svals[r] = 0.0f;
         }
 }
 
@@ -2773,6 +3215,100 @@ __global__ void sample_topk_serial_b_kernel(
                               (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
+// eta-cutoff sampling tail (v1.6), row-decomposed: the cutoff derives
+// in-kernel from the row's totals/svals tail entries
+// (H = log(T) - s / T, cutoff = eta * min(1, exp(-H)) * T).
+__global__ void sample_eta_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int n, float eta,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const float* __restrict__ totals, const float* __restrict__ svals,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const float total = totals[row];
+    const float h = logf(total) - svals[row] / total;
+    const float threshold_e = eta * fminf(1.0f, expf(-h)) * total;
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+    extern __shared__ float cps[];
+    const int cps_stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, threshold_e, &nucleus_mass,
+                                      cps, cps_stride, &ncp);
+    if (edge < 0 && k < n) {
+        cumws[row] = nucleus_mass;
+        return;
+    }
+    const int nucleus = (edge < 0) ? k : (edge > 0 ? edge : 1);
+    const float u = splitmix_uniform(seeds[row]);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
+                                 cps_stride);
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// locally typical sampling tail (v1.6), row-decomposed: the smallest
+// band of the value-sorted window (contiguous, because the shifted
+// surprise is U-shaped) whose mass reaches typical * total. The
+// band-touching-window-tail check (hi == k - 1 && k < n && mass short)
+// sends the row back for widening — same trust boundary as the
+// single-row version.
+__global__ void sample_typical_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int n, float typical,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const float* __restrict__ totals, const float* __restrict__ svals,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const float total = totals[row];
+    const float m = svals[row] / total;
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+    const float need = typical * total;
+    // find the shifted valley (the U-shape's minimum)
+    int amin = 0;
+    float best = fabsf(logf(exps[0]) - m);
+    for (int i = 1; i < k; ++i) {
+        const float d = fabsf(logf(exps[i]) - m);
+        if (d < best) { best = d; amin = i; }
+    }
+    int blo = amin, bhi = amin;
+    float band_mass = exps[amin];
+    // two-pointer: grow the band in ascending shifted order (merging
+    // the valley's two monotone arms)
+    while (band_mass < need && (blo > 0 || bhi < k - 1)) {
+        const float dl = (blo > 0)
+            ? fabsf(logf(exps[blo - 1]) - m) : 1e30f;
+        const float dr = (bhi < k - 1)
+            ? fabsf(logf(exps[bhi + 1]) - m) : 1e30f;
+        if (dl <= dr) { --blo; band_mass += exps[blo]; }
+        else { ++bhi; band_mass += exps[bhi]; }
+    }
+    if (band_mass < need && k < n) {
+        cumws[row] = band_mass;
+        return;
+    }
+    const float u = splitmix_uniform(seeds[row]);
+    const float target = u * band_mass;
+    float cum = 0.0f;
+    int idx = bhi;
+    for (int i = blo; i <= bhi; ++i) {
+        cum += exps[i];
+        if (cum >= target) { idx = i; break; }
+    }
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
 // per-chunk attempt sequencer for the nucleus samplers (topp = mode 0,
 // minp = mode 1). Drives the shared kernel sequence above through the
 // uniform-window widening loop described in the section note.
@@ -2816,7 +3352,8 @@ std::vector<long long> sample_nucleus_batched_chunk(
                 std::string("batch args upload failed: ") +
                 cudaGetErrorString(up1 != cudaSuccess ? up1 : up2));
         batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
-            tail.tokens, tail.cumws, tail.totals, tail.active, rows);
+            tail.tokens, tail.cumws, tail.totals, tail.svals, tail.active,
+            rows);
         cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
         const int grid = rows * gpr;
         const bool full = (window == n);
@@ -2829,12 +3366,19 @@ std::vector<long long> sample_nucleus_batched_chunk(
                 x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
             check_launch("batch selection launch");
         }
-        if (mode == 0) {
+        if (mode != 1) {
+            // topp/eta/typical: the mass passes run per attempt (the
+            // per-attempt head memset zeroes their tail/head slots);
+            // entropy_b (modes 2/3) adds the entropy accumulator
             expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                 x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
             exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                 x, ws, stride, n, inv_t, tail.totals, gpr, tail.active,
                 kNoPenB);
+            if (mode >= 2) {
+                entropy_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    x, ws, stride, n, inv_t, tail.svals, gpr, tail.active);
+            }
             check_launch("batch mass launch");
         }
         if (mode == 0 && !full && window <= kSelEarlyOut) {
@@ -2878,13 +3422,29 @@ std::vector<long long> sample_nucleus_batched_chunk(
                     ws, stride, sorted_off, mate_off, window, n, thr,
                     tail.seeds, tail.tokens, tail.cumws, tail.totals,
                     tail.active);
-            else
+            else if (mode == 1)
                 sample_minp_serial_b_kernel<<<rows, 32,
                                               walk_cp_slots(window) *
                                                   sizeof(float),
                                               cs>>>(
                     ws, stride, sorted_off, mate_off, window, n, thr,
                     tail.seeds, tail.tokens, tail.cumws, tail.active);
+            else if (mode == 2)
+                sample_eta_serial_b_kernel<<<rows, 32,
+                                             walk_cp_slots(window) *
+                                                 sizeof(float),
+                                             cs>>>(
+                    ws, stride, sorted_off, mate_off, window, n, thr,
+                    tail.seeds, tail.tokens, tail.cumws, tail.totals,
+                    tail.svals, tail.active);
+            else
+                sample_typical_serial_b_kernel<<<rows, 32,
+                                                 walk_cp_slots(window) *
+                                                     sizeof(float),
+                                                 cs>>>(
+                    ws, stride, sorted_off, mate_off, window, n, thr,
+                    tail.seeds, tail.tokens, tail.cumws, tail.totals,
+                    tail.svals, tail.active);
             check_launch("batch tail launch");
         }
         cudaError_t err = cudaStreamSynchronize(cs);
@@ -2951,13 +3511,33 @@ std::vector<long long> sample_nucleus_batched_chunk(
                 if (active[r]) total[r] = (double)tot_h[r];
         }
         long long want = (long long)window * 8;
+        // eta (mode 2) derives its cutoff from the entropy accumulator:
+        // read svals alongside the totals to compute the per-row
+        // threshold, then reuse min-p's sufficient bound
+        std::vector<float> sv_h(rows, 0.0f);
+        if (mode == 2) {
+            if (cudaMemcpy(sv_h.data(), tail.svals, (size_t)rows * 4,
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("batch svals readback failed");
+        }
         for (int r = 0; r < rows; ++r) {
             if (!active[r]) continue;
-            const long long lb = (mode == 0)
-                ? topp_widen_bound(window, (double)thr, total[r],
-                                   (double)cum_h[r])
-                : minp_widen_bound(window, (double)thr, total[r],
-                                   (double)cum_h[r]);
+            long long lb = (long long)window * 8;
+            if (mode == 0)
+                lb = topp_widen_bound(window, (double)thr, total[r],
+                                      (double)cum_h[r]);
+            else if (mode == 1)
+                lb = minp_widen_bound(window, (double)thr, total[r],
+                                      (double)cum_h[r]);
+            else if (mode == 2) {
+                const double h_r =
+                    std::log(total[r]) - (double)sv_h[r] / total[r];
+                const double cut =
+                    (double)thr * std::fmin(1.0, std::exp(-h_r));
+                lb = minp_widen_bound(window, cut, total[r],
+                                      (double)cum_h[r]);
+            }
+            // mode 3 (typical): no analytic bound — x8 ladder floor
             want = std::max<long long>(want, lb);
         }
         if (want >= n) {
@@ -3039,7 +3619,8 @@ std::vector<long long> decode_step_batched_chunk(
                                     : up2 != cudaSuccess ? up2
                                     : up3 != cudaSuccess ? up3 : up4));
         batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
-            tail.tokens, tail.cumws, tail.totals, tail.active, rows);
+            tail.tokens, tail.cumws, tail.totals, tail.svals, tail.active,
+            rows);
         // one contiguous clear over stripes + bitmaps (the bitmaps are
         // ORed, so they must start zero every attempt)
         cudaMemsetAsync(ws, 0,
@@ -3201,7 +3782,8 @@ std::vector<long long> sample_topk_batched_chunk(
             std::string("batch args upload failed: ") +
             cudaGetErrorString(up1 != cudaSuccess ? up1 : up2));
     batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
-        tail.tokens, tail.cumws, tail.totals, tail.active, rows);
+        tail.tokens, tail.cumws, tail.totals, tail.svals, tail.active,
+        rows);
     cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
     const int grid = rows * gpr;
     const bool full = (k == n);
@@ -3371,6 +3953,57 @@ std::vector<long long> decode_step_batched_launch(
         auto chunk = decode_step_batched_chunk(
             x + (size_t)c * n, b, n, ids.data() + offs[c], local.data(),
             local[b], penalty, p, t, seeds.data() + c, stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
+std::vector<long long> sample_eta_batched_launch(
+    const float* x, int rows, int n, float eta, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(eta > 0.0f && eta <= 1.0f))
+        throw std::invalid_argument("eta must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, eta, t, 2, seeds.data() + c, stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
+std::vector<long long> sample_typical_batched_launch(
+    const float* x, int rows, int n, float typical, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(typical > 0.0f && typical <= 1.0f))
+        throw std::invalid_argument("typical must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, typical, t, 3, seeds.data() + c,
+            stream);
         std::copy(chunk.begin(), chunk.end(), out.begin() + c);
     }
     return out;

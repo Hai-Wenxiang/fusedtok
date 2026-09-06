@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace fusedtok {
@@ -250,6 +251,191 @@ long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
         if (cum >= target) return (long long)order[i];
     }
     return (long long)order[nucleus - 1];     // float rounding fallback
+}
+
+// eta-cutoff sampling (v1.6, Hewitt et al. 2022): keep every token with
+// p_i >= eta * min(1, exp(-H)), H the distribution entropy in nats,
+// renormalize within the kept prefix and inverse-CDF the splitmix-hash
+// uniform. Prefix cut on a VALUE threshold of the normalized
+// probability (p_i = exp / total), so the structure mirrors
+// sample_minp_cpu; the entropy uses exact exp/log here while the device
+// derives it from __expf accumulators - the usual neighboring-draw
+// caveat on rounding boundaries applies, and the accumulated H itself
+// can drift ~ulps between paths (same class as top-p's atomic total).
+long long sample_eta_cpu(const std::vector<float>& logits, float eta,
+                         float t, unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (!(eta > 0.0f && eta <= 1.0f))
+        throw std::invalid_argument("eta must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    // order indices by (logit/T desc, index asc) - the packed-key order
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+
+    // total and entropy accumulator (double: the entropy is the one
+    // quantity both the cutoff and the widening bound derive from)
+    double total = 0.0;
+    double s_acc = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double e = mass_at(i);
+        const double lv = (double)(logits[order[i]] * inv_t) - row_max;
+        total += e;
+        s_acc += e * lv;
+    }
+    const double h = std::log(total) - s_acc / total;
+    const double cutoff_p =
+        (double)eta * std::fmin(1.0, std::exp(-h));   // absolute prob
+
+    // nucleus: prefix while p_i >= cutoff (p of the rank-0 element is
+    // the max probability, which bounds the weighted geometric mean
+    // cutoff, so the nucleus is never empty for a valid eta)
+    float nucleus_mass = 0.0f;
+    size_t nucleus = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double p = mass_at(i) / total;
+        if (p < cutoff_p) { nucleus = i; break; }
+        nucleus_mass += mass_at(i);
+        nucleus = i + 1;
+    }
+    if (nucleus == 0) nucleus = 1;   // min-token guard against drift
+
+    // splitmix64-finalized uniform, identical to the device side
+    const float u = splitmix_uniform(seed);
+
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    for (size_t i = 0; i < nucleus; ++i) {
+        cum += mass_at(i);
+        if (cum >= target) return (long long)order[i];
+    }
+    return (long long)order[nucleus - 1];     // float rounding fallback
+}
+
+// locally typical sampling (v1.6, Meister et al. 2022): keep the
+// smallest value-ordered band whose mass reaches typical * total. The
+// shifted surprise |lv_i - m| (lv the max-shifted logit, m its
+// p-weighted mean) is U-shaped along the descending-p order, so the
+// band is a contiguous slice found by expanding from the valley with
+// two pointers; the draw renormalizes inside the band replaying its
+// cumsum in ascending index order - identical structure to the device
+// serial kernel, exact exp/log here (neighboring-draw caveat on
+// rounding boundaries as usual).
+long long sample_typical_cpu(const std::vector<float>& logits, float typical,
+                             float t, unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (!(typical > 0.0f && typical <= 1.0f))
+        throw std::invalid_argument("typical must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    // order indices by (logit/T desc, index asc) - the packed-key order
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+
+    double total = 0.0;
+    double s_acc = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double e = mass_at(i);
+        const double lv = (double)(logits[order[i]] * inv_t) - row_max;
+        total += e;
+        s_acc += e * lv;
+    }
+    const double m = s_acc / total;   // p-mean of lv; shifted = |lv - m|
+
+    auto shifted_at = [&](size_t i) {
+        return std::fabs((double)(logits[order[i]] * inv_t) - row_max - m);
+    };
+
+    // the valley seeds the band; two-pointer grows it in ascending
+    // shifted order (merging the two monotone arms) until the band mass
+    // reaches typical * total
+    size_t amin = 0;
+    double best = shifted_at(0);
+    for (size_t i = 1; i < n; ++i) {
+        const double d = shifted_at(i);
+        if (d < best) { best = d; amin = i; }
+    }
+    size_t lo = amin, hi = amin;
+    double mass = (double)mass_at(amin);
+    const double need = (double)typical * total;
+    while (mass < need && (lo > 0 || hi < n - 1)) {
+        const double dl = (lo > 0) ? shifted_at(lo - 1)
+                                   : std::numeric_limits<double>::infinity();
+        const double dr = (hi < n - 1)
+                              ? shifted_at(hi + 1)
+                              : std::numeric_limits<double>::infinity();
+        if (dl <= dr) { --lo; mass += (double)mass_at(lo); }
+        else { ++hi; mass += (double)mass_at(hi); }
+    }
+
+    // splitmix64-finalized uniform, identical to the device side
+    const float u = splitmix_uniform(seed);
+
+    const double target = (double)u * mass;
+    double cum = 0.0;
+    for (size_t i = lo; i <= hi; ++i) {
+        cum += (double)mass_at(i);
+        if (cum >= target) return (long long)order[i];
+    }
+    return (long long)order[hi];              // float rounding fallback
+}
+
+std::vector<long long> sample_eta_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float eta, float t,
+    const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_eta_cpu(std::vector<float>(row, row + n),
+                                      eta, t, seeds[r]));
+    }
+    return out;
+}
+
+std::vector<long long> sample_typical_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float typical,
+    float t, const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_typical_cpu(std::vector<float>(row, row + n),
+                                          typical, t, seeds[r]));
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

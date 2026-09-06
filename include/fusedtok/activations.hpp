@@ -98,6 +98,26 @@ long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
 long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
                           float t, unsigned long long seed);
 
+// eta-cutoff sampling (v1.6, Hewitt et al. 2022): keep every token with
+// p_i >= eta * min(1, exp(-H)), H the distribution entropy in nats,
+// renormalize within that prefix and draw with the same seeded hash.
+long long sample_eta_cpu(const std::vector<float>& logits, float eta,
+                         float t, unsigned long long seed);
+
+// locally typical sampling (v1.6, Meister et al. 2022): keep the
+// smallest value-ordered band whose mass reaches typical * total (the
+// band groups tokens by |surprise - entropy|), renormalize inside it
+// and draw with the same seeded hash.
+long long sample_typical_cpu(const std::vector<float>& logits,
+                             float typical, float t,
+                             unsigned long long seed);
+std::vector<long long> sample_eta_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float eta, float t,
+    const std::vector<unsigned long long>& seeds);
+std::vector<long long> sample_typical_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float typical,
+    float t, const std::vector<unsigned long long>& seeds);
+
 // Batched variants (v1.4): logits is rows x n row-major, one seed per
 // row, one token per row returned. Semantics are the row-wise singles
 // (identical arithmetic per row by construction).
