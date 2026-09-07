@@ -35,6 +35,7 @@ FROZEN_API = frozenset({
     "temperature",
     "repetition_penalty",
     "logit_penalties",
+    "logit_penalties_batched",
     "argmax",
     "topk",
     "topp",

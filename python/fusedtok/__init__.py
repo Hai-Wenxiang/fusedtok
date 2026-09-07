@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 __all__ = [
     "cuda_available",
@@ -53,6 +53,7 @@ __all__ = [
     "temperature",
     "repetition_penalty",
     "logit_penalties",
+    "logit_penalties_batched",
     "argmax",
     "topk",
     "topp",
@@ -1280,6 +1281,73 @@ def logit_penalties(logits, token_ids, *, repetition=1.0, presence=0.0,
             else _fusedtok.logit_penalties_cpu)
     res = call(arr, ids, repetition, presence, frequency)
     return _numpy_to_torch_like(res) if _is_torch(logits) else res
+
+
+def logit_penalties_batched(logits, token_ids, *, repetition=1.0,
+                            presence=0.0, frequency=0.0, ids_offsets=None,
+                            cuda=False):
+    """HF-style combined logit penalties for a whole batch, one call.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32). Every row
+    runs the exact ``logit_penalties`` pipeline over its own history -
+    CTRL repetition scale, then presence shift, then count-weighted
+    frequency shift - and the call returns the penalized logits with the
+    same shape and type family as the input (a CUDA torch tensor on the
+    zero-copy path, otherwise a CPU array/tensor of float32).
+
+    ``token_ids`` carries the per-row histories exactly like
+    :func:`decode_step_batched`: a ragged sequence of per-row sequences,
+    a 2-D integer array (every row contributes all its columns), or a
+    flat 1-D integer array plus ``ids_offsets`` (rows + 1 non-decreasing
+    entries starting at 0). Values must lie in ``[0, vocab)``.
+    ``repetition`` > 0 (1.0 disables the scale), ``presence`` and
+    ``frequency`` are plain shifts (0.0 disables). Duplicates never
+    stack: an id is penalized once per row with ``c`` = its count in
+    that row, entering only the frequency term.
+
+    Per-row deterministic (no seeds - the op is not stochastic); each
+    row's output is bit-identical to the single-row ``logit_penalties``
+    on that row, on every path. The per-row histograms ride a cached
+    workspace allocated outside stream captures, so the op is CUDA-graph
+    capturable after a warm-up call (a cold capture falls back to a
+    slower per-row path that needs ``out`` scratch internally - the
+    Python wrapper always returns a fresh tensor, so wrapper users are
+    unaffected).
+    """
+    if not repetition > 0.0:
+        raise ValueError("repetition must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        ids, offs = _batch_ids_arg(token_ids, ids_offsets, rows, n)
+        out = torch.empty_like(logits)
+        # ids/offs ride a small upload on the caller's stream (host
+        # arrays -> device), the same boundary as _ids_arg on the
+        # single-row op
+        ids_d = torch.from_numpy(ids).to(logits.device)
+        offs_d = torch.from_numpy(offs).to(logits.device)
+        _fusedtok.logit_penalties_batched_launch(
+            logits.data_ptr(), ids_d.data_ptr(), offs_d.data_ptr(),
+            out.data_ptr(), rows, n, repetition, presence, frequency,
+            _cuda_stream())
+        return out
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    ids, offs = _batch_ids_arg(token_ids, ids_offsets, rows, n)
+    if rows == 0:
+        out = np.empty((0, n), dtype=np.float32)
+    else:
+        call = (_fusedtok.logit_penalties_batched
+                if path == "staged"
+                else _fusedtok.logit_penalties_batched_cpu)
+        out = np.asarray(call(arr, rows, n, ids, offs, repetition,
+                              presence, frequency), dtype=np.float32)
+    return _numpy_to_torch_like(out) if _is_torch(logits) else out
 
 
 def quantize_int8(x):

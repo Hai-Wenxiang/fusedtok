@@ -52,6 +52,7 @@ __all__ = [
     "temperature",
     "repetition_penalty",
     "logit_penalties",
+    "logit_penalties_batched",
     "argmax",
     "topk",
     "topp",
@@ -106,6 +107,12 @@ def logit_penalties(logits: Array, token_ids: Array, *,
                     repetition: float = 1.0, presence: float = 0.0,
                     frequency: float = 0.0,
                     cuda: bool = False) -> Array: ...
+def logit_penalties_batched(logits: Array, token_ids: Array, *,
+                            repetition: float = 1.0,
+                            presence: float = 0.0,
+                            frequency: float = 0.0,
+                            ids_offsets: Optional[Array] = None,
+                            cuda: bool = False) -> Array: ...
 def argmax(x: Array, *, cuda: bool = False) -> int: ...
 def topk(x: Array, k: int, *,
          cuda: bool = False) -> "tuple[Array, Array]": ...

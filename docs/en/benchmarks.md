@@ -27,7 +27,7 @@ python benchmarks/bench.py            # full suite, a few minutes
   peaked row uses a +20 spike and the flat row uses near-uniform
   logits, so both regimes are deterministically what their labels say.
 - `--iters N` adjusts the per-round iteration count (60 for the
-  published runs, 100 by default for quick checks).
+  published runs; the default is 100).
 
 Output lands in `docs/benchmarks/`: one JSON + one single-panel
 speedup chart per GPU (file names carry the device name). The README
@@ -42,9 +42,9 @@ rounding.
 - **(honest)** marks rows where fusedtok loses: attention_prefill vs
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
   (0.40-0.58x), flat-distribution sample_topp vs torch's fully
-  parallel sort (0.15-0.27x for the singles; the batched flat rows
+  parallel sort (0.15-0.26x for the singles; the batched flat rows
   fall to 0.05-0.06x - see the batched table) and the wide-nucleus
-  sample_minp row (0.27-0.45x - one widening retry plus a 32-64k
+  sample_minp row (0.27-0.39x - one widening retry plus a 32-64k
   sort; the torch boolean-mask composite never sorts). These are
   design-scope statements, not measurement noise - the
   [topic pages](usage.md) explain each one.

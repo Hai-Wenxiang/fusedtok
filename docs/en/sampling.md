@@ -233,11 +233,50 @@ penalized[id] = v
 - The id histogram rides a cached per-vocab workspace allocated outside
   stream captures (the attention-workspace pattern), so the op is CUDA
   graph capturable; a first call that races a capture borrows the
-  output buffer for the histogram instead, which is the one case where
-  `out` may not alias `logits` (the launcher raises a clear error on
-  that rare path). Warm up before capturing to keep in-place calls
-  available.
-- Single-row only; a batched variant is a future candidate.
+  output buffer for the histogram instead, which is the one case
+  where the internal launcher's `out` may not alias `logits` (it
+  raises a clear error on that rare path; the public wrapper always
+  returns a fresh tensor). Warm up before capturing to keep in-place
+  raw-launcher calls available.
+- The batched form lives in [its own section](#logit_penalties_batched---the-trio-for-a-whole-batch-v17)
+  below.
+
+## logit_penalties_batched - the trio for a whole batch (v1.7)
+
+```python
+penalized = fusedtok.logit_penalties_batched(batch_logits, histories,
+                                             repetition=1.2, presence=0.1,
+                                             frequency=0.05)
+```
+
+`logit_penalties_batched` applies the three penalties to a whole
+`[rows, vocab]` batch in one call. The per-row semantics are the
+single-row `logit_penalties` verbatim - the composition order, the
+once-per-distinct-id rule with `c` counted per row, the guards - so
+each row's output is **bit-identical** to running the single-row op on
+that row, on every path, cross-process included. Unlike the batched
+samplers there are no seeds (the op is not stochastic) and the result
+stays a device tensor on the zero-copy path.
+
+- `logits` is 2-D, contiguous, float32; the return matches the input's
+  type family (CUDA torch tensor for CUDA input, otherwise float32
+  CPU array/tensor).
+- `token_ids` carries the ragged per-row histories exactly like
+  `decode_step_batched`: a list of per-row id lists, a 2-D integer
+  array (every row contributes all its columns - pad with a valid id
+  and remember the pad gets its own count), or a flat 1-D integer
+  array plus `ids_offsets` (rows + 1 non-decreasing entries starting
+  at 0). Values must lie in `[0, vocab)`; host values are validated
+  before upload, device ids are trusted.
+- The per-row id histograms ride a cached per-(rows, vocab) workspace
+  allocated outside stream captures, so the op is CUDA graph
+  capturable after a warm-up call; a cold capture falls back to a
+  per-row path that borrows the row's output slice as histogram
+  scratch (slower, same result - the Python wrapper always returns a
+  fresh tensor, so wrapper users are unaffected). In-place `out ==
+  logits` through the raw launcher is available on the warm path.
+- Empty rows are an exact pass-through; an empty batch returns an
+  empty `[0, vocab]` result.
 
 ## Batched sampling - one call per decode step (v1.4)
 
@@ -313,7 +352,8 @@ returned (int64 on the host, same contract as the batched samplers).
   `decode_step` on peaked logits (3060: 1676 -> 321 µs; 5060 Ti:
   646 -> 145 µs) and 3.1x on mid-tail logits (3060: 17.3 -> 5.5 ms) -
   within ~20% of torch's native penalize + softmax +
-  batched-multinomial composite on the peaked rows.
+  batched-multinomial composite on the peaked 3060 wall probe
+  (the 5060 Ti table row sits lower - see the honest losses).
 
 ## The same-token guarantee
 
@@ -355,7 +395,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.15-0.27x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.15-0.26x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its

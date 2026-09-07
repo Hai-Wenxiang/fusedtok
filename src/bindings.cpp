@@ -192,23 +192,24 @@ void check_batch_temp(double t) {
 // are visible here, and the id arrays ride a host upload anyway, so
 // unlike device-resident lens/table data there is no sync to avoid.
 void check_batch_ids(const I64Array& ids, const I64Array& offs, int rows,
-                     int n) {
+                     int n, const char* what = "sampled_ids") {
     if (offs.size() != rows + 1)
         throw std::invalid_argument(
-            "sampled_ids offsets must have rows + 1 entries");
+            std::string(what) + " offsets must have rows + 1 entries");
     if (offs.size() == 0 || offs.at(0) != 0 ||
         offs.at(offs.size() - 1) != (long long)ids.size())
         throw std::invalid_argument(
-            "sampled_ids offsets must start at 0 and end at its length");
+            std::string(what) +
+            " offsets must start at 0 and end at its length");
     for (py::ssize_t i = 1; i < offs.size(); ++i)
         if (offs.at(i) < offs.at(i - 1))
             throw std::invalid_argument(
-                "sampled_ids offsets must be non-decreasing");
+                std::string(what) + " offsets must be non-decreasing");
     const long long* p = ids.data();
     for (py::ssize_t i = 0; i < ids.size(); ++i)
         if (p[i] < 0 || p[i] >= n)
             throw std::invalid_argument(
-                "sampled_ids entries must be in [0, vocab)");
+                std::string(what) + " entries must be in [0, vocab)");
 }
 float* dfm(py::int_ p) { return reinterpret_cast<float*>((uintptr_t)p); }
 const long long* dll(py::int_ p) { return reinterpret_cast<const long long*>((uintptr_t)p); }
@@ -896,6 +897,75 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("logits"), py::arg("token_ids"), py::arg("out"), py::arg("n"),
        py::arg("m"), py::arg("repetition"), py::arg("presence"),
        py::arg("frequency"), py::arg("stream") = 0);
+
+    // ==================================================================
+    // batched HF-style combined logit penalties (v1.7)
+    // ==================================================================
+    m.def("logit_penalties_batched_cpu",
+          [](FArray logits, int rows, int n, const I64Array& ids,
+             const I64Array& offs, double repetition, double presence,
+             double frequency) {
+        check_batch_host(logits, rows, n);
+        check_batch_ids(ids, offs, rows, n, "token_ids");
+        if (!(repetition > 0.0))
+            throw std::invalid_argument("repetition must be > 0");
+        std::vector<float> out = ft::logit_penalties_batched_cpu(
+            to_vec(logits), rows, n,
+            std::vector<long long>(ids.data(), ids.data() + ids.size()),
+            std::vector<long long>(offs.data(), offs.data() + offs.size()),
+            (float)repetition, (float)presence, (float)frequency);
+        return wrap_vec(std::move(out),
+                        {(py::ssize_t)rows, (py::ssize_t)n});
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("repetition") = 1.0, py::arg("presence") = 0.0,
+       py::arg("frequency") = 0.0);
+
+    m.def("logit_penalties_batched",
+          [](FArray logits, int rows, int n, const I64Array& ids,
+             const I64Array& offs, double repetition, double presence,
+             double frequency) {
+        check_batch_host(logits, rows, n);
+        check_batch_ids(ids, offs, rows, n, "token_ids");
+        if (!(repetition > 0.0))
+            throw std::invalid_argument("repetition must be > 0");
+        const size_t count = (size_t)rows * n;
+        py::array_t<float> y({(py::ssize_t)rows, (py::ssize_t)n});
+        if (count == 0) return y;
+        DevBuf dx(count * 4);
+        h2d(dx.get(), logits.data(), count * 4);
+        DevBuf dids(ids.size() * sizeof(long long)),
+            doffs(offs.size() * sizeof(long long));
+        if (ids.size())
+            h2d(dids.get(), ids.data(), ids.size() * sizeof(long long));
+        h2d(doffs.get(), offs.data(), offs.size() * sizeof(long long));
+        DevBuf dy(count * 4);
+        ft::logit_penalties_batched_launch(
+            dx.fget(),
+            static_cast<const long long*>(dids.get()),
+            static_cast<const long long*>(doffs.get()),
+            rows, n, (float)repetition, (float)presence, (float)frequency,
+            reinterpret_cast<float*>(dy.get()));
+        d2h(y.mutable_data(), dy.get(), count * 4);
+        sync_device("logit_penalties_batched kernel");
+        return y;
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("repetition") = 1.0, py::arg("presence") = 0.0,
+       py::arg("frequency") = 0.0);
+
+    m.def("logit_penalties_batched_launch",
+          [](py::int_ logits, py::int_ ids, py::int_ offs, py::int_ out,
+             int rows, int n, float repetition, float presence,
+             float frequency, std::uintptr_t stream) {
+        // raw surface: everything is a device pointer (like the
+        // single-row launch). Allocation-free so the call is CUDA-graph
+        // capturable; the Python wrapper uploads host id arrays outside
+        // captures and passes device pointers
+        ft::logit_penalties_batched_launch(
+            df(logits), dll(ids), dll(offs), rows, n, repetition, presence,
+            frequency, dfm(out), stream);
+    }, py::arg("logits"), py::arg("token_ids"), py::arg("ids_offsets"),
+       py::arg("out"), py::arg("rows"), py::arg("n"), py::arg("repetition"),
+       py::arg("presence"), py::arg("frequency"), py::arg("stream") = 0);
 
     // ==================================================================
     // fused nucleus sampling: softmax -> nucleus -> inverse-CDF draw

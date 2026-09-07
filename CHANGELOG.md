@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-09-07
+
+The combined penalty operator goes batched. 44 public names; 589
+tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2).
+
+### Added
+- **`logit_penalties_batched(logits, token_ids, *, repetition,
+  presence, frequency, ids_offsets)`** - the HF sampling-penalty trio
+  for a whole `[rows, vocab]` batch in one call, with ragged per-row
+  histories in `decode_step_batched`'s layout (per-row lists, a 2-D id
+  array, or flat ids plus offsets). Per-row semantics are the 1.6.1
+  single-row op verbatim - each row's output is bit-identical to
+  `logit_penalties` on that row (the CPU reference dispatches per row;
+  the GPU runs one histogram kernel per batch plus a flat apply
+  kernel). The per-row histograms ride a workspace cached per
+  (rows, vocab), allocated outside stream captures, so the hot path is
+  CUDA-graph capturable; workspace-free fallbacks (cold capture race,
+  allocation failure) borrow the output buffer itself as the histogram
+  scratch and never read the offsets on the host. Exactness detail:
+  both apply kernels force separate roundings for the frequency term
+  (`__fmul_rn` / `__fsub_rn`) - ptxas's FFMA fusion would otherwise
+  let the GPU differ from the host reference by 1 ulp when a row's
+  count reaches 2. API count 43 -> 44.
+
+### Docs
+- Post-release bilingual audit: the flat-topp README prose still said
+  0.16x / 0.37x (now 0.15x / 0.27x), the roadmap 1.6.1 row sat before
+  1.6, the zh sampler enumeration missed eta/typical, the multinomial
+  description in the en FAQ said boolean-mask instead of
+  cumulative-sum, the ~20% batched decode-step claim is now scoped to
+  the 3060 wall probe, plus a stiff-phrasing and rounding sweep across
+  both languages.
+
 ## [1.6.1] - 2026-09-07
 
 The combined HF penalty operator, plus audit-driven hardening of the

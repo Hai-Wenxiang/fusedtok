@@ -89,7 +89,11 @@ __global__ void logit_penalties_kernel(const float* x, const int* counts,
     if (c > 0) {
         if (repetition != 1.0f) v = v > 0.0f ? v / repetition : v * repetition;
         if (presence != 0.0f) v -= presence;
-        if (frequency != 0.0f) v -= (float)c * frequency;
+        // __fmul_rn/__fsub_rn keep both roundings separate: ptxas would
+        // otherwise fuse this into one FFMA (single rounding) and the
+        // host reference (two roundings) could differ by 1 ulp
+        if (frequency != 0.0f)
+            v = __fsub_rn(v, __fmul_rn((float)c, frequency));
     }
     y[i] = v;
 }
@@ -230,6 +234,223 @@ void repetition_penalty_launch(const float* logits, const long long* ids,
     if (err != cudaSuccess)
         throw std::runtime_error(std::string("repetition_penalty kernel launch: ") +
                                  cudaGetErrorString(err));
+}
+
+// ---------------------------------------------------------------------------
+// Batched HF-style combined logit penalties (v1.7): the single-row trio
+// above, one call for a whole [rows, n] batch. Rows carry ragged id
+// histories (flat ids + rows+1 offsets, decode_step_batched's layout);
+// the semantics are per-row IDENTICAL to logit_penalties - the CTRL
+// repetition scale, then the presence shift, then c * frequency with c
+// the id's count IN THAT ROW - so each row's output is bit-identical to
+// running the single-row op on the row (integer counts, no output
+// atomics, same-order IEEE float ops; the batched CPU reference simply
+// calls the single-row one per row).
+// ---------------------------------------------------------------------------
+
+// One block per row: bump the row's histogram buckets for its id range.
+// rows with empty ranges contribute nothing; out-of-range ids are host-
+// validated on every path - the guard keeps a bad device-resident id
+// array (trusted, not synced) from corrupting memory.
+namespace {
+
+__global__ void penalty_count_b_kernel(const long long* ids,
+                                       const long long* offs, int n,
+                                       int* counts) {
+    const int row = blockIdx.x;
+    const long long begin = offs[row];
+    const long long end = offs[row + 1];
+    const long long m = end - begin;
+    for (long long j = threadIdx.x; j < m; j += blockDim.x) {
+        const long long id = ids[begin + j];
+        if (id >= 0 && id < (long long)n)
+            atomicAdd(&counts[(size_t)row * n + id], 1);
+    }
+}
+
+// One thread per (row, vocab slot): the single-row apply formula at a
+// flat row-major index. grid_for rounds the grid up, so threads past
+// the total exit early. Reads x (never y), so in-place out == logits
+// stays safe on the cached-workspace path.
+__global__ void logit_penalties_b_kernel(const float* x, const int* counts,
+                                         long long total, int n,
+                                         float repetition, float presence,
+                                         float frequency, float* y) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int row = (int)(i / n);
+    const int col = (int)(i % (long long)n);
+    float v = x[i];
+    const int c = counts[(size_t)row * n + col];
+    if (c > 0) {
+        if (repetition != 1.0f) v = v > 0.0f ? v / repetition : v * repetition;
+        if (presence != 0.0f) v -= presence;
+        // separate roundings so the host reference (mul then sub)
+        // stays bit-identical - see the single-row kernel note
+        if (frequency != 0.0f)
+            v = __fsub_rn(v, __fmul_rn((float)c, frequency));
+    }
+    y[i] = v;
+}
+
+} // namespace
+
+std::vector<float> logit_penalties_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<long long>& token_ids,
+    const std::vector<long long>& offs, float repetition, float presence,
+    float frequency) {
+    if (!(repetition > 0.0f))
+        throw std::invalid_argument("repetition must be > 0");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
+    if (offs.size() != (size_t)rows + 1 || offs.size() == 0 ||
+        offs.front() != 0 ||
+        offs.back() != (long long)token_ids.size())
+        throw std::invalid_argument(
+            "token_ids offsets must have rows + 1 entries, start at 0 "
+            "and end at the id count");
+    for (size_t i = 1; i < offs.size(); ++i)
+        if (offs[i] < offs[i - 1])
+            throw std::invalid_argument(
+                "token_ids offsets must be non-decreasing");
+    for (long long id : token_ids)
+        if (id < 0 || id >= (long long)n)
+            throw std::invalid_argument("token id out of range");
+    std::vector<float> y((size_t)rows * n);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        // per-row semantics are the single-row op verbatim: dispatch to
+        // it so the bit-exact contract holds by construction
+        const std::vector<long long> row_ids(
+            token_ids.begin() + offs[r], token_ids.begin() + offs[r + 1]);
+        std::vector<float> out = logit_penalties_cpu(
+            std::vector<float>(row, row + n), row_ids, repetition,
+            presence, frequency);
+        std::copy(out.begin(), out.end(), y.begin() + (size_t)r * n);
+    }
+    return y;
+}
+
+namespace {
+
+// Per-(rows, n) histogram buffers (rows * n ints, 4 MiB at the standard
+// [8, 131072] bench shape). Allocated OUTSIDE stream captures (the
+// attention-workspace pattern); a first use that races an active
+// capture - or an allocation failure - falls back to running the
+// single-row kernels per row with the row's own output slice as the
+// histogram scratch (same byte count, cleared then rewritten), which
+// needs no extra memory and no allocation.
+std::mutex& bpen_ws_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::map<std::pair<int, int>, int*>& bpen_ws_cache() {
+    static std::map<std::pair<int, int>, int*> c;
+    return c;
+}
+
+} // namespace
+
+// Workspace-free fallback shared by the capture-race and allocation-
+// failure paths: clear the WHOLE output buffer, histogram the ids into
+// it (an int view - counts fit exactly because counts and logits have
+// the same element count), then let the apply pass read those counts
+// and overwrite the buffer with the result. Never touches offs on the
+// host, needs no allocation, and every launch is capture-safe.
+void borrow_output_fallback(const float* logits, const long long* ids,
+                            const long long* offs, int rows, int n,
+                            float repetition, float presence,
+                            float frequency, float* y, cudaStream_t cs) {
+    const long long total = (long long)rows * n;
+    cudaError_t err = cudaMemsetAsync(y, 0, (size_t)total * sizeof(int), cs);
+    if (err == cudaSuccess)
+        penalty_count_b_kernel<<<rows, kBlock, 0, cs>>>(
+            ids, offs, n, reinterpret_cast<int*>(y));
+    if (err == cudaSuccess)
+        logit_penalties_b_kernel<<<(unsigned)grid_for(total), kBlock,
+                                   0, cs>>>(
+            logits, reinterpret_cast<const int*>(y), total, n, repetition,
+            presence, frequency, y);
+    if (err == cudaSuccess)
+        err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(
+            std::string("logit_penalties_batched kernel launch: ") +
+            cudaGetErrorString(err));
+}
+
+void logit_penalties_batched_launch(const float* logits,
+                                    const long long* ids,
+                                    const long long* offs, int rows, int n,
+                                    float repetition, float presence,
+                                    float frequency, float* y,
+                                    std::uintptr_t stream) {
+    if (rows <= 0 || n <= 0) return;
+    if (!(repetition > 0.0f))
+        throw std::invalid_argument("repetition must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    int* counts = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(bpen_ws_mutex());
+        const auto key = std::make_pair(rows, n);
+        auto it = bpen_ws_cache().find(key);
+        if (it != bpen_ws_cache().end()) {
+            counts = it->second;
+        } else if (stream_is_capturing(cs)) {
+            // first use raced an active capture: borrow the WHOLE
+            // output buffer as the histogram scratch for THIS call
+            // (same byte count as counts, cleared then rewritten by
+            // the apply pass). Aliased in-place calls have no safe
+            // form here; every non-capturing later call populates the
+            // cache
+            if (y == logits)
+                throw std::invalid_argument(
+                    "logit_penalties_batched: out must not alias logits "
+                    "when capture races first use; call once outside "
+                    "capture first");
+            borrow_output_fallback(logits, ids, offs, rows, n, repetition,
+                                   presence, frequency, y, cs);
+            return;
+        } else {
+            int* buf = nullptr;
+            if (cudaMalloc(&buf, (size_t)rows * n * sizeof(int))
+                    != cudaSuccess) {
+                cudaGetLastError();
+                // allocation failed: same borrowed-output fallback
+                if (y == logits)
+                    throw std::invalid_argument(
+                        "logit_penalties_batched: out must not alias "
+                        "logits when the counts workspace cannot be "
+                        "allocated");
+                borrow_output_fallback(logits, ids, offs, rows, n,
+                                       repetition, presence, frequency, y,
+                                       cs);
+                return;
+            }
+            counts = buf;
+            bpen_ws_cache().emplace(key, buf);
+        }
+    }
+    // zero the histograms, count the ids, then rewrite the logits (all
+    // stream-ordered, still async)
+    cudaError_t err = cudaMemsetAsync(counts, 0,
+                                      (size_t)rows * n * sizeof(int), cs);
+    if (err == cudaSuccess)
+        penalty_count_b_kernel<<<rows, kBlock, 0, cs>>>(ids, offs, n,
+                                                        counts);
+    if (err == cudaSuccess)
+        logit_penalties_b_kernel<<<(unsigned)grid_for((long long)rows * n),
+                                   kBlock, 0, cs>>>(
+            logits, counts, (long long)rows * n, n, repetition, presence,
+            frequency, y);
+    if (err == cudaSuccess)
+        err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(
+            std::string("logit_penalties_batched kernel launch: ") +
+            cudaGetErrorString(err));
 }
 
 // ---------------------------------------------------------------------------

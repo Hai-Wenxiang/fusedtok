@@ -30,8 +30,8 @@ https://developer.nvidia.com/cuda-gpus 查计算能力。
 ## 为什么第一次调用偏慢？
 
 每个形状的首次调用可能做一次性工作：分配 workspace
-（attention 切分路径、选择管线）或微基准测试启动配置（行
-kernel 线程块、qgemm tile）。选择结果会按进程缓存。捕获
+（attention 切分路径、选择管线）或对启动配置（行
+kernel 线程块、qgemm tile）做微基准调优。选择结果会按进程缓存。捕获
 CUDA graph 或计时之前先热身一次（见
 [执行模型](execution.md#流与-cuda-graph)）。
 
@@ -65,7 +65,7 @@ torch 的组合参考（softmax、必要时布尔掩码，再加 multinomial）�
 排序——multinomial 直接对整个分布做前缀和抽签。fusedtok 的采样器
 必须给核**排序**（选择管线的职责），而接近
 均匀的 logits 下核约占九成词表，所以这个场景下如实落后（批量
-0.05-0.06x、单行 0.15-0.27x）。真实解码的 logits 是尖峰状的，那
+0.05-0.06x、单行 0.15-0.26x）。真实解码的 logits 是尖峰状的，那
 才是采样器与原生 multinomial 同档甚至更快的场景。细节见
 [采样——平坦分布](sampling.md#平坦分布如实的最坏情况)。
 

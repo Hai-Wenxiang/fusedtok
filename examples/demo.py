@@ -318,6 +318,54 @@ def main():
             print(f"  {f'seed {seed} cuda matches cpu':<26} {'PASS' if ok else 'FAIL'}")
             ALL_OK &= ok
 
+    print("sample_eta / sample_typical: entropy-adaptive samplers (v1.6)")
+    # eta: the cutoff derives from the entropy - compute it and check
+    # the draws stay inside the eta nucleus
+    logits64 = lg.astype(np.float64) / 0.8
+    e = np.exp(logits64 - logits64.max())
+    p64 = e / e.sum()
+    h = float(-(p64 * np.log(p64)).sum())
+    cutoff = 0.3 * min(1.0, float(np.exp(-h)))
+    nucleus = set(np.flatnonzero(p64 >= cutoff).tolist())
+    draws = {fusedtok.sample_eta(lg, 0.3, temperature=0.8, seed=s)
+             for s in range(16)}
+    ok = bool(draws) and draws.issubset(nucleus)
+    print(f"  {'eta draws stay in the eta nucleus':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    # typical = 1.0 must never throw (the 1.6.1 full-window fix)
+    ok = all(0 <= int(fusedtok.sample_typical(lg, 1.0, temperature=0.8,
+                                              seed=s)) < lg.size
+             for s in range(4))
+    print(f"  {'typical=1 covers, never throws':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    if have_cuda and HAS_TORCH:
+        lte = torch.from_numpy(lg).cuda()
+        for seed in (0, 7):
+            ok = fusedtok.sample_eta(lte, 0.3, temperature=0.8,
+                                     seed=seed) ==                 fusedtok.sample_eta(lg, 0.3, temperature=0.8, seed=seed)
+            print(f"  {f'seed {seed} cuda matches cpu':<26} {'PASS' if ok else 'FAIL'}")
+            ALL_OK &= ok
+
+    print("batched sampling + batched penalties: one call per batch")
+    b8 = rng.standard_normal((8, lg.size)).astype(np.float32)
+    b8[range(8), rng.integers(0, lg.size, 8)] += 6.0
+    toks = fusedtok.sample_topp_batched(b8, 0.9, seeds=np.arange(8))
+    ok = (int(toks[0]) == int(fusedtok.sample_topp(b8[0], 0.9, seed=0)))
+    print(f"  {'topp_batched row 0 == single':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    ids = np.array([[3, 3, 7], [1] * 5, [], [2]], dtype=object)
+    pb = fusedtok.logit_penalties_batched(
+        b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
+        frequency=0.1, cuda=True) if have_cuda and HAS_TORCH else         fusedtok.logit_penalties_batched(
+            b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
+            frequency=0.1)
+    ph = fusedtok.logit_penalties_batched(
+        b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
+        frequency=0.1)
+    ok = (np.asarray(pb, dtype=np.float32) == ph).all()
+    print(f"  {'penalties_batched == host (exact)':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+
     print(SEP)
     print("attention: decode step, GQA + kv-cache + per-sequence lens")
     q = rng.standard_normal((2, 8, 16)).astype(np.float32)     # B=2 Hq=8 D=16
