@@ -89,6 +89,10 @@ tokens = fusedtok.decode_step_batched(batch_logits, histories,
 token = fusedtok.sample_eta(logits, eta=1e-3, temperature=0.8, seed=0)
 token = fusedtok.sample_typical(logits, typical=0.9,
                                 temperature=0.8, seed=0)
+
+# 组合版 HF 惩罚（v1.6.1）：一次调用，每个去重 id 只罚一次
+penalized = fusedtok.logit_penalties(logits, [3, 3, 7], repetition=1.2,
+                                     presence=0.1, frequency=0.05)
 ```
 
 仓库里的 `examples/demo.py` 会把每个算子都逐个演示一遍并与解析
@@ -100,7 +104,7 @@ token = fusedtok.sample_typical(logits, typical=0.9,
   CUDA graph、错误契约
 - [注意力算子](attention.md) —— 解码注意力、连续与分页 append 写侧、prefill
 - [采样与选择](sampling.md) —— top-k / top-p / min-p、熵自适应采样器
-  （eta、typical）、融合采样器、确定性契约
+  （eta、typical）、组合 logit 惩罚、确定性契约
 - [INT8 路径](int8.md) —— 量化工具与整数精确矩阵乘
 - [基准测试](benchmarks.md) —— 数字怎么测的、表格怎么读
 - [常见问题](faq.md) —— 排错与词汇表

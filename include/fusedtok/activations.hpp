@@ -86,6 +86,16 @@ std::vector<float> logit_penalties_cpu(const std::vector<float>& logits,
                                        float repetition, float presence,
                                        float frequency);
 
+// Batched form of logit_penalties over a [rows, n] logit batch with
+// ragged per-row id histories (decode_step_batched's flat-ids +
+// rows+1-offsets layout). Every row's output is bit-identical to the
+// single-row op on that row.
+std::vector<float> logit_penalties_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<long long>& token_ids,
+    const std::vector<long long>& offs, float repetition, float presence,
+    float frequency);
+
 // ---------------------------------------------------------------------------
 // Fused nucleus sampling (deterministic per seed):
 //   probs = softmax(logits / t); nucleus = smallest top-p prefix;

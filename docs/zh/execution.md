@@ -101,7 +101,7 @@ g.replay()                                  # 整批一次 replay
   主机侧 int64 张量/数组，而且扩窗循环要根据回读结果重新启动
   kernel——同样不可捕获（契约一致）。
 - `quantize_int8` / `qadd_int8` 必须把归约出的 scale 读回主机
-  才能组织第二遍 kernel，所以调用中途会同步一次调用方的流。
+  才能拼装第二遍 kernel，所以调用中途会同步一次调用方的流。
 - 零拷贝路径上，整数输入（attention 的 `lens`、分页的
   `block_table`、重复惩罚的 token id）如果本身就是 CUDA 张量，
   **直接信任**——校验它们的值需要同步流，而同步会破坏图捕获。

@@ -67,10 +67,10 @@ case may pick a neighboring token after a process restart. Details:
 ## Why is my batched sampler slower than torch on flat logits?
 
 `torch.multinomial` never sorts - it draws against the full
-distribution with a boolean-mask pass. The fusedtok samplers must
+distribution via a cumulative-sum pass. The fusedtok samplers must
 sort the nucleus (the selection pipeline), and on near-uniform
 logits the nucleus is ~90% of the vocabulary, so they honestly lose
-that regime (0.05-0.06x batched, 0.15-0.27x single-row). Real decode
+that regime (0.05-0.06x batched, 0.15-0.26x single-row). Real decode
 logits are peaked, where the samplers sit at native-multinomial
 level or better. Details:
 [sampling - flat distributions](sampling.md#flat-distributions---the-honest-worst-case).
@@ -86,8 +86,8 @@ application needs one.
 Yes, library-wide, with warm-up first. Exceptions: the fused samplers
 return host ints (each call ends in a readback) - the `_batched`
 samplers and `decode_step_batched` additionally re-launch kernels from
-a readback inside their widening loop, so whether they return
-int64 arrays or not, they stay outside graphs - and
+a readback inside their widening loop, so they stay outside graphs
+regardless of where their results land - and
 `quantize_int8`/`qadd_int8` sync once mid-call to compose their
 scales. The selection pipeline captures its
 own internal graph automatically - you do not manage it.

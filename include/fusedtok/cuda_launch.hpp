@@ -205,6 +205,21 @@ void repetition_penalty_launch(const float* logits, const long long* ids,
 void logit_penalties_launch(const float* logits, const long long* ids,
                             int n, int m, float repetition, float presence,
                             float frequency, float* y, std::uintptr_t stream = 0);
+// Batched form: rows carry ragged per-row histories (flat ids plus
+// rows + 1 non-decreasing offsets starting at 0, decode_step_batched's
+// layout; ids/offs are DEVICE pointers). Per-row semantics are the single-row penalties verbatim, so
+// each row's output is bit-identical to logit_penalties_launch on that
+// row. logits/y: [rows, n]. The per-row id histograms ride a cached
+// workspace allocated outside captures; a first call racing a capture
+// (or an allocation failure) falls back to a per-row loop that borrows
+// the row's output slice as histogram scratch - in-place out == logits
+// is therefore only available on the warm path, like the single-row op.
+void logit_penalties_batched_launch(const float* logits,
+                                    const long long* ids,
+                                    const long long* offs, int rows, int n,
+                                    float repetition, float presence,
+                                    float frequency, float* y,
+                                    std::uintptr_t stream = 0);
 
 
 // --- attention (decode step) -------------------------------------------------

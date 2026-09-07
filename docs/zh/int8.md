@@ -17,7 +17,7 @@ fusedtok 的 INT8 路径覆盖量化存储与量化计算：对称逐张量量�
 q, scale = fusedtok.quantize_int8(x)     # scale = max|x|/127，
                                          # 每条路径都返回 Python float
 x_back = fusedtok.dequantize_int8(q, scale)
-qy, s_out = fusedtok.qadd_int8(qa, sa, qb, sb)   # 融合 反量化-加-再量化
+qy, s_out = fusedtok.qadd_int8(qa, sa, qb, sb)   # 融合的反量化-加-再量化
 ```
 
 - `quantize_int8`：对称逐张量——`scale = max|x| / 127`，
@@ -33,7 +33,7 @@ qy, s_out = fusedtok.qadd_int8(qa, sa, qb, sb)   # 融合 反量化-加-再量�
 
 全库的启动器默认异步、不同步调用方的流——`quantize_int8` /
 `qadd_int8` 是唯一注明过的例外：第二遍 kernel 要用主机上的
-absmax 来组织，所以调用中途会同步一次调用方的流（拷贝走调用方
+absmax 来完成合成，所以调用中途会同步一次调用方的流（拷贝走调用方
 的流、且带错误检查）。
 
 ## 矩阵乘
@@ -56,7 +56,7 @@ y = fusedtok.qgemm_perchannel(a_q, a_scale, b_q, b_scales)
   TensorRT-LLM 风格的 W8A8）：激活带一个逐张量 scale，权重带
   **每个输出通道一个** scale（`b_scales[j]`，长度 N 的 float32
   向量）。逐通道 scale 能吃掉单一逐张量 scale 消化不了的权重
-  离群值——端到端测试实测，离群值上的量化误差降到约 1/5。
+  离群值——端到端测试实测，离群值上的量化误差降到原来的 1/5 以下。
 
 零拷贝路径要求 int8 且 C 连续的操作数（scale 向量为 float32）；
 非连续张量会被拒绝，而不是被读错。

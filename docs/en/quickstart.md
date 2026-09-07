@@ -95,6 +95,10 @@ tokens = fusedtok.decode_step_batched(batch_logits, histories,
 token = fusedtok.sample_eta(logits, eta=1e-3, temperature=0.8, seed=0)
 token = fusedtok.sample_typical(logits, typical=0.9,
                                 temperature=0.8, seed=0)
+
+# the combined HF penalties (v1.6.1): one call, once per distinct id
+penalized = fusedtok.logit_penalties(logits, [3, 3, 7], repetition=1.2,
+                                     presence=0.1, frequency=0.05)
 ```
 
 `examples/demo.py` in the repository tours every operator with
@@ -107,8 +111,8 @@ closed-form checks - it doubles as executable documentation.
 - [Attention operators](attention.md) - decode, paged caches, the
   contiguous and paged append write sides, prefill
 - [Sampling and selection](sampling.md) - top-k/top-p/min-p, the
-  entropy-adaptive samplers (eta, typical), fused samplers, and the
-  determinism contract
+  entropy-adaptive samplers (eta, typical), the combined logit
+  penalties, and the determinism contract
 - [The INT8 path](int8.md) - quantization and integer-exact GEMM
 - [Benchmarks](benchmarks.md) - how the numbers are measured and how to
   read them
