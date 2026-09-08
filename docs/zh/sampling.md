@@ -1,7 +1,8 @@
 # 采样与选择
 
 选择类算子（top-k、top-p、argmax）和融合采样器（`sample_topp`、
-`sample_topk`、`sample_minp`、`sample_eta`、`sample_typical`、
+`sample_topk`、`sample_minp`、`sample_topa`、`sample_nsigma`、
+`sample_eta`、`sample_typical`、
 `decode_step`，以及各自的 `_batched` 批量变体）共用一条管线和一份确定性契约，`logit_penalties` 则把 HF
 的三件惩罚合并成一次调用。这一页把两者讲清，包括
 CPU 与 GPU 抽签可能不一致的精确边界。
@@ -11,6 +12,8 @@ CPU 与 GPU 抽签可能不一致的精确边界。
 - [选择算子](#选择算子)
 - [融合采样器](#融合采样器)
 - [sample_minp——按最大值阈值截断的采样（v1.3）](#sample_minp按最大值阈值截断的采样v13)
+- [sample_topa——平方峰值截断采样（v1.8）](#sample_topa平方峰值截断采样v18)
+- [sample_nsigma——按离散度截断的采样（v1.8）](#sample_nsigma按离散度截断的采样v18)
 - [sample_eta——熵自适应截断采样（v1.6）](#sample_eta熵自适应截断采样v16)
 - [sample_typical——局部典型采样（v1.6）](#sample_typical局部典型采样v16)
 - [logit_penalties——一次调用套齐 HF 三件惩罚（v1.6.1）](#logit_penalties一次调用套齐-hf-三件惩罚v161)
@@ -29,6 +32,7 @@ CPU 与 GPU 抽签可能不一致的精确边界。
 i = fusedtok.argmax(logits)                # 并列时取最靠前的下标
 vals, idxs = fusedtok.topk(logits, 50)     # 降序，返回 (值, 下标)
 vals, idxs = fusedtok.topp(probs, 0.9)     # 输入是概率
+idxs = fusedtok.argmax_batched(batch_logits)   # 每行一个下标（v1.8）
 ```
 
 - `topk` 接原始分数，`k` 取值 `[0, n]`。
@@ -38,6 +42,16 @@ vals, idxs = fusedtok.topp(probs, 0.9)     # 输入是概率
 `argmax` 返回主机侧的 `int`，因此需要一次设备到主机的回读。
 零拷贝路径上 argmax 用两个自我复位的 workspace 槽位，让热路径
 只剩一次 kernel 启动、零额外分配（v1.2 优化）。
+
+`argmax_batched`（v1.8）把同样的规则按行跑在二维 `[行数, 词表]`
+的整批上——一次 launch 完成整批贪心解码，不需要种子也不需要
+温度。与单行版不同，它返回 int64 下标且零拷贝路径**不做主机
+回读**：CUDA 输入返回 CUDA 张量（与调用方的其他操作按流排序），
+CPU 输入返回 CPU 张量或 numpy 数组；这也让 launcher 可以做
+CUDA graph 捕获。每行的到达槽位每次调用清一次（整批一次小
+memset，不是每行一次），因为这片槽位与选择类算子的暂存区共用
+区域；每行的最后到达块发布该行的下标——就是单行的到达票据
+模式按行拆开。
 
 ## 融合采样器
 
@@ -99,6 +113,73 @@ min-p（出自 2024 年的 Min-P Sampling 论文，llama.cpp、vLLM 等推理栈
   其中 W 是失败窗口的宽度、C 是它的累计质量、T 是惰性计算的全局
   总量），宽核从此跳过 x8 阶梯的中间档位（宽核行约快 30%，token
   逐位不变）。
+
+## sample_topa——平方峰值截断采样（v1.8）
+
+```python
+tok = fusedtok.sample_topa(logits, top_a=0.2, temperature=0.8, seed=step)
+```
+
+top-a 采样（开源采样栈的 top-a 规则，HF transformers 以
+`TopALogitsWarper`、vLLM 以 `top_a` 之名支持）用**峰值平方**驱动的
+值阈值截断：保留所有概率不低于 `top_a × 最大概率²` 的 token，在核内
+重新归一化，再用同一个种子哈希抽签。平方是关键：门槛比峰值本身
+塌得更快，于是自信分布保住紧凑的头部，接近均匀的分布则几乎保留
+整个词表——同等取值下比 `min_p` 的自适应更强。
+
+- 取值范围：`top_a` 必须在 `(0, 1]` 内（越界抛 `ValueError`），
+  `temperature` 必须大于 0。
+- `top_a = 1.0` 的门槛是 `p_max²`：只有单个 dominant token 时退化为
+  贪心；但只要第二名 token 的概率仍够到平方峰值，两匹马就都留在
+  抽签池里（`min_p = 1.0` 在同样分布下只保留最大概率 token）。
+- 核永远至少保留一个 token：只要 `top_a <= 1`，门槛就不会超过最大
+  概率（因为 `p_max <= 1`），实现里另加 min-token 守卫，即使有浮点
+  误差这条下限也不会破。
+- 按种子确定，与其余采样器共用 RNG 与同 token 保证。截断阈值来自
+  全局 softmax 总量（一次浮点原子归约），因此与 top-p、eta 同属
+  文档记录的边界情形：CPU 对 GPU、跨运行在同一边界上的抽签可能取
+  相邻排名；同进程同输入缓冲内结果位稳定。
+- 实现说明：在按行最大归一的 exp 列（`exps[0] == 1.0`）里，
+  峰值概率是 `p_max = 1 / total`，截断值换算成 exp 阈值就是
+  `e_i >= top_a / total`——用 exptotal pass 已产出的总量做一次除法
+  即可，不需要额外归约。核和 min-p 一样是值阈值前缀，扩窗下界复用
+  min-p 的充分质量公式（除数换成推导出的截断值）；总量每次尝试都
+  重算（每次尝试的开头 memset 会清掉它的槽位），首次加宽后由主机
+  缓存——与 eta 的做法完全一致。
+
+## sample_nsigma——按离散度截断的采样（v1.8）
+
+```python
+tok = fusedtok.sample_nsigma(logits, nsigma=1.5, temperature=0.8,
+                             seed=step)
+```
+
+top-nσ 采样（Shi 等 2024 年论文 *Top-nσ: Not All Logits Are You
+Need*，Qwen 解码栈背后的极值过滤器）按分布**自身离散度**截断：先把
+logits 除以温度，保留所有缩放后 logit 不低于 `均值 − nsigma × 标准差`
+的 token（均值与标准差都对整行取），在核内重新归一化，再用同一个
+种子哈希抽签。截断和 min-p 一样是值阈值，只是写在 logit 空间里，
+连 softmax 归约都不需要——只要整行的前两阶矩。
+
+- 取值范围：`nsigma` 必须大于 0（越界抛 `ValueError`），
+  `temperature` 必须大于 0。论文的常用区间是 `1.0`–`3.0`：
+  `1.0` 大约把普通解码行裁到展开度最高的前三分之二，`3.0` 几乎
+  全保留；非常大的 `nsigma` 逼近普通采样。
+- 接近平坦的行全保留：`sigma -> 0` 时门槛落到每一个 logit 上
+  （全相等的行就是精确情形）。
+- 核永远至少保留一个 token：门槛不会超过行最大值（均值在最大值
+  下方，`nsigma × sigma >= 0`），实现里另加 min-token 守卫，即使有
+  浮点误差这条下限也不会破。
+- 按种子确定，与其余采样器共用 RNG 与同 token 保证。截断阈值来自
+  整行的矩累加器（逐线程舍入模式固定，块结果升为 double 后原子
+  加——方差的相减运算若用 float 会放大到达序漂移），因此属于
+  文档记录的边界情形：CPU 对 GPU 在同一边界上的抽签可能取相邻
+  排名；同进程同输入缓冲内结果位稳定。
+- 实现说明：记 `d = l - max`，门槛换算成 exp 阈值是
+  `exp(mean(d) - nsigma × sigma_d)`——与最大值无关且永不超过 1，
+  所以核是值阈值前缀，扩窗下界复用 min-p 的充分质量公式（除数换成
+  这个阈值）。每次尝试跑一遍 expmax 加一遍新的矩 pass（外加扩窗界
+  要用的全局总量），结构与 eta 一致。
 
 ## sample_eta——熵自适应截断采样（v1.6）
 
@@ -242,7 +323,8 @@ penalized = fusedtok.logit_penalties_batched(batch_logits, histories,
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 ```
 
-`sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched` /
+`sample_topp_batched` / `sample_minp_batched` / `sample_topa_batched` /
+`sample_nsigma_batched` / `sample_topk_batched` /
 `sample_eta_batched` / `sample_typical_batched`
 一次调用采样整个 `[行数, 词表]` 批，每行返回一个 token。返回值是
 **主机侧**的 int64：torch 输入回 CPU torch 张量，numpy 输入回 numpy

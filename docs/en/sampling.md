@@ -1,8 +1,9 @@
 # Sampling and selection
 
 The selection operators (top-k, top-p, argmax) and the fused samplers
-(`sample_topp`, `sample_topk`, `sample_minp`, `sample_eta`,
-`sample_typical`, `decode_step`, plus the `_batched` variants) share
+(`sample_topp`, `sample_topk`, `sample_minp`, `sample_topa`,
+`sample_nsigma`, `sample_eta`, `sample_typical`, `decode_step`, plus
+the `_batched` variants) share
 one pipeline and one determinism
 contract, and `logit_penalties` applies the HF penalty trio in one
 call. This page explains both, plus the exact boundary where CPU
@@ -13,6 +14,8 @@ and GPU draws may differ.
 - [Selection operators](#selection-operators)
 - [The fused samplers](#the-fused-samplers)
 - [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp---threshold-by-max-sampling-v13)
+- [sample_topa - squared-peak cutoff sampling (v1.8)](#sample_topa---squared-peak-cutoff-sampling-v18)
+- [sample_nsigma - sigma-spread cutoff sampling (v1.8)](#sample_nsigma---sigma-spread-cutoff-sampling-v18)
 - [sample_eta - entropy-adaptive cutoff sampling (v1.6)](#sample_eta---entropy-adaptive-cutoff-sampling-v16)
 - [sample_typical - locally typical sampling (v1.6)](#sample_typical---locally-typical-sampling-v16)
 - [logit_penalties - the HF penalty trio in one call (v1.6.1)](#logit_penalties---the-hf-penalty-trio-in-one-call-v161)
@@ -30,6 +33,7 @@ All selection ops resolve ties toward the **earliest index**.
 i = fusedtok.argmax(logits)                # earliest index on ties
 vals, idxs = fusedtok.topk(logits, 50)     # descending, (values, indices)
 vals, idxs = fusedtok.topp(probs, 0.9)     # input = probabilities
+idxs = fusedtok.argmax_batched(batch_logits)   # one index per row (v1.8)
 ```
 
 - `topk` takes raw scores, `k` in `[0, n]`.
@@ -40,6 +44,18 @@ vals, idxs = fusedtok.topp(probs, 0.9)     # input = probabilities
 device-to-host readback. On the zero-copy path `argmax` keeps two
 self-resetting workspace slots so the hot path is one kernel launch
 and no extra allocation (v1.2).
+
+`argmax_batched` (v1.8) runs the same rule per row of a 2-D
+`[rows, vocab]` batch in ONE launch - the greedy decode step for a
+whole batch, no seeds and no temperature. Unlike the single-row op it
+returns int64 indices with NO host readback on the zero-copy path: a
+CUDA tensor for CUDA input (stream-ordered with the caller's ops),
+a CPU tensor or numpy array otherwise, which also makes the launcher
+CUDA-graph capturable. The per-row arrival slots are cleared once per
+call (one small memset per batch, not per row) because the slots share
+workspace region selection calls also use; each row's block team
+publishes its index from the last-arriving block, exactly the
+single-row arrival-ticket pattern row-decomposed.
 
 ## The fused samplers
 
@@ -111,6 +127,93 @@ nucleus, draw with the same seeded hash.
   width, C its cumulated mass, and T the lazily-computed global
   total), so wide nuclei skip the x8 ladder's intermediate stops
   (~30% off the wide-nucleus row) with bit-identical tokens.
+
+## sample_topa - squared-peak cutoff sampling (v1.8)
+
+```python
+tok = fusedtok.sample_topa(logits, top_a=0.2, temperature=0.8, seed=step)
+```
+
+Top-a sampling (the top-a rule from the open-source sampling stack -
+deployed in HF transformers as `TopALogitsWarper` and in vLLM as
+`top_a`) truncates by a value threshold driven by the SQUARED peak:
+keep every token whose probability is at least `top_a` times the
+square of the maximum probability, renormalize within that nucleus,
+draw with the same seeded hash. The square is the whole point: the bar
+falls faster than the peak itself flattens, so a confident
+distribution keeps a tight head while a near-uniform one keeps almost
+the entire vocabulary - stronger adaptivity than `min_p` at the same
+setting.
+
+- `top_a` must be in `(0, 1]` (`ValueError` otherwise); `temperature`
+  must be greater than 0.
+- `top_a = 1.0` cutoffs at `p_max^2`: with one dominant token that is
+  exactly greedy, but when a runner-up's probability still reaches the
+  squared peak BOTH leaders stay in the draw (where `min_p = 1.0`
+  would keep only the maximum-probability tokens).
+- The nucleus always keeps at least one token: the cutoff never
+  exceeds the maximum probability for a valid `top_a <= 1` (since
+  `p_max <= 1`), and a min-token guard makes that explicit against
+  float drift.
+- Deterministic per seed, same RNG and same-token guarantee as the
+  other samplers. The cutoff derives from the global softmax total
+  (one atomic-float reduction), so it lives in the documented boundary
+  class: CPU-vs-GPU and cross-run draws on a rounding boundary may
+  pick a neighboring rank; within one process and one input buffer the
+  result is bit-stable.
+- Implementation note: in the max-normalized exp column
+  (`exps[0] == 1.0`) the peak probability is `p_max = 1 / total`, so
+  the cutoff translates to a plain exp threshold `e_i >= top_a /
+  total` - one divide off the total the exptotal pass already
+  produces, no extra reduction. The nucleus is a value-threshold
+  prefix exactly like min-p's, and the widening bound reuses min-p's
+  sufficient mass formula with the derived cutoff as the divisor; the
+  total runs per attempt (the head memset zeroes its slot) and is
+  host-cached after the first widening, exactly like eta's.
+
+## sample_nsigma - sigma-spread cutoff sampling (v1.8)
+
+```python
+tok = fusedtok.sample_nsigma(logits, nsigma=1.5, temperature=0.8,
+                             seed=step)
+```
+
+Top-n-sigma sampling (Shi et al. 2024, "Top-nσ: Not All Logits Are
+You Need" - the extreme-value filter behind Qwen's decode stack)
+truncates by the row's own SPREAD: temperature-scale the logits, then
+keep every token whose scaled logit stays at or above
+`mean - nsigma * sigma` (the mean and standard deviation taken over
+the whole row), renormalize within that nucleus, draw with the same
+seeded hash. The cutoff is a value threshold like min-p's, but
+expressed in logit space, so it needs no softmax reduction at all -
+just the row's first two moments.
+
+- `nsigma` must be greater than 0 (`ValueError` otherwise);
+  `temperature` must be greater than 0. The paper's operating range is
+  `1.0`-`3.0`: `1.0` trims a plain-decoding row to roughly its top
+  two-thirds of spread, `3.0` keeps almost everything. Huge values
+  approach plain sampling.
+- A near-flat row keeps everything: `sigma -> 0` drops the cutoff onto
+  every logit (the all-equal row is the exact case).
+- The nucleus always keeps at least one token: the cutoff never
+  exceeds the row maximum (the mean sits below the max, and
+  `nsigma * sigma >= 0`), and a min-token guard makes that explicit
+  against float drift.
+- Deterministic per seed, same RNG and same-token guarantee as the
+  other samplers. The cutoff derives from the row's moment
+  accumulators (fixed per-thread rounding, block results widened and
+  atomically added as doubles so the subtractive cancellation in the
+  variance cannot amplify arrival-order drift), so it sits in the
+  documented boundary class: CPU-vs-GPU draws on a rounding boundary
+  may pick a neighboring rank; within one process and one input buffer
+  the result is bit-stable.
+- Implementation note: with `d = l - max` the cutoff translates to an
+  exp threshold of `exp(mean(d) - nsigma * sigma_d)` - max-independent
+  and never above 1, so the nucleus is a value-threshold prefix and
+  the widening bound reuses min-p's sufficient mass formula with that
+  threshold as the divisor. Each attempt runs the expmax pass plus one
+  new moments pass (and the global total for the widening bound),
+  mirroring eta's per-attempt structure.
 
 ## sample_eta - entropy-adaptive cutoff sampling (v1.6)
 
@@ -284,7 +387,8 @@ stays a device tensor on the zero-copy path.
 tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 ```
 
-`sample_topp_batched` / `sample_minp_batched` / `sample_topk_batched` /
+`sample_topp_batched` / `sample_minp_batched` / `sample_topa_batched` /
+`sample_nsigma_batched` / `sample_topk_batched` /
 `sample_eta_batched` / `sample_typical_batched`
 sample a whole `[rows, vocab]` batch in one call and return one token
 per row. The return is int64 on the HOST: a CPU torch tensor for torch

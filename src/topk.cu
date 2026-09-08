@@ -146,7 +146,20 @@ constexpr int kWsLevelDone = 267;   // level of the last completed round
 constexpr int kWsArgBest = 268;     // argmax packed-key max (self-resetting)
 constexpr int kWsArgCnt = 269;      // argmax arrival counter (self-resetting)
 constexpr int kWsEtaS = 270;        // eta entropy accumulator (float, sample)
-constexpr int kWsHead = 271;
+// kWsNsS1 / kWsNsS2 (271/272) hold the top-n-sigma moment accumulators
+// over the temperature-scaled logits: s1 = sum (l_i - max) and
+// s2 = sum (l_i - max)^2, from which the serial walker derives the
+// mean mu = max + s1 / n and the standard deviation
+// sigma = sqrt(max(s2 / n - (s1/n)^2, 0)) - the cutoff in logit units
+// is mu - nsigma * sigma, translated to exp units as
+// exp(mu - nsigma * sigma - max). Each slot holds one DOUBLE (a full
+// u64 word): the variance computes the difference of two
+// nearly-equal large quantities, so float-magnitude arrival-order
+// drift would be amplified into visible threshold wobble on wide
+// nuclei - double accumulation keeps cross-call reruns stable.
+constexpr int kWsNsS1 = 271;        // nsigma first moment acc (double)
+constexpr int kWsNsS2 = 272;        // nsigma second moment acc (double)
+constexpr int kWsHead = 273;
 constexpr int kWsCand = kWsHead;               // candidates [0, kSelEarlyOut)
 constexpr int kWsKeys = kWsHead + kSelEarlyOut;  // key buffer A (m words)
 
@@ -1179,68 +1192,127 @@ __global__ void exptotal_kernel(const float* __restrict__ x,
     }
 }
 
-// eta/typical entropy accumulator (v1.6), row-decomposed: svals row
-// entry accumulates sum e_i * (l_i - max), like exptotal_b but with
-// the (l_i - max) factor. Zeroed by batch_preset per attempt.
-__global__ void entropy_b_kernel(const float* __restrict__ x,
-                                 unsigned long long* __restrict__ ws,
-                                 long long stride, int n, float inv_t,
-                                 float* __restrict__ svals, int gpr,
-                                 const int* __restrict__ active) {
+// mass_stats_kernel row-decomposed (v1.8): one full-row read producing
+// the row's total (totals), entropy accumulator (svals) and nsigma
+// moments (n1vals/n2vals, doubles) - replaces the exptotal_b +
+// entropy_b + nsigma_stats_b sequence for the entropy-family modes
+// with each output's accumulation pattern untouched (bit-identical
+// tokens; see the single-row note).
+__global__ void mass_stats_b_kernel(const float* __restrict__ x,
+                                    unsigned long long* __restrict__ ws,
+                                    long long stride, int n, float inv_t,
+                                    float* __restrict__ totals,
+                                    float* __restrict__ svals,
+                                    double* __restrict__ n1vals,
+                                    double* __restrict__ n2vals,
+                                    int gpr,
+                                    const int* __restrict__ active) {
     const int row = blockIdx.x / gpr;
     if (!active[row]) return;
     const int lid = blockIdx.x % gpr;
     const float* x_row = x + (size_t)row * n;
     unsigned long long* ws_row = ws + (size_t)row * stride;
     const float row_max = unfkey((unsigned)ws_row[kWsExpMax]);
-    float s = 0.0f;
+    float total = 0.0f, s = 0.0f, s1 = 0.0f, s2 = 0.0f;
     for (int i = lid * blockDim.x + threadIdx.x; i < n;
          i += gpr * blockDim.x) {
         const float lv = x_row[i] * inv_t - row_max;
-        s += __expf(lv) * lv;
+        const float e = __expf(lv);
+        total += e;
+        s += e * lv;
+        s1 += lv;
+        s2 += lv * lv;
     }
-    __shared__ float warp_sum[kSelWarps];
+    __shared__ float warp_total[kSelWarps];
+    __shared__ float warp_s[kSelWarps];
+    __shared__ float warp_s1[kSelWarps];
+    __shared__ float warp_s2[kSelWarps];
+    total = warp_reduce_sum(total);
     s = warp_reduce_sum(s);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    if (lane == 0) warp_sum[warp] = s;
+    if (lane == 0) {
+        warp_total[warp] = total;
+        warp_s[warp] = s;
+        warp_s1[warp] = s1;
+        warp_s2[warp] = s2;
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
-        float t = 0.0f;
+        float bt = 0.0f, bs = 0.0f, bs1 = 0.0f, bs2 = 0.0f;
         #pragma unroll
-        for (int w = 0; w < kSelWarps; ++w) t += warp_sum[w];
-        atomicAdd(&svals[row], t);
+        for (int w = 0; w < kSelWarps; ++w) {
+            bt += warp_total[w];
+            bs += warp_s[w];
+            bs1 += warp_s1[w];
+            bs2 += warp_s2[w];
+        }
+        atomicAdd(&totals[row], bt);
+        atomicAdd(&svals[row], bs);
+        atomicAdd(&n1vals[row], (double)bs1);
+        atomicAdd(&n2vals[row], (double)bs2);
     }
 }
 
-// eta entropy accumulator (v1.6): s = sum e_i * (l_i - max) where
-// e_i = expf(l_i - max) and max is the expmax-published row max. With
-// the global total T from exptotal_kernel, the distribution entropy in
-// nats is H = log(T) - s / T (standard identity: H = ln Z - E[logit]
-// over p_i = e_i / Z). Accumulates exactly like exptotal (warp reduce,
-// one atomicAdd per block) into its own head slot; the eta serial
-// walker derives the cutoff threshold from (kWsTotal, kWsEtaS).
-__global__ void entropy_kernel(const float* __restrict__ x,
-                               unsigned long long* __restrict__ ws,
-                               int n, float inv_t, PenCtx pen) {
+// Fused mass + stats pass (v1.8): ONE full-vocabulary read producing
+// every scalar the entropy-family samplers consume - the softmax total
+// (kWsTotal, for top-a's cutoff and every widening bound), the entropy
+// accumulator (kWsEtaS, for eta's / typical's band), and the nsigma
+// moments (kWsNsS1/S2, doubles). Replaces the exptotal + entropy +
+// nsigma_stats sequence (up to three full reads of x) for eta /
+// typical / nsigma: eta and typical run 2 mass launches per attempt
+// instead of 3, nsigma 2 instead of 3, and every consumer's
+// accumulation pattern is untouched (each output keeps its own
+// per-thread serial adds, warp reduction and atomic commit with the
+// same operand values - the shared __expf(lv) is the exact quantity
+// the standalone kernels each computed), so every sampled token is
+// bit-identical to the unfused sequence.
+__global__ void mass_stats_kernel(const float* __restrict__ x,
+                                  unsigned long long* __restrict__ ws,
+                                  int n, float inv_t, PenCtx pen) {
     const float row_max = unfkey((unsigned)ws[kWsExpMax]);
-    float s = 0.0f;
+    float total = 0.0f, s = 0.0f, s1 = 0.0f, s2 = 0.0f;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += gridDim.x * blockDim.x) {
         const float lv = step_logit(x, i, inv_t, pen) - row_max;
-        s += __expf(lv) * lv;
+        const float e = __expf(lv);
+        total += e;
+        s += e * lv;
+        s1 += lv;
+        s2 += lv * lv;
     }
-    __shared__ float warp_sum[kSelWarps];
+    __shared__ float warp_total[kSelWarps];
+    __shared__ float warp_s[kSelWarps];
+    __shared__ float warp_s1[kSelWarps];
+    __shared__ float warp_s2[kSelWarps];
+    total = warp_reduce_sum(total);
     s = warp_reduce_sum(s);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    if (lane == 0) warp_sum[warp] = s;
+    if (lane == 0) {
+        warp_total[warp] = total;
+        warp_s[warp] = s;
+        warp_s1[warp] = s1;
+        warp_s2[warp] = s2;
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
-        float t = 0.0f;
+        float bt = 0.0f, bs = 0.0f, bs1 = 0.0f, bs2 = 0.0f;
         #pragma unroll
-        for (int w = 0; w < kSelWarps; ++w) t += warp_sum[w];
-        atomicAdd(reinterpret_cast<float*>(&ws[kWsEtaS]), t);
+        for (int w = 0; w < kSelWarps; ++w) {
+            bt += warp_total[w];
+            bs += warp_s[w];
+            bs1 += warp_s1[w];
+            bs2 += warp_s2[w];
+        }
+        atomicAdd(reinterpret_cast<float*>(&ws[kWsTotal]), bt);
+        atomicAdd(reinterpret_cast<float*>(&ws[kWsEtaS]), bs);
+        atomicAdd(reinterpret_cast<double*>(&ws[kWsNsS1]), (double)bs1);
+        atomicAdd(reinterpret_cast<double*>(&ws[kWsNsS2]), (double)bs2);
     }
 }
 
@@ -1669,6 +1741,63 @@ static int widen_window_minp(int window, int n, float min_p, double total,
         throw std::runtime_error("min-p mass readback failed");
     const double c = (double)*reinterpret_cast<const float*>(&cw);
     const long long lb = minp_widen_bound(window, (double)min_p, total, c);
+    const long long want = std::max<long long>((long long)window * 8, lb);
+    if (want >= n) return n;
+    int mp = 1;                       // pow2 headroom over the bound
+    while (mp < want) mp <<= 1;
+    return std::min(n, mp);
+}
+
+// Adaptive widening jump for top-a: the nucleus is again a VALUE
+// threshold on the normalized probability (p_i >= top_a * p_max^2), so
+// min-p's sufficient mass bound transfers with the divisor replaced by
+// the cutoff IN EXP UNITS - top_a / total (for min-p that divisor is
+// exactly min_p because the max exp is 1). The host derives it from the
+// same total the walker used, host-cached after the one-time mass pass
+// (global total T is retry-invariant); the only fresh readback is the
+// failed window's cum mass C (kWsCumW). The cutoff derives from floats
+// the parallel tree produced, so the pow2 rounding adds slack against
+// a hair-miss (one more attempt, never correctness).
+static int widen_window_topa(int window, int n, float top_a, double total,
+                             const unsigned long long* ws) {
+    unsigned long long cw = 0ULL;
+    if (cudaMemcpy(&cw, ws + kWsCumW, sizeof(cw),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("top-a mass readback failed");
+    const double c = (double)*reinterpret_cast<const float*>(&cw);
+    const long long lb =
+        minp_widen_bound(window, (double)top_a / total, total, c);
+    const long long want = std::max<long long>((long long)window * 8, lb);
+    if (want >= n) return n;
+    int mp = 1;                       // pow2 headroom over the bound
+    while (mp < want) mp <<= 1;
+    return std::min(n, mp);
+}
+
+// Adaptive widening jump for top-n-sigma: the nucleus is a VALUE
+// threshold on the temperature-scaled logit (l_i >= mu - nsigma *
+// sigma), so min-p's sufficient mass bound transfers with the divisor
+// replaced by the cutoff IN EXP UNITS - exp(mu - nsigma * sigma - max)
+// = exp(mu_d - nsigma * sigma_d) (max-independent). The host derives
+// it from the same accumulators the walker used, host-cached after the
+// one-time mass pass (s1, s2 and the global total T are
+// retry-invariant); the only fresh readback is the failed window's cum
+// mass C (kWsCumW). The cutoff derives from floats the parallel tree
+// produced, so the pow2 rounding adds slack against a hair-miss (one
+// more attempt, never correctness).
+static int widen_window_nsigma(int window, int n, float nsigma,
+                               double total, double s1, double s2,
+                               const unsigned long long* ws) {
+    unsigned long long cw = 0ULL;
+    if (cudaMemcpy(&cw, ws + kWsCumW, sizeof(cw),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("nsigma mass readback failed");
+    const double c = (double)*reinterpret_cast<const float*>(&cw);
+    const double mu_d = s1 / (double)n;
+    const double sigma =
+        std::sqrt(std::fmax(s2 / (double)n - mu_d * mu_d, 0.0));
+    const double thr_e = std::exp(mu_d - (double)nsigma * sigma);
+    const long long lb = minp_widen_bound(window, thr_e, total, c);
     const long long want = std::max<long long>((long long)window * 8, lb);
     if (want >= n) return n;
     int mp = 1;                       // pow2 headroom over the bound
@@ -2111,12 +2240,111 @@ __global__ void sample_minp_serial_kernel(
                        (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
+// top-a sampling tail: keep every element whose probability
+// p_i >= top_a * p_max^2 (the top-a rule from the open-source sampling
+// stack) - a VALUE threshold on the normalized probability, so the same
+// prefix-walk machinery as min-p applies with the threshold derived
+// in-kernel from the workspace slots. In the max-normalized exp column
+// (exps[0] == 1.0, total T from exptotal_kernel) p_max == 1 / T, so the
+// cutoff translates to exp units as e_i >= top_a / T: one float divide
+// off kWsTotal, no extra reduction passes. The cutoff is bounded by
+// p_max for any top_a <= 1 (a * p_max^2 <= p_max when p_max <= 1), so
+// the nucleus is never empty. An uncovered window leaves the sentinel
+// and the whole-window cum mass for the host's widening bound
+// (widen_window_topa).
+__global__ void sample_topa_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
+    int* __restrict__ token_out,
+    int k, int n, float top_a, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const float total =
+        *reinterpret_cast<const float*>(&ws[kWsTotal]);
+    const float threshold_e = top_a / total;   // cutoff in exp units
+    extern __shared__ float cps[];   // walk checkpoints (walk_cp_slots)
+    const int stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, threshold_e, &nucleus_mass,
+                                      cps, stride, &ncp);
+    if (edge < 0 && k < n) {
+        // every window element passes: nucleus extends past the window -
+        // the host retries wider (token stays -1). Leave the whole-window
+        // cum mass for the host's next-jump bound (widen_window_topa)
+        *reinterpret_cast<float*>(&ws[kWsCumW]) = nucleus_mass;
+        return;
+    }
+    // nucleus is never empty (threshold_e <= exps[0]); the max(.., 1)
+    // makes the min-token guarantee explicit against float drift
+    const int nucleus = (edge < 0) ? k : (edge > 0 ? edge : 1);
+    const float u = splitmix_uniform(seed);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
+    // float-boundary fallback: the last nucleus element, same as the
+    // CPU reference and the topk walker
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// top-n-sigma sampling tail (Shi et al. 2024, "Top-n sigma: Not All
+// Logits Are You Need"): keep every element whose temperature-scaled
+// logit exceeds mu - nsigma * sigma (mu / sigma: the row's mean and
+// standard deviation) - a VALUE threshold like min-p, derived
+// in-kernel from the workspace slots (first/second moment
+// accumulators s1, s2 from the fused mass+stats pass, both
+// max-shifted). With
+// d = l - max the mean is mu = max + s1 / n and the cutoff translates
+// to exp units as exp(d_mean - nsigma * sigma_d) - max-independent and
+// never above 1 (d_mean <= 0 and sigma >= 0), so the nucleus is never
+// empty; the all-equal row (sigma == 0, cutoff == every logit) keeps
+// the whole window. An uncovered window leaves the sentinel and the
+// whole-window cum mass for the host's widening bound
+// (widen_window_nsigma).
+__global__ void sample_nsigma_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
+    int* __restrict__ token_out,
+    int k, int n, float nsigma, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const double s1 = *reinterpret_cast<const double*>(&ws[kWsNsS1]);
+    const double s2 = *reinterpret_cast<const double*>(&ws[kWsNsS2]);
+    const double mu_d = s1 / (double)n;
+    const double var = fmax(s2 / (double)n - mu_d * mu_d, 0.0);
+    const float sigma = (float)sqrt(var);
+    const float threshold_e = expf((float)mu_d - nsigma * sigma);
+    extern __shared__ float cps[];   // walk checkpoints (walk_cp_slots)
+    const int stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, threshold_e, &nucleus_mass,
+                                      cps, stride, &ncp);
+    if (edge < 0 && k < n) {
+        // every window element passes: nucleus extends past the window -
+        // the host retries wider (token stays -1). Leave the whole-window
+        // cum mass for the host's next-jump bound (widen_window_nsigma)
+        *reinterpret_cast<float*>(&ws[kWsCumW]) = nucleus_mass;
+        return;
+    }
+    // nucleus is never empty (threshold_e <= 1 == exps[0]); the
+    // max(.., 1) makes the min-token guarantee explicit against drift
+    const int nucleus = (edge < 0) ? k : (edge > 0 ? edge : 1);
+    const float u = splitmix_uniform(seed);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
 // eta-cutoff sampling tail (v1.6, Hewitt et al. 2022): keep every
 // element whose probability p_i >= eta * min(1, exp(-H)), H the
 // distribution entropy in nats - a VALUE threshold like min-p, so the
 // same prefix-walk machinery applies with the threshold derived
-// in-kernel from the workspace slots (global total T from
-// exptotal_kernel, entropy accumulator s from entropy_kernel:
+// in-kernel from the workspace slots (global total T and
+// entropy accumulator s from the fused mass+stats pass:
 // H = log(T) - s / T, cutoff p = eta * min(1, exp(-H))). The cutoff is
 // bounded by p_max (the weighted geometric mean of the p_i bounds
 // their max), so the nucleus is never empty. An uncovered window
@@ -2350,10 +2578,225 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
 }
 
 // ---------------------------------------------------------------------------
+// fused top-a sampling: softmax(logits/T) -> keep every token with
+// p_i >= top_a * p_max^2 -> inverse-CDF draw from a hash-derived
+// uniform. The cutoff derives from the exptotal total (p_max = 1/T in
+// the max-normalized exp column), re-run per attempt (the per-attempt
+// head memset zeroes the slot). Same windowing strategy and
+// non-capturable contract as sample_minp.
+// ---------------------------------------------------------------------------
+long long sample_topa_launch(const float* x, int n, float top_a, float t,
+                             unsigned long long seed, std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(top_a > 0.0f && top_a <= 1.0f))
+        throw std::invalid_argument("top_a must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    // like eta, the cutoff derives from a workspace quantity (T) the
+    // serial walker reads - so the mass passes run on EVERY attempt
+    // (the head memset zeroes the slot). The widening bound additionally
+    // needs the total host-side; it is window-invariant, so it is read
+    // back once after the first failure and cached (same lazy pattern
+    // as min-p's / eta's total).
+    double total = -1.0;
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;                // sort pad size
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window,
+                    inv_t, kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, inv_t, kNoPen);
+        }
+        // the mass pass feeds the serial walker's cutoff (kWsExpMax
+        // publishes the max before the total consumer)
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                    kNoPen);
+        check_launch("top-a mass launch");
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                inv_t, kNoPen);
+        check_launch("top-a selection launch");
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
+        sample_topa_serial_kernel<<<1, 32,
+                                    walk_cp_slots(window) * sizeof(float),
+                                    cs>>>(
+            sorted, exps, ws, token_out, window, n, top_a, seed);
+        check_launch("top-a tail launch");
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("top-a kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("top-a readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("top-a nucleus not covered");
+        if (total < 0.0) {
+            // one-time readback of the global total for the adaptive
+            // bound (window-invariant, and already correct: the failed
+            // attempt's own exptotal pass populated the slot - re-running
+            // the pass would atomicAdd onto it and double the value)
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess)
+                throw std::runtime_error(std::string("top-a mass failed: ") +
+                                         cudaGetErrorString(err));
+            unsigned long long tw = 0ULL;
+            if (cudaMemcpy(&tw, ws + kWsTotal, sizeof(tw),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("top-a total readback failed");
+            total = (double)*reinterpret_cast<const float*>(&tw);
+        }
+        window = widen_window_topa(window, n, top_a, total, ws);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fused top-n-sigma sampling (v1.8): softmax(logits/T) -> keep every
+// token with logit >= mu - nsigma * sigma (mu, sigma: the row's mean
+// and standard deviation over the temperature-scaled logits) ->
+// inverse-CDF draw from a hash-derived uniform. The moments come from
+// the fused mass+stats pass accumulators, re-run per attempt (the
+// per-attempt head memset zeroes their slots). Same windowing strategy
+// and non-capturable contract as sample_minp/eta/top-a.
+// ---------------------------------------------------------------------------
+long long sample_nsigma_launch(const float* x, int n, float nsigma,
+                               float t, unsigned long long seed,
+                               std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(nsigma > 0.0f))
+        throw std::invalid_argument("nsigma must be > 0");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    // the cutoff derives from workspace quantities (s1, s2) the serial
+    // walker reads - so the stats pass runs on EVERY attempt (the head
+    // memset zeroes the slots). The widening bound additionally needs
+    // the moments host-side; they are window-invariant, so they are
+    // read back once after the first failure and cached (same lazy
+    // pattern as min-p's / eta's / top-a's total).
+    double total = -1.0;
+    double s1_acc = 0.0, s2_acc = 0.0;
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;                // sort pad size
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window,
+                    inv_t, kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, inv_t, kNoPen);
+        }
+        // the mass + moment passes feed the serial walker's cutoff
+        // (kWsExpMax publishes the max before the consumers; the
+        // exptotal total is only needed for the widening bound)
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        mass_stats_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                      kNoPen);
+        check_launch("nsigma mass launch");
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                inv_t, kNoPen);
+        check_launch("nsigma selection launch");
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
+        sample_nsigma_serial_kernel<<<1, 32,
+                                      walk_cp_slots(window) * sizeof(float),
+                                      cs>>>(
+            sorted, exps, ws, token_out, window, n, nsigma, seed);
+        check_launch("nsigma tail launch");
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("nsigma kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("nsigma readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("nsigma nucleus not covered");
+        if (total < 0.0) {
+            // one-time readback of the global total and the moments for
+            // the adaptive bound (all window-invariant, and already
+            // correct: the failed attempt's own fused pass populated
+            // the slots - re-running the pass would atomicAdd onto them
+            // and double every value)
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess)
+                throw std::runtime_error(std::string("nsigma mass failed: ") +
+                                         cudaGetErrorString(err));
+            unsigned long long tw = 0ULL;
+            double d1 = 0.0, d2 = 0.0;
+            if (cudaMemcpy(&tw, ws + kWsTotal, sizeof(tw),
+                           cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(&d1, ws + kWsNsS1, sizeof(d1),
+                           cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(&d2, ws + kWsNsS2, sizeof(d2),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("nsigma mass readback failed");
+            total = (double)*reinterpret_cast<const float*>(&tw);
+            s1_acc = d1;
+            s2_acc = d2;
+        }
+        window = widen_window_nsigma(window, n, nsigma, total, s1_acc,
+                                     s2_acc, ws);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fused eta-cutoff sampling (v1.6): softmax(logits/T) -> keep every token
 // with p_i >= eta * min(1, exp(-H)) -> inverse-CDF draw from a
 // hash-derived uniform. H (the distribution entropy in nats) comes from
-// the entropy_kernel accumulator + the exptotal total, both re-run per
+// the fused mass+stats pass (entropy + total), both re-run per
 // attempt (the per-attempt head memset zeroes their slots). Same
 // windowing strategy and non-capturable contract as sample_minp.
 // ---------------------------------------------------------------------------
@@ -2402,13 +2845,12 @@ long long sample_eta_launch(const float* x, int n, float eta, float t,
             select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
                 dargs, ws, n, inv_t, kNoPen);
         }
-        // the mass + entropy passes feed the serial walker's cutoff
-        // (kWsExpMax publishes the max before both consumers)
+        // the fused mass+stats pass feeds the serial walker's cutoff
+        // (kWsExpMax publishes the max before it; one full read
+        // produces the total AND the entropy accumulator)
         expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
-        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
-                                                    kNoPen);
-        entropy_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
-                                                   kNoPen);
+        mass_stats_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                      kNoPen);
         check_launch("eta mass launch");
         emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
                                                  inv_t, kNoPen);
@@ -2435,17 +2877,11 @@ long long sample_eta_launch(const float* x, int n, float eta, float t,
         if (window == n)
             throw std::runtime_error("eta nucleus not covered");
         if (total < 0.0) {
-            // one-time global max + total + entropy accumulator for the
-            // adaptive bound (all three window-invariant; the head
-            // memset of THIS attempt zeroed the slots and the kernels
-            // run strictly after the failed attempt on the same stream)
-            expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
-                                                      kNoPen);
-            exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
-                                                        kNoPen);
-            entropy_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
-                                                       kNoPen);
-            check_launch("eta mass launch");
+            // one-time readback of the global total and the entropy
+            // accumulator for the adaptive bound (both window-invariant,
+            // and already correct: the failed attempt's own fused pass
+            // populated the slots - re-running the pass would atomicAdd
+            // onto them and double every value)
             err = cudaDeviceSynchronize();
             if (err != cudaSuccess)
                 throw std::runtime_error(std::string("eta mass failed: ") +
@@ -2517,12 +2953,11 @@ long long sample_typical_launch(const float* x, int n, float typical,
                 dargs, ws, n, inv_t, kNoPen);
         }
         // band membership needs the total and the entropy accumulator
-        // (kWsExpMax publishes the max before both consumers)
+        // (kWsExpMax publishes the max before the fused pass; one
+        // full read produces both)
         expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
-        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
-                                                    kNoPen);
-        entropy_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
-                                                   kNoPen);
+        mass_stats_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                      kNoPen);
         check_launch("typical mass launch");
         emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
                                                  inv_t, kNoPen);
@@ -2605,11 +3040,15 @@ constexpr int kBMaxBatch = 32;
 // compact per-row scalar tail after the B stripes. Word layout (all
 // ranges word-aligned so the comment IS the layout): seeds [0, B) |
 // tokens [B, 2B) | cumws [2B, 2B+C) | totals [2B+C, 2B+2C) | active
-// [2B+2C, 2B+3C) | svals [2B+3C, 2B+4C), C = ceil(B / 2). Each
-// float/int array occupies C words; for odd B the half-word left by
+// [2B+2C, 2B+3C) | svals [2B+3C, 2B+4C) | n1vals [2B+4C, 3B+4C) |
+// n2vals [3B+4C, 4B+4C), C = ceil(B / 2). Each float/int array
+// occupies C words; for odd B the half-word left by
 // one array stays unused (a padded gap, never shared - the 1.4.0
 // overlap bug came from exactly such sharing). svals holds the
-// eta/typical entropy accumulator per row (v1.6), zeroed by
+// eta/typical entropy accumulator per row (v1.6, float); n1vals /
+// n2vals the top-n-sigma moment accumulators per row (v1.8, one
+// DOUBLE per row each - the variance's cancellation amplifies float
+// arrival-order drift, so these accumulate in double), all zeroed by
 // batch_preset like the totals.
 struct BatchTail {
     unsigned long long* seeds;   // B u64
@@ -2618,11 +3057,13 @@ struct BatchTail {
     float* totals;               // B f32, max-normalized global total
     int* active;                 // B i32, 1 = row still needs a token
     float* svals;                // B f32, eta/typical entropy acc
+    double* n1vals;              // B f64, nsigma first moment acc
+    double* n2vals;              // B f64, nsigma second moment acc
 };
 
 inline size_t batch_tail_words(int rows) {
     const size_t pairs = (size_t)((rows + 1) / 2);
-    return 2 * (size_t)rows + 4 * pairs;
+    return 4 * (size_t)rows + 4 * pairs;
 }
 
 inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
@@ -2638,6 +3079,10 @@ inline BatchTail batch_tail(unsigned long long* ws, size_t stripes,
                                       2 * pairs);
     t.svals = reinterpret_cast<float*>(ws + stripes + 2 * (size_t)rows +
                                        3 * pairs);
+    t.n1vals = reinterpret_cast<double*>(ws + stripes + 2 *
+                                         (size_t)rows + 4 * pairs);
+    t.n2vals = reinterpret_cast<double*>(ws + stripes + 3 *
+                                         (size_t)rows + 4 * pairs);
     return t;
 }
 
@@ -2658,6 +3103,8 @@ __global__ void batch_preset_kernel(long long* __restrict__ tokens,
                                     float* __restrict__ cumws,
                                     float* __restrict__ totals,
                                     float* __restrict__ svals,
+                                    double* __restrict__ n1vals,
+                                    double* __restrict__ n2vals,
                                     const int* __restrict__ active,
                                     int rows) {
     for (int r = threadIdx.x; r < rows; r += blockDim.x)
@@ -2666,6 +3113,8 @@ __global__ void batch_preset_kernel(long long* __restrict__ tokens,
             cumws[r] = 0.0f;
             totals[r] = 0.0f;
             svals[r] = 0.0f;
+            n1vals[r] = 0.0;
+            n2vals[r] = 0.0;
         }
 }
 
@@ -3202,6 +3651,83 @@ __global__ void sample_minp_serial_b_kernel(
                               (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
+// sample_topa_serial_kernel row-decomposed (the cutoff derives from
+// the row's total: threshold in exp units = top_a / total[row]; on an
+// uncovered window leaves the sentinel and the whole-window cum mass
+// for the host-side bound)
+__global__ void sample_topa_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int n, float top_a,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const float* __restrict__ totals, const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const float threshold_e = top_a / totals[row];
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+    extern __shared__ float cps[];
+    const int cps_stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, threshold_e, &nucleus_mass,
+                                      cps, cps_stride, &ncp);
+    if (edge < 0 && k < n) {
+        cumws[row] = nucleus_mass;
+        return;
+    }
+    const int nucleus = (edge < 0) ? k : (edge > 0 ? edge : 1);
+    const float u = splitmix_uniform(seeds[row]);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
+                                 cps_stride);
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// sample_nsigma_serial_kernel row-decomposed (the cutoff derives from
+// the row's moment accumulators: mu_d = s1 / n, sigma =
+// sqrt(max(s2/n - mu_d^2, 0)), threshold in exp units =
+// exp(mu_d - nsigma * sigma); on an uncovered window leaves the
+// sentinel and the whole-window cum mass for the host-side bound)
+__global__ void sample_nsigma_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int n, float nsigma,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const double* __restrict__ n1vals, const double* __restrict__ n2vals,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const double mu_d = n1vals[row] / (double)n;
+    const double var = fmax(n2vals[row] / (double)n - mu_d * mu_d, 0.0);
+    const float threshold_e = expf((float)mu_d -
+                                   nsigma * (float)sqrt(var));
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+    extern __shared__ float cps[];
+    const int cps_stride = walk_cp_stride(k);
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, threshold_e, &nucleus_mass,
+                                      cps, cps_stride, &ncp);
+    if (edge < 0 && k < n) {
+        cumws[row] = nucleus_mass;
+        return;
+    }
+    const int nucleus = (edge < 0) ? k : (edge > 0 ? edge : 1);
+    const float u = splitmix_uniform(seeds[row]);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp,
+                                 cps_stride);
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
 // sample_topk_serial_kernel row-decomposed (the k-window is covered by
 // construction - no threshold, no widening)
 __global__ void sample_topk_serial_b_kernel(
@@ -3229,7 +3755,8 @@ __global__ void sample_topk_serial_b_kernel(
 
 // eta-cutoff sampling tail (v1.6), row-decomposed: the cutoff derives
 // in-kernel from the row's totals/svals tail entries
-// (H = log(T) - s / T, cutoff = eta * min(1, exp(-H)) * T).
+// (H = log(T) - s / T, cutoff = eta * min(1, exp(-H)) * T),
+// both produced by the fused mass+stats pass.
 __global__ void sample_eta_serial_b_kernel(
     const unsigned long long* __restrict__ ws, long long stride,
     int keys_off, int exps_off, int k, int n, float eta,
@@ -3325,8 +3852,9 @@ __global__ void sample_typical_serial_b_kernel(
 }
 
 // per-chunk attempt sequencer for the nucleus samplers (topp = mode 0,
-// minp = mode 1). Drives the shared kernel sequence above through the
-// uniform-window widening loop described in the section note.
+// minp = mode 1, eta = 2, typical = 3, top-a = 4, nsigma = 5). Drives
+// the shared kernel sequence above through the uniform-window widening
+// loop described in the section note.
 std::vector<long long> sample_nucleus_batched_chunk(
     const float* x, int rows, int n, float thr, float t, int mode,
     const unsigned long long* seeds, std::uintptr_t stream) {
@@ -3367,8 +3895,8 @@ std::vector<long long> sample_nucleus_batched_chunk(
                 std::string("batch args upload failed: ") +
                 cudaGetErrorString(up1 != cudaSuccess ? up1 : up2));
         batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
-            tail.tokens, tail.cumws, tail.totals, tail.svals, tail.active,
-            rows);
+            tail.tokens, tail.cumws, tail.totals, tail.svals, tail.n1vals,
+            tail.n2vals, tail.active, rows);
         cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
         const int grid = rows * gpr;
         const bool full = (window == n);
@@ -3382,17 +3910,22 @@ std::vector<long long> sample_nucleus_batched_chunk(
             check_launch("batch selection launch");
         }
         if (mode != 1) {
-            // topp/eta/typical: the mass passes run per attempt (the
-            // per-attempt head memset zeroes their tail/head slots);
-            // entropy_b (modes 2/3) adds the entropy accumulator
+            // the mass passes run per attempt (the per-attempt head
+            // memset zeroes their tail/head slots). topp (mode 0) and
+            // top-a (mode 4) need only the total; eta/typical/nsigma
+            // (modes 2/3/5) take the fused pass - one full-row read
+            // produces the total, the entropy accumulator and the
+            // nsigma moments
             expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                 x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
-            exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                x, ws, stride, n, inv_t, tail.totals, gpr, tail.active,
-                kNoPenB);
-            if (mode >= 2) {
-                entropy_b_kernel<<<grid, kSelBlock, 0, cs>>>(
-                    x, ws, stride, n, inv_t, tail.svals, gpr, tail.active);
+            if (mode == 0 || mode == 4) {
+                exptotal_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    x, ws, stride, n, inv_t, tail.totals, gpr,
+                    tail.active, kNoPenB);
+            } else {
+                mass_stats_b_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    x, ws, stride, n, inv_t, tail.totals, tail.svals,
+                    tail.n1vals, tail.n2vals, gpr, tail.active);
             }
             check_launch("batch mass launch");
         }
@@ -3452,7 +3985,7 @@ std::vector<long long> sample_nucleus_batched_chunk(
                     ws, stride, sorted_off, mate_off, window, n, thr,
                     tail.seeds, tail.tokens, tail.cumws, tail.totals,
                     tail.svals, tail.active);
-            else
+            else if (mode == 3)
                 sample_typical_serial_b_kernel<<<rows, 32,
                                                  walk_cp_slots(window) *
                                                      sizeof(float),
@@ -3460,6 +3993,22 @@ std::vector<long long> sample_nucleus_batched_chunk(
                     ws, stride, sorted_off, mate_off, window, n, thr,
                     tail.seeds, tail.tokens, tail.cumws, tail.totals,
                     tail.svals, tail.active);
+            else if (mode == 4)
+                sample_topa_serial_b_kernel<<<rows, 32,
+                                              walk_cp_slots(window) *
+                                                  sizeof(float),
+                                              cs>>>(
+                    ws, stride, sorted_off, mate_off, window, n, thr,
+                    tail.seeds, tail.tokens, tail.cumws, tail.totals,
+                    tail.active);
+            else
+                sample_nsigma_serial_b_kernel<<<rows, 32,
+                                                walk_cp_slots(window) *
+                                                    sizeof(float),
+                                                cs>>>(
+                    ws, stride, sorted_off, mate_off, window, n, thr,
+                    tail.seeds, tail.tokens, tail.cumws, tail.n1vals,
+                    tail.n2vals, tail.active);
             check_launch("batch tail launch");
         }
         cudaError_t err = cudaStreamSynchronize(cs);
@@ -3528,12 +4077,21 @@ std::vector<long long> sample_nucleus_batched_chunk(
         long long want = (long long)window * 8;
         // eta (mode 2) derives its cutoff from the entropy accumulator:
         // read svals alongside the totals to compute the per-row
-        // threshold, then reuse min-p's sufficient bound
+        // threshold, then reuse min-p's sufficient bound. nsigma
+        // (mode 5) likewise reads its moment accumulators.
         std::vector<float> sv_h(rows, 0.0f);
         if (mode == 2) {
             if (cudaMemcpy(sv_h.data(), tail.svals, (size_t)rows * 4,
                            cudaMemcpyDeviceToHost) != cudaSuccess)
                 throw std::runtime_error("batch svals readback failed");
+        }
+        std::vector<double> n1_h(rows, 0.0), n2_h(rows, 0.0);
+        if (mode == 5) {
+            if (cudaMemcpy(n1_h.data(), tail.n1vals, (size_t)rows * 8,
+                           cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(n2_h.data(), tail.n2vals, (size_t)rows * 8,
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("batch nvals readback failed");
         }
         for (int r = 0; r < rows; ++r) {
             if (!active[r]) continue;
@@ -3553,6 +4111,25 @@ std::vector<long long> sample_nucleus_batched_chunk(
                 // contribution: the probability cutoff times the
                 // row's global total
                 lb = minp_widen_bound(window, cut * total[r], total[r],
+                                      (double)cum_h[r]);
+            } else if (mode == 4) {
+                // top-a's cutoff in exp units is top_a / total: the
+                // bound's divisor is the per-element exp contribution
+                // directly
+                lb = minp_widen_bound(window, (double)thr / total[r],
+                                      total[r], (double)cum_h[r]);
+            } else if (mode == 5) {
+                // nsigma's cutoff in exp units is
+                // exp(mu_d - nsigma * sigma_d), both moments per row
+                // (read back as the doubles the accumulators hold)
+                const double mu_d = n1_h[r] / (double)n;
+                const double sigma =
+                    std::sqrt(std::fmax(n2_h[r] / (double)n -
+                                            mu_d * mu_d,
+                                        0.0));
+                const double thr_e =
+                    std::exp(mu_d - (double)thr * sigma);
+                lb = minp_widen_bound(window, thr_e, total[r],
                                       (double)cum_h[r]);
             }
             // mode 3 (typical): no analytic bound - x8 ladder floor
@@ -3637,8 +4214,8 @@ std::vector<long long> decode_step_batched_chunk(
                                     : up2 != cudaSuccess ? up2
                                     : up3 != cudaSuccess ? up3 : up4));
         batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
-            tail.tokens, tail.cumws, tail.totals, tail.svals, tail.active,
-            rows);
+            tail.tokens, tail.cumws, tail.totals, tail.svals, tail.n1vals,
+            tail.n2vals, tail.active, rows);
         // one contiguous clear over stripes + bitmaps (the bitmaps are
         // ORed, so they must start zero every attempt)
         cudaMemsetAsync(ws, 0,
@@ -3800,8 +4377,8 @@ std::vector<long long> sample_topk_batched_chunk(
             std::string("batch args upload failed: ") +
             cudaGetErrorString(up1 != cudaSuccess ? up1 : up2));
     batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
-        tail.tokens, tail.cumws, tail.totals, tail.svals, tail.active,
-        rows);
+        tail.tokens, tail.cumws, tail.totals, tail.svals, tail.n1vals,
+        tail.n2vals, tail.active, rows);
     cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
     const int grid = rows * gpr;
     const bool full = (k == n);
@@ -4001,6 +4578,58 @@ std::vector<long long> sample_eta_batched_launch(
     return out;
 }
 
+std::vector<long long> sample_topa_batched_launch(
+    const float* x, int rows, int n, float top_a, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(top_a > 0.0f && top_a <= 1.0f))
+        throw std::invalid_argument("top_a must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, top_a, t, 4, seeds.data() + c,
+            stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
+std::vector<long long> sample_nsigma_batched_launch(
+    const float* x, int rows, int n, float nsigma, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(nsigma > 0.0f))
+        throw std::invalid_argument("nsigma must be > 0");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, nsigma, t, 5, seeds.data() + c,
+            stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
 std::vector<long long> sample_typical_batched_launch(
     const float* x, int rows, int n, float typical, float t,
     const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
@@ -4099,6 +4728,82 @@ void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream) {
     argmax_kernel<<<grid, kSelBlock, 0, (cudaStream_t)stream>>>(
         x, best, reinterpret_cast<unsigned int*>(ws + kWsArgCnt), n, out);
     check_launch("argmax kernel launch");
+}
+
+// ---------------------------------------------------------------------------
+// batched argmax (v1.8): the single-row pattern row-decomposed - one
+// launch for a whole [rows, n] batch, per-row packed-key max (ties
+// resolve to the earliest index through the key's inverted-index half)
+// with a per-row arrival counter publishing the answer from the last
+// block of the row. The per-row best/counter slots live past the
+// workspace head, where selection calls keep their own data, so they
+// CANNOT ride the single-row self-reset contract across mixed call
+// sequences - the launcher clears them once per call (one memset for
+// the whole batch, never per row) and the finalize still resets them
+// defensively. No device-to-host readback: stream-ordered with the
+// caller's stream and CUDA-graph capturable.
+// ---------------------------------------------------------------------------
+
+__global__ void argmax_b_kernel(const float* __restrict__ x,
+                                unsigned long long* __restrict__ best,
+                                unsigned int* __restrict__ counter,
+                                int n, int gpr, long long* __restrict__ out) {
+    const int row = blockIdx.x / gpr;
+    const int lid = blockIdx.x % gpr;
+    const float* x_row = x + (size_t)row * n;
+    unsigned long long* best_row = best + row;
+    unsigned int* counter_row = counter + row;
+    __shared__ unsigned long long warp_best[kSelWarps];
+    unsigned long long local = 0;
+    for (int i = lid * blockDim.x + threadIdx.x; i < n;
+         i += gpr * blockDim.x) {
+        const unsigned long long key = pack_key(x_row[i], i);
+        if (key > local) local = key;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        local = max(local, __shfl_down_sync(0xffffffffu, local, off));
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_best[warp] = local;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long b = warp_best[0];
+        #pragma unroll
+        for (int w = 1; w < kSelWarps; ++w) b = max(b, warp_best[w]);
+        atomicMax(best_row, b);
+        __threadfence();
+        const unsigned int arrived = atomicAdd(counter_row, 1u);
+        if (arrived == (unsigned int)gpr - 1) {   // last block of the row
+            __threadfence();              // acquire: see every atomicMax
+            out[row] = (long long)(0xFFFFFFFFu -
+                                   (unsigned)((*best_row) & 0xFFFFFFFFu));
+            *best_row = 0ULL;             // defensive reset
+            *counter_row = 0u;
+        }
+    }
+}
+
+void argmax_batched_launch(const float* x, int rows, int n, long long* out,
+                           std::uintptr_t stream) {
+    if (rows <= 0 || n <= 0) return;   // callers enforce the contract
+    unsigned long long* ws = selection_workspace(2 * (size_t)rows);
+    unsigned long long* best = ws + kWsHead;
+    unsigned int* counter =
+        reinterpret_cast<unsigned int*>(ws + kWsHead + rows);
+    cudaStream_t cs = (cudaStream_t)stream;
+    cudaMemsetAsync(best, 0,
+                    2 * (size_t)rows * sizeof(unsigned long long), cs);
+    // same per-row launch shape a standalone call would see: gpr
+    // blocks per row, grid-stride within the row
+    const int gpr = (int)std::min<long long>(
+        ((long long)n + kSelBlock - 1) / kSelBlock, kMaxGrid);
+    // rows * gpr stays far below INT_MAX for any allocation that fits
+    // in device memory (2M rows at the 1024-block cap would need a
+    // ~2 TB input), so the int product cannot overflow
+    argmax_b_kernel<<<rows * gpr, kSelBlock, 0, cs>>>(
+        x, best, counter, n, gpr, out);
+    check_launch("argmax batched kernel launch");
 }
 
 } // namespace fusedtok

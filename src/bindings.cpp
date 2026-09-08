@@ -712,6 +712,48 @@ PYBIND11_MODULE(_fusedtok, m) {
         return idx;
     }, py::arg("x"));
 
+    m.def("argmax_batched_cpu",
+          [](FArray x, int rows, int n) -> py::array_t<long long> {
+        if (x.ndim() != 2)
+            throw std::invalid_argument("argmax_batched expects 2-D input");
+        if (rows < 0)
+            throw std::invalid_argument("rows must be >= 0");
+        if (n <= 0)
+            throw std::invalid_argument("argmax of empty input");
+        if ((py::ssize_t)x.size() < (py::ssize_t)rows * n)
+            throw std::invalid_argument("x size must be at least rows * n");
+        return wrap_ivec(ft::argmax_batched_cpu(to_vec(x), rows, n));
+    }, py::arg("x"), py::arg("rows"), py::arg("n"));
+
+    m.def("argmax_batched", [](FArray x, int rows, int n) {
+        // staged: copy the batch up, run, read the indices back
+        if (x.ndim() != 2)
+            throw std::invalid_argument("argmax_batched expects 2-D input");
+        if (rows < 0)
+            throw std::invalid_argument("rows must be >= 0");
+        if (n <= 0)
+            throw std::invalid_argument("argmax of empty input");
+        if ((py::ssize_t)x.size() < (py::ssize_t)rows * n)
+            throw std::invalid_argument("x size must be at least rows * n");
+        DevBuf dx((size_t)rows * n * 4);
+        DevBuf dout((size_t)rows * sizeof(long long));
+        h2d(dx.get(), x.data(), (size_t)rows * n * 4);
+        ft::argmax_batched_launch(dx.fget(), rows, n,
+                                  static_cast<long long*>(dout.get()));
+        std::vector<long long> idxs((size_t)rows);
+        d2h(idxs.data(), dout.get(), (size_t)rows * sizeof(long long));
+        sync_device("argmax batched kernel");
+        return wrap_ivec(idxs);
+    }, py::arg("x"), py::arg("rows"), py::arg("n"));
+
+    m.def("argmax_batched_launch",
+          [](py::int_ x, int rows, int n, py::int_ out,
+             std::uintptr_t stream) {
+        check_batch_rows_n(rows, n);
+        ft::argmax_batched_launch(df(x), rows, n, dllm(out), stream);
+    }, py::arg("x"), py::arg("rows"), py::arg("n"), py::arg("out"),
+       py::arg("stream") = 0);
+
     m.def("topk_cpu", [](FArray x, int k) {
         if (x.ndim() != 1) throw std::invalid_argument("topk expects 1-D input");
         if (k < 0 || (py::ssize_t)k > x.size())
@@ -1064,6 +1106,98 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("n"), py::arg("min_p"), py::arg("t") = 1.0,
        py::arg("seed") = 0, py::arg("stream") = 0);
 
+    m.def("sample_topa_cpu", [](FArray logits, double top_a, double t,
+                                unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_topa_cpu(to_vec(logits), (float)top_a, (float)t,
+                                   seed);
+    }, py::arg("logits"), py::arg("top_a"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_topa", [](FArray logits, double top_a, double t,
+                            unsigned long long seed) -> long long {
+        // staged: copy logits up, run, read the token back
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(top_a > 0.0 && top_a <= 1.0))
+            throw std::invalid_argument("top_a must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_topa_launch(dx.fget(), n,
+                                                       (float)top_a,
+                                                       (float)t, seed);
+        sync_device("sample top-a kernel");
+        return token;
+    }, py::arg("logits"), py::arg("top_a"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_topa_launch", [](py::int_ x, int n, double top_a,
+                                   double t, unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (!(top_a > 0.0 && top_a <= 1.0))
+            throw std::invalid_argument("top_a must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_topa_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                      n, (float)top_a, (float)t, seed,
+                                      stream);
+    }, py::arg("x"), py::arg("n"), py::arg("top_a"), py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
+    m.def("sample_nsigma_cpu", [](FArray logits, double nsigma, double t,
+                                  unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_nsigma_cpu(to_vec(logits), (float)nsigma,
+                                     (float)t, seed);
+    }, py::arg("logits"), py::arg("nsigma"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_nsigma", [](FArray logits, double nsigma, double t,
+                              unsigned long long seed) -> long long {
+        // staged: copy logits up, run, read the token back
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(nsigma > 0.0))
+            throw std::invalid_argument("nsigma must be > 0");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_nsigma_launch(dx.fget(), n,
+                                                         (float)nsigma,
+                                                         (float)t, seed);
+        sync_device("sample nsigma kernel");
+        return token;
+    }, py::arg("logits"), py::arg("nsigma"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_nsigma_launch", [](py::int_ x, int n, double nsigma,
+                                     double t, unsigned long long seed,
+                                     std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (!(nsigma > 0.0))
+            throw std::invalid_argument("nsigma must be > 0");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_nsigma_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                        n, (float)nsigma, (float)t, seed,
+                                        stream);
+    }, py::arg("x"), py::arg("n"), py::arg("nsigma"), py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
     m.def("sample_eta_cpu", [](FArray logits, double eta, double t,
                                unsigned long long seed) -> long long {
         if (logits.ndim() != 1)
@@ -1330,6 +1464,101 @@ PYBIND11_MODULE(_fusedtok, m) {
             df(x), rows, n, (float)min_p, (float)t, seeds_vec(seeds),
             stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("min_p"),
+       py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
+
+    m.def("sample_topa_batched_cpu",
+          [](FArray logits, int rows, int n, double top_a, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_unit("top_a", top_a);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_topa_batched_cpu(
+            to_vec(logits), rows, n, (float)top_a, (float)t,
+            seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_a"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_topa_batched",
+          [](FArray logits, int rows, int n, double top_a, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_unit("top_a", top_a);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return wrap_ivec({});
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const std::vector<long long> tokens = ft::sample_topa_batched_launch(
+            dx.fget(), rows, n, (float)top_a, (float)t, seeds_vec(seeds));
+        sync_device("sample top-a batched kernel");
+        return wrap_ivec(tokens);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_a"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_topa_batched_launch",
+          [](py::int_ x, int rows, int n, double top_a, double t,
+             const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        check_batch_rows_n(rows, n);
+        check_batch_unit("top_a", top_a);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_topa_batched_launch(
+            df(x), rows, n, (float)top_a, (float)t, seeds_vec(seeds),
+            stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_a"),
+       py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
+
+    m.def("sample_nsigma_batched_cpu",
+          [](FArray logits, int rows, int n, double nsigma, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        if (!(nsigma > 0.0))
+            throw std::invalid_argument("nsigma must be > 0");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_nsigma_batched_cpu(
+            to_vec(logits), rows, n, (float)nsigma, (float)t,
+            seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("nsigma"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_nsigma_batched",
+          [](FArray logits, int rows, int n, double nsigma, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        if (!(nsigma > 0.0))
+            throw std::invalid_argument("nsigma must be > 0");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return wrap_ivec({});
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const std::vector<long long> tokens =
+            ft::sample_nsigma_batched_launch(
+                dx.fget(), rows, n, (float)nsigma, (float)t,
+                seeds_vec(seeds));
+        sync_device("sample nsigma batched kernel");
+        return wrap_ivec(tokens);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("nsigma"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_nsigma_batched_launch",
+          [](py::int_ x, int rows, int n, double nsigma, double t,
+             const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        check_batch_rows_n(rows, n);
+        if (!(nsigma > 0.0))
+            throw std::invalid_argument("nsigma must be > 0");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_nsigma_batched_launch(
+            df(x), rows, n, (float)nsigma, (float)t, seeds_vec(seeds),
+            stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("nsigma"),
        py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
 
     m.def("sample_eta_batched_cpu",

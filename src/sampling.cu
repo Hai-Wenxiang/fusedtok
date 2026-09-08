@@ -626,6 +626,143 @@ long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
     return (long long)order[nucleus - 1];     // float rounding fallback
 }
 
+// top-a sampling: keep every token with p_i >= top_a * p_max^2, the
+// top-a rule from the open-source sampling stack. Prefix cut on a VALUE
+// threshold of the normalized probability (p_max = 1 / total in the
+// max-normalized exp column, so the cutoff in exp units is
+// top_a / total - the same quantity the device serial kernel derives
+// from the float total; here everything runs in double, giving the
+// usual neighboring-draw caveat on rounding boundaries). The cutoff is
+// bounded by p_max for any top_a <= 1, so the nucleus is never empty.
+long long sample_topa_cpu(const std::vector<float>& logits, float top_a,
+                          float t, unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (!(top_a > 0.0f && top_a <= 1.0f))
+        throw std::invalid_argument("top_a must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    // order indices by (logit/T desc, index asc) - the packed-key order
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+
+    // total in double: both the cutoff and the membership comparisons
+    // derive from it
+    double total = 0.0;
+    for (size_t i = 0; i < n; ++i) total += mass_at(i);
+    const double cutoff_p = (double)top_a / (total * total);   // a * p_max^2
+
+    // nucleus: prefix while p_i >= cutoff (p of the rank-0 element is
+    // the max probability, which the cutoff never exceeds for a valid
+    // top_a <= 1, so the nucleus is never empty)
+    float nucleus_mass = 0.0f;
+    size_t nucleus = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double p = mass_at(i) / total;
+        if (p < cutoff_p) { nucleus = i; break; }
+        nucleus_mass += mass_at(i);
+        nucleus = i + 1;
+    }
+    if (nucleus == 0) nucleus = 1;   // min-token guard against drift
+
+    // splitmix64-finalized uniform, identical to the device side
+    const float u = splitmix_uniform(seed);
+
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    for (size_t i = 0; i < nucleus; ++i) {
+        cum += mass_at(i);
+        if (cum >= target) return (long long)order[i];
+    }
+    return (long long)order[nucleus - 1];     // float rounding fallback
+}
+
+// top-n-sigma sampling (Shi et al. 2024, "Top-n sigma: Not All Logits
+// Are You Need"): keep every token whose temperature-scaled logit is
+// at least mu - nsigma * sigma (mu / sigma: the row's mean and
+// standard deviation over the scaled logits themselves), renormalize
+// within that prefix and inverse-CDF the splitmix-hash uniform. The
+// moments run in double here while the device derives them from float
+// accumulators - the usual neighboring-draw caveat on rounding
+// boundaries applies. A near-flat row (sigma -> 0, cutoff -> every
+// logit) keeps the whole vocabulary.
+long long sample_nsigma_cpu(const std::vector<float>& logits,
+                            float nsigma, float t,
+                            unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (!(nsigma > 0.0f))
+        throw std::invalid_argument("nsigma must be > 0");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    // order indices by (logit/T desc, index asc) - the packed-key order
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    // max-shifted moments in double: the cutoff derives from them
+    double s1 = 0.0, s2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double d = (double)(logits[order[i]] * inv_t) - row_max;
+        s1 += d;
+        s2 += d * d;
+    }
+    const double mu_d = s1 / (double)n;
+    const double sigma =
+        std::sqrt(std::fmax(s2 / (double)n - mu_d * mu_d, 0.0));
+    const double cutoff = row_max + mu_d - (double)nsigma * sigma;
+
+    // nucleus: prefix while the scaled logit stays at or above the
+    // cutoff (the rank-0 logit equals the max, which the cutoff never
+    // exceeds, so the nucleus is never empty)
+    float nucleus_mass = 0.0f;
+    size_t nucleus = 0;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+    for (size_t i = 0; i < n; ++i) {
+        if ((double)(logits[order[i]] * inv_t) < cutoff) {
+            nucleus = i;
+            break;
+        }
+        nucleus_mass += mass_at(i);
+        nucleus = i + 1;
+    }
+    if (nucleus == 0) nucleus = 1;   // min-token guard against drift
+
+    // splitmix64-finalized uniform, identical to the device side
+    const float u = splitmix_uniform(seed);
+
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    for (size_t i = 0; i < nucleus; ++i) {
+        cum += mass_at(i);
+        if (cum >= target) return (long long)order[i];
+    }
+    return (long long)order[nucleus - 1];     // float rounding fallback
+}
+
 // eta-cutoff sampling (v1.6, Hewitt et al. 2022): keep every token with
 // p_i >= eta * min(1, exp(-H)), H the distribution entropy in nats,
 // renormalize within the kept prefix and inverse-CDF the splitmix-hash
@@ -877,6 +1014,42 @@ std::vector<long long> sample_minp_batched_cpu(
     return out;
 }
 
+std::vector<long long> sample_topa_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float top_a,
+    float t, const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_topa_cpu(std::vector<float>(row, row + n),
+                                      top_a, t, seeds[r]));
+    }
+    return out;
+}
+
+std::vector<long long> sample_nsigma_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float nsigma,
+    float t, const std::vector<unsigned long long>& seeds) {
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_nsigma_cpu(std::vector<float>(row, row + n),
+                                        nsigma, t, seeds[r]));
+    }
+    return out;
+}
+
 // Batched fused decode step (v1.5): the row-wise composition
 // repetition_penalty -> sample_topp, exactly the single-row wrapper's
 // CPU path (python/fusedtok/__init__.py composes the same two
@@ -916,6 +1089,25 @@ std::vector<long long> decode_step_batched_cpu(
                     ids.begin() + offs[r], ids.begin() + offs[r + 1]),
                 penalty);
         out.push_back(sample_topp_cpu(logits_row, p, t, seeds[r]));
+    }
+    return out;
+}
+
+std::vector<long long> argmax_batched_cpu(const std::vector<float>& x,
+                                          int rows, int n) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (n <= 0)
+        throw std::invalid_argument("argmax of empty vector");
+    if ((long long)x.size() < (long long)rows * n)
+        throw std::invalid_argument("x size must be at least rows * n");
+    std::vector<long long> out((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = x.data() + (size_t)r * n;
+        long long best = 0;
+        for (int i = 1; i < n; ++i)
+            if (row[i] > row[best]) best = i;
+        out[r] = best;
     }
     return out;
 }

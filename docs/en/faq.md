@@ -124,6 +124,16 @@ micro-benchmark yourself, prefer events over wall clock and expect
   `p_i >= eta * min(1, exp(-H))`): confident distributions get the
   heavy truncation (the bar rises toward `eta`), flat ones almost
   none (the bar drops toward zero).
+- **top-a** - a sampling truncation whose threshold tracks the squared
+  peak (keep every token with `p_i >= top_a * p_max^2`): confident
+  distributions keep a tight head, while near-uniform ones keep almost
+  the whole vocabulary - the bar collapses faster than the peak itself
+  flattens.
+- **top-n-sigma** - a sampling truncation whose threshold tracks the
+  row's own spread (keep every token whose scaled logit stays at or
+  above `mean - nsigma * sigma`, moments over the whole row): the long
+  tail of the distribution itself is what gets trimmed; flat rows keep
+  everything.
 - **Locally typical sampling** - a truncation that keeps the smallest
   set of tokens whose total mass reaches `typical`, ordered by how
   close each token's "surprise" (`-log p_i`) is to the distribution

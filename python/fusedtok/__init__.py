@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 __all__ = [
     "cuda_available",
@@ -55,11 +55,14 @@ __all__ = [
     "logit_penalties",
     "logit_penalties_batched",
     "argmax",
+    "argmax_batched",
     "topk",
     "topp",
     "sample_topp",
     "sample_topk",
     "sample_minp",
+    "sample_topa",
+    "sample_nsigma",
     "sample_eta",
     "sample_eta_batched",
     "sample_typical",
@@ -67,6 +70,8 @@ __all__ = [
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
+    "sample_topa_batched",
+    "sample_nsigma_batched",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -1126,6 +1131,42 @@ def argmax(x, *, cuda=False):
     return int(call(arr))
 
 
+def argmax_batched(x, *, cuda=False):
+    """Row-wise argmax for a 2-D batch: one launch for the whole
+    ``[rows, vocab]`` batch, one index per row (earliest index wins
+    ties within each row - the single-row ``argmax`` rule applied
+    verbatim).
+
+    Returns int64 indices: a CUDA torch tensor for CUDA input
+    (stream-ordered, zero-copy - no host sync), a CPU torch tensor for
+    CPU torch input, a numpy array otherwise. This is the greedy decode
+    step for a batch: no seeds, no temperature, no readback on the
+    zero-copy path.
+    """
+    path = _device_path(x, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(x, "x")
+        if x.ndim != 2:
+            raise ValueError("x must be 2-D [rows, vocab] for argmax_batched")
+        if x.shape[1] == 0:
+            raise ValueError("argmax of empty input")
+        rows, n = x.shape
+        out = torch.empty(rows, dtype=torch.int64, device=x.device)
+        _fusedtok.argmax_batched_launch(x.data_ptr(), rows, n,
+                                        out.data_ptr(), _cuda_stream())
+        return out
+    arr = _as_numpy(x, "x")
+    if arr.ndim != 2:
+        raise ValueError("x must be 2-D [rows, vocab] for argmax_batched")
+    if arr.shape[1] == 0:
+        raise ValueError("argmax of empty input")
+    rows, n = arr.shape
+    call = (_fusedtok.argmax_batched if path == "staged"
+            else _fusedtok.argmax_batched_cpu)
+    out = np.asarray(call(arr, rows, n), dtype=np.int64)
+    return _numpy_to_torch_like(out) if _is_torch(x) else out
+
+
 def topk(x, k, *, cuda=False):
     """Top-k selection: the k largest elements and their indices,
     descending, earliest index on ties. Returns ``(values, indices)``."""
@@ -1651,6 +1692,85 @@ def sample_minp(logits, min_p, *, temperature=1.0, seed=0, cuda=False):
     return int(call(arr, min_p, temperature, seed))
 
 
+def sample_topa(logits, top_a, *, temperature=1.0, seed=0, cuda=False):
+    """Fused top-a sampling: one GPU round trip from raw logits to a token.
+
+    Pipeline: softmax of ``logits / temperature`` -> keep every token
+    whose probability is at least ``top_a`` times the SQUARE of the
+    maximum probability -> renormalize within that nucleus ->
+    inverse-CDF draw using a hash-uniform of ``seed``. Like min-p this
+    is a value-threshold nucleus, but the bar falls with the SQUARE of
+    the peak: confident distributions keep a tight head, flat ones keep
+    almost everything (the cutoff is ``top_a * p_max**2`` and
+    ``p_max`` itself shrinks as the distribution flattens). Deterministic per
+    seed; the RNG is a splitmix-style hash (reproducible, NOT
+    cryptographically secure).
+
+    Returns the sampled token id (int). ``top_a`` in (0, 1]
+    (1.0 keeps only tokens whose probability reaches the squared peak -
+    for a unique maximum that is the argmax alone), temperature
+    > 0. The nucleus always keeps at least one token.
+    """
+    if not 0.0 < top_a <= 1.0:
+        raise ValueError("top_a must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_topa_launch(logits.data_ptr(),
+                                                logits.numel(), top_a,
+                                                temperature, seed,
+                                                _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_topa if path == "staged"
+            else _fusedtok.sample_topa_cpu)
+    return int(call(arr, top_a, temperature, seed))
+
+
+def sample_nsigma(logits, nsigma, *, temperature=1.0, seed=0, cuda=False):
+    """Fused top-n-sigma sampling: one GPU round trip from raw logits
+    to a token.
+
+    Pipeline: temperature-scale the logits -> keep every token whose
+    scaled logit is at least ``nsigma`` standard deviations below the
+    mean (``logit >= mean - nsigma * sigma``, the moments taken over
+    the whole row) -> softmax over the survivors -> inverse-CDF draw
+    using a hash-uniform of ``seed`` (Shi et al. 2024, "Top-n sigma:
+    Not All Logits Are You Need"). The cutoff moves with the row's own
+    spread: a confident row trims its long tail hard, a flat row keeps
+    everything. Deterministic per seed; the RNG is a splitmix-style
+    hash (reproducible, NOT cryptographically secure).
+
+    Returns the sampled token id (int). ``nsigma`` > 0 (the paper's
+    sweet spot is 1.0-3.0; huge values approach plain sampling),
+    temperature > 0. The nucleus always keeps at least one token.
+    """
+    if not nsigma > 0.0:
+        raise ValueError("nsigma must be > 0")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_nsigma_launch(logits.data_ptr(),
+                                                  logits.numel(), nsigma,
+                                                  temperature, seed,
+                                                  _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_nsigma if path == "staged"
+            else _fusedtok.sample_nsigma_cpu)
+    return int(call(arr, nsigma, temperature, seed))
+
+
 def sample_eta(logits, eta, *, temperature=1.0, seed=0, cuda=False):
     """Fused eta-cutoff sampling: one GPU round trip from raw logits to
     a token.
@@ -1773,8 +1893,9 @@ def sample_typical_batched(logits, typical, *, temperature=1.0, seeds=None,
 
 
 def _sample_batched(kind, logits, arg, *, temperature, seeds, cuda):
-    """Shared dispatcher behind the three batched samplers (v1.4.1 -
-    the 1.4.0 wrappers were near-verbatim copies of this body).
+    """Shared dispatcher behind the batched samplers (introduced in
+    v1.4, generalized as the sampler family grew - the 1.4.0 wrappers
+    were near-verbatim copies of this body).
     ``kind`` selects the binding family
     ``_fusedtok.sample_<kind>_batched[_cpu|_launch]``; parameter
     validation stays in the public wrappers so their error messages
@@ -1807,6 +1928,54 @@ def _sample_batched(kind, logits, arg, *, temperature, seeds, cuda):
         out = np.asarray(call(arr, rows, n, arg, temperature, s),
                          dtype=np.int64)
     return _numpy_to_torch_like(out) if _is_torch(logits) else out
+
+
+def sample_topa_batched(logits, top_a, *, temperature=1.0, seeds=None,
+                        cuda=False):
+    """Fused top-a sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every
+    row runs the exact ``sample_topa`` pipeline (value-threshold
+    nucleus at ``top_a`` times the squared row maximum) and the call
+    returns one token id per row (int64 array / torch tensor on CPU).
+
+    ``seeds`` is one non-negative integer per row; ``None`` defaults to
+    ``0..rows-1``. ``top_a`` in (0, 1], temperature > 0. Deterministic
+    per (row, seed); not CUDA-graph capturable. Each row's token
+    matches the single-row API up to the documented __expf/atomic-order
+    ulp boundary.
+    """
+    if not 0.0 < top_a <= 1.0:
+        raise ValueError("top_a must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    return _sample_batched("sample_topa", logits, top_a,
+                           temperature=temperature, seeds=seeds,
+                           cuda=cuda)
+
+
+def sample_nsigma_batched(logits, nsigma, *, temperature=1.0, seeds=None,
+                          cuda=False):
+    """Fused top-n-sigma sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every
+    row runs the exact ``sample_nsigma`` pipeline (cutoff at
+    ``nsigma`` standard deviations below the row mean) and the call
+    returns one token id per row (int64 array / torch tensor on CPU).
+
+    ``seeds`` is one non-negative integer per row; ``None`` defaults to
+    ``0..rows-1``. ``nsigma`` > 0, temperature > 0. Deterministic per
+    (row, seed); not CUDA-graph capturable. Each row's token matches
+    the single-row API up to the documented __expf/atomic-order ulp
+    boundary.
+    """
+    if not nsigma > 0.0:
+        raise ValueError("nsigma must be > 0")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    return _sample_batched("sample_nsigma", logits, nsigma,
+                           temperature=temperature, seeds=seeds,
+                           cuda=cuda)
 
 
 def sample_topp_batched(logits, p, *, temperature=1.0, seeds=None,

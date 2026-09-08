@@ -162,7 +162,7 @@ prefill 请交给 SDPA / FlashAttention（基准表里如实标着约 0.45x
 顺序读一遍。可以期待的是：
 
 - f32 decode 在长 cache 上达到或超过 SDPA 的有效带宽
-  （README 表里 3060 @T=16384 最高 8.86x——参考实现需要额外做头
+  （README 表里 3060 @T=16384 最高 8.82x——参考实现需要额外做头
   展开，且在小 query 下效率偏低）。
 - bf16/fp16 cache 把字节减半。batch 为 1 时 kernel 受延迟限制，
   绝对收益有限，batch 越大收益越大。

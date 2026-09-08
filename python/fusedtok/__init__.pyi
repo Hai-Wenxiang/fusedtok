@@ -54,11 +54,14 @@ __all__ = [
     "logit_penalties",
     "logit_penalties_batched",
     "argmax",
+    "argmax_batched",
     "topk",
     "topp",
     "sample_topp",
     "sample_topk",
     "sample_minp",
+    "sample_topa",
+    "sample_nsigma",
     "sample_eta",
     "sample_eta_batched",
     "sample_typical",
@@ -66,6 +69,8 @@ __all__ = [
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
+    "sample_topa_batched",
+    "sample_nsigma_batched",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -114,6 +119,7 @@ def logit_penalties_batched(logits: Array, token_ids: Array, *,
                             ids_offsets: Optional[Array] = None,
                             cuda: bool = False) -> Array: ...
 def argmax(x: Array, *, cuda: bool = False) -> int: ...
+def argmax_batched(x: Array, *, cuda: bool = False) -> Array: ...
 def topk(x: Array, k: int, *,
          cuda: bool = False) -> "tuple[Array, Array]": ...
 def topp(probs: Array, p: float, *,
@@ -124,6 +130,10 @@ def sample_topk(logits: Array, k: int, *, temperature: float = 1.0,
                 seed: int = 0, cuda: bool = False) -> int: ...
 def sample_minp(logits: Array, min_p: float, *, temperature: float = 1.0,
                 seed: int = 0, cuda: bool = False) -> int: ...
+def sample_topa(logits: Array, top_a: float, *, temperature: float = 1.0,
+                seed: int = 0, cuda: bool = False) -> int: ...
+def sample_nsigma(logits: Array, nsigma: float, *, temperature: float = 1.0,
+                  seed: int = 0, cuda: bool = False) -> int: ...
 def sample_eta(logits: Array, eta: float, *, temperature: float = 1.0,
                seed: int = 0, cuda: bool = False) -> int: ...
 def sample_eta_batched(logits: Array, eta: float, *,
@@ -148,6 +158,14 @@ def sample_minp_batched(logits: Array, min_p: float, *,
                         temperature: float = 1.0,
                         seeds: Optional[Array] = None,
                         cuda: bool = False) -> Array: ...
+def sample_topa_batched(logits: Array, top_a: float, *,
+                        temperature: float = 1.0,
+                        seeds: Optional[Array] = None,
+                        cuda: bool = False) -> Array: ...
+def sample_nsigma_batched(logits: Array, nsigma: float, *,
+                          temperature: float = 1.0,
+                          seeds: Optional[Array] = None,
+                          cuda: bool = False) -> Array: ...
 def quantize_int8(x: Array) -> "tuple[Array, float]": ...
 def dequantize_int8(q: Array, scale: float) -> Array: ...
 def qadd_int8(qa: Array, sa: float, qb: Array,
