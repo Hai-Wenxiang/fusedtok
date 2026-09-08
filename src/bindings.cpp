@@ -720,8 +720,11 @@ PYBIND11_MODULE(_fusedtok, m) {
             throw std::invalid_argument("rows must be >= 0");
         if (n <= 0)
             throw std::invalid_argument("argmax of empty input");
-        if ((py::ssize_t)x.size() < (py::ssize_t)rows * n)
-            throw std::invalid_argument("x size must be at least rows * n");
+        // exact shape, not just a size floor - same contract as the
+        // other batched entries (a size floor would silently re-split
+        // a mis-shaped buffer)
+        if (x.shape(0) != rows || x.shape(1) != n)
+            throw std::invalid_argument("x shape must be [rows, n]");
         return wrap_ivec(ft::argmax_batched_cpu(to_vec(x), rows, n));
     }, py::arg("x"), py::arg("rows"), py::arg("n"));
 
@@ -733,8 +736,8 @@ PYBIND11_MODULE(_fusedtok, m) {
             throw std::invalid_argument("rows must be >= 0");
         if (n <= 0)
             throw std::invalid_argument("argmax of empty input");
-        if ((py::ssize_t)x.size() < (py::ssize_t)rows * n)
-            throw std::invalid_argument("x size must be at least rows * n");
+        if (x.shape(0) != rows || x.shape(1) != n)
+            throw std::invalid_argument("x shape must be [rows, n]");
         DevBuf dx((size_t)rows * n * 4);
         DevBuf dout((size_t)rows * sizeof(long long));
         h2d(dx.get(), x.data(), (size_t)rows * n * 4);
@@ -749,7 +752,12 @@ PYBIND11_MODULE(_fusedtok, m) {
     m.def("argmax_batched_launch",
           [](py::int_ x, int rows, int n, py::int_ out,
              std::uintptr_t stream) {
-        check_batch_rows_n(rows, n);
+        // own message instead of check_batch_rows_n (whose
+        // "sample of empty logits" names the wrong family)
+        if (rows < 0)
+            throw std::invalid_argument("rows must be >= 0");
+        if (n <= 0)
+            throw std::invalid_argument("argmax of empty input");
         ft::argmax_batched_launch(df(x), rows, n, dllm(out), stream);
     }, py::arg("x"), py::arg("rows"), py::arg("n"), py::arg("out"),
        py::arg("stream") = 0);

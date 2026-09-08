@@ -197,11 +197,19 @@ def test_error_contract_cpu():
 
 @pytest.mark.skipif(not fusedtok.cuda_available(), reason="staged needs a GPU")
 def test_staged_matches_cpu():
+    # the cutoff derives from the atomic-float total, so a draw landing
+    # on an exp-rounding boundary may shift one rank between the exact
+    # CPU exp column and the GPU __expf column - the documented
+    # neighbor-rank contract, not exact equality
     rng = np.random.default_rng(96)
     logits = _logits(rng, "midtail", 2048)
+    probs = _probs(logits)
+    order = np.argsort(-probs, kind="stable")
+    rank = {int(t): i for i, t in enumerate(order)}
     for seed in range(6):
-        assert fusedtok.sample_topa(logits, 0.2, seed=seed) == \
-            fusedtok.sample_topa(logits, 0.2, seed=seed, cuda=True)
+        host = fusedtok.sample_topa(logits, 0.2, seed=seed)
+        got = fusedtok.sample_topa(logits, 0.2, seed=seed, cuda=True)
+        assert host == got or abs(rank[host] - rank[got]) <= 1
 
 
 @needs_gpu
@@ -272,9 +280,12 @@ class TestCuda:
                 assert int(fusedtok.sample_topa(d_plain, top_a,
                                                 seed=seed)) == \
                     int(fusedtok.sample_topa(d_plain, top_a, seed=seed))
-                assert int(fusedtok.sample_topa(d_spiky, top_a,
-                                                seed=seed)) == \
-                    fusedtok.sample_topa(spiky, top_a, seed=seed)
+                host = fusedtok.sample_topa(spiky, top_a, seed=seed)
+                got = int(fusedtok.sample_topa(d_spiky, top_a, seed=seed))
+                if host != got:
+                    order = np.argsort(-spiky, kind="stable")
+                    rank = {int(tk): i for i, tk in enumerate(order)}
+                    assert abs(rank[host] - rank[got]) <= 1
 
     def test_batched_matches_single_rows_mixed(self):
         # per-row parity on mixed peaked / flat rows: the batched

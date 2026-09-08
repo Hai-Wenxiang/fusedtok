@@ -4,7 +4,7 @@ fusedtok 提供五个注意力相关入口：解码步主力 `attention_decode`�
 分页 cache 变体 `attention_decode_paged`（v1.2）、配套的两条写侧
 `kv_append_paged`（v1.2）与 `kv_append`（v1.3，连续 cache），以及
 prefill 便捷路径 `attention_prefill`。
-这一页讲清各种布局、GQA 映射、变长 batch，以及性能上的诚实定位。
+这一页讲清各种布局、GQA 映射、变长 batch，以及性能上的定位。
 
 **其他语言：** [English: attention operators](../en/attention.md)
 
@@ -125,8 +125,8 @@ fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
 - 一个微型 kernel、流序、可 CUDA graph 捕获。
 - 主机侧来源的 `lens` 取值在 `[0, T)` 内校验；设备上的张量直接信任
   （标准零拷贝信任边界）。
-- 性能（基准表）：3060 上 15.7 µs vs torch 高级索引 49.8 µs
-  （3.18x）、5060 Ti 上 9.4µs vs 20.8µs（2.22x）——算子本身很小、
+- 性能（基准表）：3060 上 13.8 µs vs torch 高级索引 49.1 µs
+  （3.55x）、5060 Ti 上 9.4µs vs 20.8µs（2.21x）——算子本身很小、
   受启动开销限制，倍数随参考侧高级索引自身的 WDDM 波动，量的
   是每步解码的固定成本。
 
@@ -151,18 +151,18 @@ ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
   `causal=False` 时看全部。
 - GQA / dtype / 维度规则与 decode 相同。
 
-诚实定位：这是**便捷路径**——单个分块 kernel，不用 tensor core。
+性能定位：这是**便捷路径**——单个分块 kernel，不用 tensor core。
 它存在的意义是让小 prefill 和混合负载留在 fusedtok 里；重度
-prefill 请交给 SDPA / FlashAttention（基准表里如实标着约 0.45x
-的比值）。
+prefill 请交给 SDPA / FlashAttention（基准表里明确标着约 0.45x
+的差距）。
 
 ## 性能定位
 
 解码注意力受**显存带宽**约束：每个 token 都要把整个 kv-cache
-顺序读一遍。可以期待的是：
+顺序读一遍。大致可以预期：
 
 - f32 decode 在长 cache 上达到或超过 SDPA 的有效带宽
-  （README 表里 3060 @T=16384 最高 8.82x——参考实现需要额外做头
+  （README 表里 3060 @T=16384 最高 8.89x——参考实现需要额外做头
   展开，且在小 query 下效率偏低）。
 - bf16/fp16 cache 把字节减半。batch 为 1 时 kernel 受延迟限制，
   绝对收益有限，batch 越大收益越大。

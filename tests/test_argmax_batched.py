@@ -72,6 +72,14 @@ def test_batched_cpu_direct_surface_contract():
     with pytest.raises(ValueError):
         _fusedtok.argmax_batched_cpu(
             np.zeros((2, 8), dtype=np.float32), -1, 8)  # negative rows
+    # exact shape, not just a size floor: a mis-shaped buffer must be
+    # rejected instead of silently re-split (the 1.8.1 audit fix)
+    with pytest.raises(ValueError):
+        _fusedtok.argmax_batched_cpu(
+            np.zeros((4, 8), dtype=np.float32), 2, 16)
+    with pytest.raises(ValueError):
+        _fusedtok.argmax_batched(
+            np.zeros((4, 8), dtype=np.float32), 2, 16)
 
 
 def test_error_contract_cpu():

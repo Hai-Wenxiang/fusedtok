@@ -184,11 +184,18 @@ def test_error_contract_cpu():
 
 @pytest.mark.skipif(not fusedtok.cuda_available(), reason="staged needs a GPU")
 def test_staged_matches_cpu():
+    # the cutoff derives from the float moment accumulators, so a draw
+    # landing on a rounding boundary may shift one rank between paths -
+    # the documented neighbor-rank contract, not exact equality
     rng = np.random.default_rng(135)
     logits = _logits(rng, "midtail", 2048)
     for seed in range(6):
-        assert fusedtok.sample_nsigma(logits, 1.5, seed=seed) == \
-            fusedtok.sample_nsigma(logits, 1.5, seed=seed, cuda=True)
+        host = fusedtok.sample_nsigma(logits, 1.5, seed=seed)
+        got = fusedtok.sample_nsigma(logits, 1.5, seed=seed, cuda=True)
+        if host != got:
+            order = np.argsort(-logits, kind="stable")
+            rank = {int(t): i for i, t in enumerate(order)}
+            assert abs(rank[host] - rank[got]) <= 1, seed
 
 
 @needs_gpu

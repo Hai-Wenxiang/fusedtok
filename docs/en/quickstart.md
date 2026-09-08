@@ -99,6 +99,17 @@ token = fusedtok.sample_typical(logits, typical=0.9,
 # the combined HF penalties (v1.6.1): one call, once per distinct id
 penalized = fusedtok.logit_penalties(logits, [3, 3, 7], repetition=1.2,
                                      presence=0.1, frequency=0.05)
+
+# value-threshold pair (v1.8): both cutoffs ride min-p's prefix
+# machinery - top-a keys off the squared peak, nsigma off the row's
+# own spread
+token = fusedtok.sample_topa(logits, top_a=0.2, temperature=0.8, seed=0)
+token = fusedtok.sample_nsigma(logits, nsigma=1.5, temperature=0.8,
+                               seed=0)
+
+# batched greedy argmax (v1.8): one launch for the whole batch, ties
+# to the earliest index - the batched decode shortcut with no seeding
+idx = fusedtok.argmax_batched(batch_logits)
 ```
 
 `examples/demo.py` in the repository tours every operator with
@@ -111,8 +122,9 @@ closed-form checks - it doubles as executable documentation.
 - [Attention operators](attention.md) - decode, paged caches, the
   contiguous and paged append write sides, prefill
 - [Sampling and selection](sampling.md) - top-k/top-p/min-p, the
-  entropy-adaptive samplers (eta, typical), the combined logit
-  penalties, and the determinism contract
+  value-threshold pair (top-a, top-n-sigma), the entropy-adaptive
+  samplers (eta, typical), the combined logit penalties, and the
+  determinism contract
 - [The INT8 path](int8.md) - quantization and integer-exact GEMM
 - [Benchmarks](benchmarks.md) - how the numbers are measured and how to
   read them

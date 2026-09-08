@@ -4,10 +4,63 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.1] - 2026-09-09
+
+An audit-driven hardening and documentation round; no new operators,
+no semantic changes. 49 public names; 659 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Fixed
+- **argmax_batched bindings now enforce the exact `[rows, n]` shape**
+  on the staged and CPU surfaces. A mis-shaped buffer whose SIZE
+  covered `rows * n` (say a `[4, 8]` buffer passed as `rows=2,
+  n=16`) used to be silently re-split instead of rejected - every
+  other batched entry checks the shape, and the raw surface is
+  documented to carry the same contract. New tests pin the rejection
+  on both surfaces.
+- The batched CPU references for top-a / top-n-sigma validated
+  `seeds` before `rows`, so a negative `rows` reported the wrong
+  error; the validation order now matches the GPU launchers
+  (rows first), and `argmax_batched_launch`'s empty-input error says
+  "argmax of empty input" like its siblings instead of the sampler
+  helper's "sample of empty logits".
+- Three exact GPU==CPU token assertions relaxed to the documented
+  neighbor-rank contract (the staged tests in the top-a / nsigma
+  files and the spiky-row branch of top-a's mixed-rows test): the
+  cutoffs derive from atomic-float reductions, so a draw landing on a
+  rounding boundary may shift one rank between the exact CPU exp
+  column and the GPU `__expf` column - the same files already used
+  rank windows everywhere else, and exact equality was one driver
+  update away from a spurious CI red.
+
+### Docs
+- Bilingual audit round (55 findings): every prose number resynced to
+  the shipped 1.8.0 benchmark JSONs (headline 8.9x -> 8.8x, the
+  flat-topp range 0.15-0.26x -> 0.16-0.26x, batched top-k 1.51x/1.17x
+  -> 1.48x/1.18x, IMMA ~38 -> ~39 TOPS, the kv_append rows, the
+  argmax across-run spread); the Chinese docs went through a
+  natural-language pass (the "honest" family now renders as
+  natural Chinese, 走查 -> 遍历 with the English glossed at first
+  use, a wall-clock direction fix in the batched-argmax row, and two
+  garbled sentences repaired); the 1.8 ops joined both quickstarts
+  and examples/demo.py so the "tours every operator" claim holds;
+  the en sampling TOC gained the missing logit_penalties_batched
+  entry.
+
+### Changed
+- The argmax_batched launcher's capture contract is now explicit at
+  every level: the zero-copy path is CUDA-graph capturable once the
+  workspace has been reserved by a prior call - a first-ever call
+  may allocate, which cannot run inside an outer capture, so warm up
+  first (the same caveat the batched samplers' workspaces carry).
+  Stale header comments updated for the fused mass+stats pass
+  (eta/typical run two full-vocabulary passes per attempt, not
+  three).
+
 ## [1.8.0] - 2026-09-08
 
 Two more truncation rules and a batched greedy argmax, plus one
-cross-the-board pass fusion. 49 public names; 659 tests green on
+across-the-board pass fusion. 49 public names; 659 tests green on
 RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
 
 ### Added

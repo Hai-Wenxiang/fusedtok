@@ -140,9 +140,9 @@ The cache-write side of the contiguous decode loop (the twin of
 - One tiny kernel, stream-ordered, CUDA-graph capturable.
 - Host-origin `lens` values are validated in `[0, T)`; device-resident
   tensors are trusted (the standard zero-copy boundary).
-- Performance (benchmark tables): 15.7 µs vs 49.8 µs for the torch
-  advanced-indexing scatter on a 3060 (3.18x), 9.4 vs 20.8 µs on a
-  5060 Ti (2.22x) - a tiny launch-bound op whose ratio tracks the
+- Performance (benchmark tables): 13.8 µs vs 49.1 µs for the torch
+  advanced-indexing scatter on a 3060 (3.55x), 9.4 vs 20.8 µs on a
+  5060 Ti (2.21x) - a tiny launch-bound op whose ratio tracks the
   reference's own WDDM swing; the row prices the
   fixed cost per decode step.
 
@@ -179,7 +179,7 @@ Decode attention is **bandwidth-bound**: every token streams the whole
 kv-cache once. What to expect:
 
 - f32 decode runs at effective-bandwidth parity or better vs SDPA at
-  long caches (the README tables show up to 8.82x on an RTX 3060 at
+  long caches (the README tables show up to 8.89x on an RTX 3060 at
   T=16384 - the reference pays head expansion or small-query
   inefficiency there).
 - bf16/fp16 caches halve the bytes. At batch 1 the kernel is

@@ -15,7 +15,7 @@
 | [注意力算子](attention.md) | 连续与分页 kv-cache 上的解码注意力、append 写侧、prefill |
 | [采样与选择](sampling.md) | top-k / top-p / min-p / argmax、融合采样器与解码步（单行与批量）、组合 logit 惩罚、同 token 确定性契约 |
 | [INT8 路径](int8.md) | 量化工具、整数精确 qgemm、W8A8 逐通道 scale |
-| [基准测试](benchmarks.md) | 测量协议、怎么读表（包括如实标注的落败行）、如何复现 |
+| [基准测试](benchmarks.md) | 测量协议、怎么读表（落败的行也原样列出）、如何复现 |
 | [常见问题](faq.md) | 显卡支持表、常见拒绝原因、计时注意事项、词汇表 |
 
 ## 一分钟版本

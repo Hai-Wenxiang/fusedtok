@@ -4741,7 +4741,12 @@ void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream) {
 // sequences - the launcher clears them once per call (one memset for
 // the whole batch, never per row) and the finalize still resets them
 // defensively. No device-to-host readback: stream-ordered with the
-// caller's stream and CUDA-graph capturable.
+// caller's stream and CUDA-graph capturable once the workspace has
+// been reserved by a prior call - a first-ever call may allocate the
+// workspace (a synchronous cudaMalloc + memset), which cannot run
+// inside an outer graph capture, so warm up before capturing. Like
+// every selection op, the workspace is not safe for concurrent
+// launches on different streams.
 // ---------------------------------------------------------------------------
 
 __global__ void argmax_b_kernel(const float* __restrict__ x,
@@ -4803,7 +4808,7 @@ void argmax_batched_launch(const float* x, int rows, int n, long long* out,
     // ~2 TB input), so the int product cannot overflow
     argmax_b_kernel<<<rows * gpr, kSelBlock, 0, cs>>>(
         x, best, counter, n, gpr, out);
-    check_launch("argmax batched kernel launch");
+    check_launch("batch argmax launch");
 }
 
 } // namespace fusedtok

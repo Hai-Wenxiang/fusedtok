@@ -477,6 +477,39 @@ def main():
             ref_bi[0, h] = p @ v[0, kvh].astype(np.float64)
         check("bidirectional zero-copy", yt.cpu().numpy(), ref_bi, tol=1e-4)
 
+    # ---- v1.8: value-threshold samplers + batched greedy argmax ----
+    print("v1.8 samplers / batched argmax")
+    rng18 = np.random.default_rng(180)
+    x18 = rng18.standard_normal(8192).astype(np.float32)
+    x18[7] += 8.0
+    e18 = np.exp(x18 - x18.max())
+    p18 = (e18 / e18.sum()).astype(np.float32)
+    # top-a: every draw must land inside the squared-peak nucleus
+    nuc = set(np.flatnonzero(
+        p18 >= 0.2 * p18.max() * p18.max()).tolist())
+    ok = all(int(fusedtok.sample_topa(x18, 0.2, seed=s)) in nuc
+             for s in range(16))
+    print(f"  {'topa nucleus draws':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    # nsigma: cutoff at 1.5 deviations below the row mean
+    keep = set(np.flatnonzero(
+        x18 >= x18.mean() - 1.5 * x18.std()).tolist())
+    ok = all(int(fusedtok.sample_nsigma(x18, 1.5, seed=s)) in keep
+             for s in range(16))
+    print(f"  {'nsigma spread draws':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    # batched greedy argmax: one launch, per-row earliest-index ties
+    b18 = rng18.standard_normal((6, 2048)).astype(np.float32)
+    b18[np.arange(6), (rng18.random(6) * 2048).astype(np.int64)] += 10.0
+    if have_cuda and HAS_TORCH:
+        got = fusedtok.argmax_batched(
+            torch.from_numpy(b18).cuda()).cpu().numpy()
+    else:
+        got = fusedtok.argmax_batched(b18)
+    ok = np.array_equal(got, np.argmax(b18, axis=1))
+    print(f"  {'argmax_batched vs numpy':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+
     print(SEP)
     print("ALL PASS" if ALL_OK else "SOME CHECKS FAILED")
     return 0 if ALL_OK else 1
