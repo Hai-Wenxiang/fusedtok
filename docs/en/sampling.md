@@ -19,6 +19,7 @@ and GPU draws may differ.
 - [sample_eta - entropy-adaptive cutoff sampling (v1.6)](#sample_eta---entropy-adaptive-cutoff-sampling-v16)
 - [sample_typical - locally typical sampling (v1.6)](#sample_typical---locally-typical-sampling-v16)
 - [logit_penalties - the HF penalty trio in one call (v1.6.1)](#logit_penalties---the-hf-penalty-trio-in-one-call-v161)
+- [logit_penalties_batched - the trio for a whole batch (v1.7)](#logit_penalties_batched---the-trio-for-a-whole-batch-v17)
 - [Batched sampling - one call per decode step (v1.4)](#batched-sampling---one-call-per-decode-step-v14)
 - [Batched decode steps - penalties included (v1.5)](#batched-decode-steps---penalties-included-v15)
 - [The same-token guarantee](#the-same-token-guarantee)
@@ -419,7 +420,7 @@ inherent to returning tokens at all, so - like the single-row samplers
   benchmark tables in the README measure GPU time, a different
   protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
-  (1.51x / 1.17x). The flat worst case keeps the singles' honest
+  (1.48x / 1.18x). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05-0.06x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.
@@ -499,7 +500,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.15-0.26x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.16-0.35x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its

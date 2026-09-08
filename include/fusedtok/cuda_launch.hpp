@@ -98,7 +98,8 @@ long long sample_topa_launch(const float* x, int n, float top_a, float t,
 
 // Fused top-n-sigma sampling (v1.8): temperature, keep every token
 // whose scaled logit stays at or above mu - nsigma * sigma (moments
-// over the whole row, computed by the nsigma stats pass per attempt),
+// over the whole row, computed by the fused mass+stats pass per
+// attempt),
 // renormalize within the nucleus, inverse-CDF draw. Deterministic per
 // seed (same RNG). A value-threshold prefix with min-p's sufficient
 // widening bound (divisor: the exp-unit cutoff).
@@ -108,9 +109,9 @@ long long sample_nsigma_launch(const float* x, int n, float nsigma,
 
 // eta-cutoff sampling (v1.6, Hewitt et al. 2022): the cutoff derives
 // from the distribution entropy (H = log(total) - s / total), computed
-// by the entropy accumulator kernel per attempt - a value-threshold
-// prefix like min-p, but with one more full-vocabulary pass per
-// attempt. Deterministic per seed (same RNG).
+// per attempt by the fused mass+stats pass alongside the total - a
+// value-threshold prefix like min-p. Deterministic per seed (same
+// RNG).
 long long sample_eta_launch(const float* x, int n, float eta, float t,
                             unsigned long long seed,
                             std::uintptr_t stream = 0);
@@ -219,10 +220,16 @@ void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream = 0);
 // Batched greedy argmax (v1.8): x is [rows, n] row-major, out holds one
 // int64 index per row (earliest index on ties, per row). One kernel
 // launch for the whole batch, no device-to-host readback - stream-
-// ordered with the caller's stream and CUDA-graph capturable. Clearing
-// the per-row arrival slots costs one small memset per call.
+// ordered with the caller's stream and CUDA-graph capturable once the
+// workspace has been reserved by a prior call (a first-ever call may
+// allocate, which cannot run inside an outer graph capture - warm up
+// first, exactly like the batched samplers' workspaces). The per-row
+// best/counter slots share workspace memory the selection family uses,
+// so - like every selection op - concurrent calls on DIFFERENT streams
+// are not supported; clearing them costs one small memset per call.
 void argmax_batched_launch(const float* x, int rows, int n, long long* out,
                            std::uintptr_t stream = 0);
+
 // y[i] = x[i] / t.
 void temperature_launch(const float* x, float* y, long long n, float t, std::uintptr_t stream = 0);
 // For each id in ids[0..m): y[id] = x[id] > 0 ? x[id]/penalty : x[id]*penalty.

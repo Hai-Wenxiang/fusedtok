@@ -1,6 +1,6 @@
 # 基准测试：协议与读表指南
 
-fusedtok 发布的数字出自同一个脚本、同一套协议和一条诚实原则。
+fusedtok 发布的数字出自同一个脚本、同一套协议和一条「数字不掺水」的原则。
 这一页把三者都写清楚，你可以复现表里的每一行，也能看懂为什么
 有些行是输的。
 
@@ -31,13 +31,13 @@ python benchmarks/bench.py            # 全套，几分钟
 
 ## 表格怎么读
 
-- 头条表格展示**每算子最大形状**；更小的形状在 JSON 里
+- 主表展示**每算子最大形状**；更小的形状在 JSON 里
   （Blackwell 上小形状的优势反而更大——形状越大，启动开销占比
   越低）。
-- **（如实）** 标注的是 fusedtok 输掉的行：attention_prefill 对
+- **（落败）** 标注的是 fusedtok 输掉的行：attention_prefill 对
   SDPA 的 flash 后端（约 0.45x）、INT8 GEMM 对 cuBLASLt
   （0.40-0.58x）、平坦分布的 sample_topp 对 torch 全并行排序
-  （单行 0.16-0.26x；批量平坦行再低一档，0.05-0.06x，见批量表）、
+  （单行 0.16-0.35x；批量平坦行再低一档，0.05-0.07x，见批量表）、
   宽核的 sample_minp 行（0.34-0.39x——一次加宽重试加一次
   32-64k 排序；torch 的布尔掩码组合式从不排序），以及
   sample_nsigma 行（0.08-0.11x——σ 门槛会保留尖峰行约前 94% 的
@@ -55,7 +55,7 @@ python benchmarks/bench.py            # 全套，几分钟
   张量、rmsnorm+res 3 张量）；INT8 行的 **TOPS** 按每秒稠密 MAC
   数 ×2 计算。
 - **argmax** 行是对含主机同步调用的事件计时，在 WDDM 上摆动大
-  （跨轮 0.73-1.24x）；把同步排除在计时环外的墙上时钟探针测得
+  （1.8.0 三轮跨轮 0.67-1.21x）；把同步排除在计时循环之外的墙钟实测为
   1.12x（3060）/ 0.96x（5060 Ti）。两种数字都在行内注明。
 - 采样行的**组合参考**（排序+掩码+multinomial 等）自身在 WDDM
   上逐轮波动约 15%；JSON 里的逐轮值能看出是哪一侧在动。
@@ -76,7 +76,7 @@ PYTHONPATH=$PWD/build python benchmarks/bench.py --iters 60
 （Windows 请在 VS 开发者命令行里执行 cmake 配置；见
 [CONTRIBUTING](../../CONTRIBUTING.md)。）
 
-## 诚实原则
+## 数字原则
 
 1. README 里的每个数字都能用同目录树里的 JSON 按上述协议再生成。
 2. 输的行与赢的行并列发布，输的原因（设计范围 vs 实测差距）在

@@ -1017,6 +1017,8 @@ std::vector<long long> sample_minp_batched_cpu(
 std::vector<long long> sample_topa_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float top_a,
     float t, const std::vector<unsigned long long>& seeds) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
     if ((long long)logits.size() < (long long)rows * n)
@@ -1035,6 +1037,8 @@ std::vector<long long> sample_topa_batched_cpu(
 std::vector<long long> sample_nsigma_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float nsigma,
     float t, const std::vector<unsigned long long>& seeds) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
     if ((long long)logits.size() < (long long)rows * n)
