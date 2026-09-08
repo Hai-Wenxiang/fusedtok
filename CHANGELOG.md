@@ -4,6 +4,84 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-09-08
+
+Two more truncation rules and a batched greedy argmax, plus one
+cross-the-board pass fusion. 49 public names; 659 tests green on
+RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Added
+- **`sample_topa(logits, top_a, *, temperature, seed)`** and
+  **`sample_topa_batched`** - top-a sampling: keep every token with
+  `p_i >= top_a * p_max^2` (the rule behind HF transformers'
+  `TopALogitsWarper` and vLLM's `top_a`). A value-threshold prefix
+  exactly like min-p, with the cutoff translated to exp units as
+  `top_a / total` - the exptotal pass already produces everything the
+  walker needs, no new reduction - and min-p's sufficient widening
+  bound with the derived cutoff as the divisor. The squared peak is
+  the point: the bar collapses faster than the peak flattens, so
+  near-uniform rows keep (almost) the whole vocabulary while peaked
+  decode rows keep a tight head; `top_a = 1.0` keeps both leaders of a
+  two-horse distribution where `min_p = 1.0` keeps only the max. The
+  cutoff derives from the atomic-float total: the samplers' documented
+  boundary class (neighbor-rank CPU/GPU on rounding boundaries,
+  bit-stable in process). API count 44 -> 46.
+- **`sample_nsigma(logits, nsigma, *, temperature, seed)`** and
+  **`sample_nsigma_batched`** - top-n-sigma sampling (Shi et al. 2024,
+  "Top-n sigma: Not All Logits Are You Need"): keep every token whose
+  temperature-scaled logit stays at or above `mean - nsigma * sigma`,
+  the moments taken over the whole row. A value threshold in logit
+  space - no softmax reduction needed, just the row's first two
+  moments from one new stats pass; in the max-normalized exp column
+  the cutoff is `exp(mean(d) - nsigma * sigma_d)`, max-independent and
+  never above 1, so the widening bound reuses min-p's formula. The
+  moment accumulators widen every block's float partials to DOUBLE
+  before the atomicAdd: the variance computes the difference of two
+  nearly-equal large quantities, and float-magnitude arrival-order
+  drift amplified through that cancellation into visible threshold
+  wobble (the batched determinism test caught 5k-rank rerun flips on
+  131k-wide nuclei before the fix). `sigma -> 0` rows keep everything.
+  API count 46 -> 48.
+- **`argmax_batched(logits)`** - row-wise greedy argmax for a whole
+  `[rows, vocab]` batch in one launch: the single-row packed-key
+  pattern row-decomposed, per-row arrival counters publishing each
+  index from the row's last block, earliest index winning ties per
+  row. No host readback on the zero-copy path (CUDA int64 tensor,
+  stream-ordered), so the launcher is CUDA-graph capturable; the
+  per-row best/counter slots clear once per call (one memset per
+  batch) because the region is shared with the selection family's
+  scratch. API count 48 -> 49.
+
+### Changed
+- The entropy-family samplers' per-attempt mass passes fused: one
+  `mass_stats` pass (single-row and row-decomposed) now produces the
+  softmax total, the entropy accumulator and the nsigma moments from a
+  single read of the logits, replacing the exptotal + entropy +
+  nsigma-stats sequences (eta/typical/nsigma run 2 full passes per
+  attempt instead of 3, one launch less on every attempt). Every
+  output keeps its own accumulation pattern and the shared
+  `__expf(lv)` is the exact quantity the standalone kernels each
+  computed, so all tokens are bit-identical - the full parity suites
+  pin it. Measured on a 3060 at n=131072, 3 rounds averaged: eta
+  single-row -1.0 to -4.9% event time, eta batched B=8 -4.3% wall;
+  typical/nsigma move within run noise (their selection pipeline and
+  widening ladder dominate), stated as-is.
+
+### Fixed
+- Pre-release audit round, four findings: the batched per-row
+  nsigma accumulator arrays sat one rows-stride past their accounted
+  tail slots (up to `rows * 8` bytes written past the workspace
+  allocation by every batched sampler's per-attempt preset whenever
+  the call was the workspace's largest so far - offsets now match the
+  declared layout); the lazy widening readback in top-a/nsigma/eta
+  re-ran the mass passes without re-zeroing, doubling the host-cached
+  total and moments and silently corrupting the "sufficient" widening
+  bound since v1.6 (tokens were never wrong - the x8 ladder floor
+  guarantees termination - but the adaptive jump overshot; the
+  readbacks now take the attempt's own slots); bench.py's nsigma
+  reference used the Bessel-corrected std where the device uses the
+  population std; the argmax-batched grid product's bounds documented.
+
 ## [1.7.0] - 2026-09-07
 
 The combined penalty operator goes batched. 44 public names; 589

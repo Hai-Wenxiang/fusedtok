@@ -75,6 +75,12 @@ topp_cpu(const std::vector<float>& probs, float p);
 
 long long argmax_cpu(const std::vector<float>& x);
 
+// Batched greedy argmax over a [rows, n] batch: one index per row,
+// earliest index winning ties within each row (the single-row rule
+// applied verbatim).
+std::vector<long long> argmax_batched_cpu(const std::vector<float>& x,
+                                          int rows, int n);
+
 std::vector<float> temperature_cpu(const std::vector<float>& x, float t);
 
 std::vector<float> repetition_penalty_cpu(const std::vector<float>& logits,
@@ -119,6 +125,20 @@ long long sample_topk_cpu(const std::vector<float>& logits, int k, float t,
 long long sample_minp_cpu(const std::vector<float>& logits, float min_p,
                           float t, unsigned long long seed);
 
+// top-a variant: keep every token with probability >= top_a times the
+// SQUARE of the maximum probability, renormalize within that nucleus
+// and draw with the same seeded hash.
+long long sample_topa_cpu(const std::vector<float>& logits, float top_a,
+                          float t, unsigned long long seed);
+
+// top-n-sigma variant (Shi et al. 2024): keep every token whose
+// temperature-scaled logit stays at or above mu - nsigma * sigma
+// (the row's mean and standard deviation), renormalize within that
+// prefix and draw with the same seeded hash.
+long long sample_nsigma_cpu(const std::vector<float>& logits,
+                            float nsigma, float t,
+                            unsigned long long seed);
+
 // eta-cutoff sampling (v1.6, Hewitt et al. 2022): keep every token with
 // p_i >= eta * min(1, exp(-H)), H the distribution entropy in nats,
 // renormalize within that prefix and draw with the same seeded hash.
@@ -150,6 +170,12 @@ std::vector<long long> sample_topk_batched_cpu(
     const std::vector<unsigned long long>& seeds);
 std::vector<long long> sample_minp_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float min_p,
+    float t, const std::vector<unsigned long long>& seeds);
+std::vector<long long> sample_topa_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float top_a,
+    float t, const std::vector<unsigned long long>& seeds);
+std::vector<long long> sample_nsigma_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float nsigma,
     float t, const std::vector<unsigned long long>& seeds);
 
 // Batched fused decode step (v1.5): the composed per-row reference

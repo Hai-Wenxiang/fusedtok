@@ -87,6 +87,25 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
                              unsigned long long seed,
                              std::uintptr_t stream = 0);
 
+// Fused top-a sampling: temperature, keep every token with probability
+// >= top_a * p_max^2 (one exptotal pass per attempt derives the cutoff
+// in exp units as top_a / total), renormalize within the nucleus,
+// inverse-CDF draw. Deterministic per seed (same RNG). A value-threshold
+// prefix like min-p with min-p's sufficient widening bound.
+long long sample_topa_launch(const float* x, int n, float top_a, float t,
+                             unsigned long long seed,
+                             std::uintptr_t stream = 0);
+
+// Fused top-n-sigma sampling (v1.8): temperature, keep every token
+// whose scaled logit stays at or above mu - nsigma * sigma (moments
+// over the whole row, computed by the nsigma stats pass per attempt),
+// renormalize within the nucleus, inverse-CDF draw. Deterministic per
+// seed (same RNG). A value-threshold prefix with min-p's sufficient
+// widening bound (divisor: the exp-unit cutoff).
+long long sample_nsigma_launch(const float* x, int n, float nsigma,
+                               float t, unsigned long long seed,
+                               std::uintptr_t stream = 0);
+
 // eta-cutoff sampling (v1.6, Hewitt et al. 2022): the cutoff derives
 // from the distribution entropy (H = log(total) - s / total), computed
 // by the entropy accumulator kernel per attempt - a value-threshold
@@ -135,6 +154,14 @@ std::vector<long long> sample_topk_batched_launch(
     std::uintptr_t stream = 0);
 std::vector<long long> sample_minp_batched_launch(
     const float* x, int rows, int n, float min_p, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+std::vector<long long> sample_topa_batched_launch(
+    const float* x, int rows, int n, float top_a, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+std::vector<long long> sample_nsigma_batched_launch(
+    const float* x, int rows, int n, float nsigma, float t,
     const std::vector<unsigned long long>& seeds,
     std::uintptr_t stream = 0);
 
@@ -188,6 +215,14 @@ void qgemm_perchannel_launch(const signed char* aq, const signed char* bq,
 
 // Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream = 0);
+
+// Batched greedy argmax (v1.8): x is [rows, n] row-major, out holds one
+// int64 index per row (earliest index on ties, per row). One kernel
+// launch for the whole batch, no device-to-host readback - stream-
+// ordered with the caller's stream and CUDA-graph capturable. Clearing
+// the per-row arrival slots costs one small memset per call.
+void argmax_batched_launch(const float* x, int rows, int n, long long* out,
+                           std::uintptr_t stream = 0);
 // y[i] = x[i] / t.
 void temperature_launch(const float* x, float* y, long long n, float t, std::uintptr_t stream = 0);
 // For each id in ids[0..m): y[id] = x[id] > 0 ? x[id]/penalty : x[id]*penalty.

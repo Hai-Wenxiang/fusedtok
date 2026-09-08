@@ -56,6 +56,8 @@ TOPK_SMALL = 50          # small-k selection / sampling window
 TOPK_MID = 4096          # mid-k chunk/merge tail
 TOPP_P = 0.9             # nucleus mass threshold
 MINP = 0.05              # min-p fraction of the max probability
+TOPA = 0.2               # top-a fraction of the squared max probability
+NSIGMA = 1.5             # top-n-sigma deviations below the row mean
 
 
 def bench(fn, iters, warmup=10, rounds=3):
@@ -283,6 +285,33 @@ def main():
                lambda: fusedtok.sample_minp(peaked, MINP),
                lambda: torch_sample_minp(peaked),
                max(20, iters // 4))
+
+        # fused top-a sampling (v1.8) vs the composite an inference loop
+        # would write (softmax + squared-peak boolean mask + renormalize
+        # + multinomial; same RNG caveat as the minp row). top_a on the
+        # same peaked logits keeps a compact head - the decode-time
+        # top-a case.
+        def torch_sample_topa(src):
+            p = torch.softmax(src, -1)
+            sel = p >= TOPA * p.max() ** 2
+            return torch.multinomial(p * sel, 1)
+        record("sample_topa peaked", f"[{vocab}]",
+               lambda: fusedtok.sample_topa(peaked, TOPA),
+               lambda: torch_sample_topa(peaked),
+               max(20, iters // 4))
+
+        # fused top-n-sigma sampling (v1.8): cutoff at NSIGMA standard
+        # deviations below the row mean; the torch composite mirrors the
+        # paper's extreme-value filter (mask in logit space, then
+        # softmax + multinomial over the survivors).
+        def torch_sample_nsigma(src):
+            p = torch.softmax(src, -1)
+            sel = src >= src.mean() - NSIGMA * src.std(correction=0)
+            return torch.multinomial(p * sel, 1)
+        record("sample_nsigma peaked", f"[{vocab}]",
+               lambda: fusedtok.sample_nsigma(peaked, NSIGMA),
+               lambda: torch_sample_nsigma(peaked),
+               max(20, iters // 4))
         flat_logits = torch.randn(vocab, device="cuda") * 1e-3
         record("sample_topp flat (worst)", f"[{vocab}]",
                 lambda: fusedtok.sample_topp(flat_logits, TOPP_P),
@@ -337,6 +366,33 @@ def main():
                    lambda: fusedtok.sample_topp_batched(flat_b, TOPP_P),
                    lambda: torch_topp_b(flat_b),
                    max(10, iters // 6))
+
+            def torch_topa_b(src):
+                p = torch.softmax(src, -1)
+                sel = p >= TOPA * p.max(dim=1, keepdim=True).values ** 2
+                return torch.multinomial(p * sel, 1)
+
+            record("sample_topa b=8 peaked", f"[{b}x{vocab}]",
+                   lambda: fusedtok.sample_topa_batched(peaked_b, TOPA),
+                   lambda: torch_topa_b(peaked_b),
+                   max(20, iters // 4))
+
+            def torch_nsigma_b(src):
+                mu = src.mean(dim=1, keepdim=True)
+                sigma = src.std(dim=1, keepdim=True, correction=0)
+                p = torch.softmax(src, -1)
+                sel = src >= mu - NSIGMA * sigma
+                return torch.multinomial(p * sel, 1)
+
+            record("sample_nsigma b=8 peaked", f"[{b}x{vocab}]",
+                   lambda: fusedtok.sample_nsigma_batched(peaked_b, NSIGMA),
+                   lambda: torch_nsigma_b(peaked_b),
+                   max(20, iters // 4))
+
+            record("argmax b=8", f"[{b}x{vocab}]",
+                   lambda: fusedtok.argmax_batched(peaked_b),
+                   lambda: peaked_b.argmax(dim=1),
+                   max(20, iters // 4))
 
             # batched decode steps (v1.5): the whole penalize -> scale
             # -> sample chain over ragged ~64-token histories. The
