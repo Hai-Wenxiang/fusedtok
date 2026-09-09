@@ -29,6 +29,10 @@ jobs:
       - name: Text hygiene gate (strict UTF-8, no BOM, no mojibake)
         run: python3 scripts/check_utf8.py
 
+      - name: Markdown hygiene gate (README tables vs shipped JSONs,
+          broken bold)
+        run: python3 scripts/check_markdown.py
+
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

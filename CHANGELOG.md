@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.2] - 2026-09-09
+
+Documentation accuracy and tooling-gate round; no new operators, no
+kernel changes. 49 public names; 659 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Fixed
+- **The README benchmark tables' speedup cells shipped corrupted in
+  1.8.1** ('** ** 8.89x****' - the table resync's regex replaced the
+  inner token and kept the old bold wrappers). All 60 cells repaired,
+  and the post-sync verification now covers every cell class: a new
+  scripts/check_markdown.py gate runs in CI beside the text-hygiene
+  gate. It rejects broken/unbalanced bold markers anywhere, and it
+  re-validates every benchmark data row against the shipped JSON of
+  its OWN GPU - the (fused, torch) microsecond pair must exist there
+  (so numbers copied across GPUs cannot ship) and the speedup token
+  must match the same JSON row. The gate negative-tests both defects
+  and enforces a per-README row-coverage floor so a format drift that
+  shrinks the scan fails loudly instead of passing vacuously.
+- The remaining five batched CPU references (eta / typical / topp /
+  topk / minp) plus decode_step_batched_cpu validated `seeds` before
+  `rows`, reporting the wrong error for a negative `rows`; they now
+  match the GPU launchers' order (the 1.8.1 round fixed only two of
+  the seven despite claiming the alignment).
+- Every stale or self-contradictory number found by the bilingual
+  docs re-audit: the argmax across-run spread was stated three
+  different ways, none of them the shipped per-round values (all
+  citations now read 0.77-0.92x, computed from the 1.8.1 rounds);
+  batched top-k in sampling.md said the 1.8.0 numbers (1.48x/1.18x
+  -> the shipped 1.68x/1.19x); the honest-loss ranges batched-flat
+  0.05-0.06x -> 0.05-0.07x, nsigma 0.08-0.11x -> 0.07-0.13x and
+  wide-nucleus min-p 0.34-0.39x -> 0.33-0.39x; a garbled zh faq
+  sentence that carried both the new and the old ranges; the
+  CHANGELOG 1.8.1 entry described an intermediate sync rather than
+  what shipped; two editing leftovers (a duplicated clause and a
+  duplicated parenthetical); the paged overhead range
+  1.09-1.14x -> 1.09-1.13x.
+- Formatting/format nits: demo.py's two >100-column glued
+  continuations rewrapped, a bench.py indent nit, zh quote style
+  normalized, a clipped zh phrase completed, roadmap rows reordered
+  (1.6.1 now precedes 1.6 in the descending list), and the
+  argmax_batched CUDA-graph warm-up caveat added to the sampling docs
+  (en/zh) where capture users would read it.
+
 ## [1.8.1] - 2026-09-09
 
 An audit-driven hardening and documentation round; no new operators,
@@ -35,17 +79,16 @@ no semantic changes. 49 public names; 659 tests green on RTX 3060
 
 ### Docs
 - Bilingual audit round (55 findings): every prose number resynced to
-  the shipped 1.8.0 benchmark JSONs (headline 8.9x -> 8.8x, the
-  flat-topp range 0.15-0.26x -> 0.16-0.26x, batched top-k 1.51x/1.17x
-  -> 1.48x/1.18x, IMMA ~38 -> ~39 TOPS, the kv_append rows, the
-  argmax across-run spread); the Chinese docs went through a
-  natural-language pass (the "honest" family now renders as
-  natural Chinese, 走查 -> 遍历 with the English glossed at first
-  use, a wall-clock direction fix in the batched-argmax row, and two
-  garbled sentences repaired); the 1.8 ops joined both quickstarts
-  and examples/demo.py so the "tours every operator" claim holds;
-  the en sampling TOC gained the missing logit_penalties_batched
-  entry.
+  the freshly re-measured 1.8.1 benchmark JSONs (both README tables
+  regenerated on the shipping build - headline 8.89x/4.67x, the
+  flat-topp range 0.16-0.35x, batched top-k 1.68x/1.19x, IMMA ~37 TOPS
+  on the 3060 - and every topic-page number cascaded); the Chinese
+  docs went through a natural-language pass (the "honest" family now
+  renders as natural Chinese, 走查 -> 遍历 with the English glossed at
+  first use, a wall-clock direction fix in the batched-argmax row, and
+  two garbled sentences repaired); the 1.8 ops joined both quickstarts
+  and examples/demo.py so the "tours every operator" claim holds; the
+  en sampling TOC gained the missing logit_penalties_batched entry.
 
 ### Changed
 - The argmax_batched launcher's capture contract is now explicit at
