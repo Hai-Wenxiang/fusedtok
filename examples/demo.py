@@ -341,8 +341,10 @@ def main():
     if have_cuda and HAS_TORCH:
         lte = torch.from_numpy(lg).cuda()
         for seed in (0, 7):
-            ok = fusedtok.sample_eta(lte, 0.3, temperature=0.8,
-                                     seed=seed) ==                 fusedtok.sample_eta(lg, 0.3, temperature=0.8, seed=seed)
+            ok = (fusedtok.sample_eta(lte, 0.3, temperature=0.8,
+                          seed=seed) ==
+                fusedtok.sample_eta(lg, 0.3, temperature=0.8,
+                                    seed=seed))
             print(f"  {f'seed {seed} cuda matches cpu':<26} {'PASS' if ok else 'FAIL'}")
             ALL_OK &= ok
 
@@ -354,11 +356,12 @@ def main():
     print(f"  {'topp_batched row 0 == single':<26} {'PASS' if ok else 'FAIL'}")
     ALL_OK &= ok
     ids = np.array([[3, 3, 7], [1] * 5, [], [2]], dtype=object)
-    pb = fusedtok.logit_penalties_batched(
-        b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
-        frequency=0.1, cuda=True) if have_cuda and HAS_TORCH else         fusedtok.logit_penalties_batched(
-            b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
-            frequency=0.1)
+    pb = (fusedtok.logit_penalties_batched(
+              b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
+              frequency=0.1, cuda=True) if have_cuda and HAS_TORCH else
+          fusedtok.logit_penalties_batched(
+          b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
+          frequency=0.1))
     ph = fusedtok.logit_penalties_batched(
         b8[:4], [list(r) for r in ids], repetition=1.5, presence=0.2,
         frequency=0.1)
