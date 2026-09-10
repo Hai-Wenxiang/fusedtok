@@ -140,8 +140,8 @@ The cache-write side of the contiguous decode loop (the twin of
 - One tiny kernel, stream-ordered, CUDA-graph capturable.
 - Host-origin `lens` values are validated in `[0, T)`; device-resident
   tensors are trusted (the standard zero-copy boundary).
-- Performance (benchmark tables): 14.4 µs vs 95.5 µs for the torch
-  advanced-indexing scatter on a 3060 (3.64x), 9.4 vs 21.3 µs on a
+- Performance (benchmark tables): 14.3 µs vs 52.0 µs for the torch
+  advanced-indexing scatter on a 3060 (3.64x), 9.3 vs 21.0 µs on a
   5060 Ti (2.26x) - a tiny launch-bound op whose ratio tracks the
   reference's own WDDM swing; the row prices the
   fixed cost per decode step.
@@ -179,12 +179,12 @@ Decode attention is **bandwidth-bound**: every token streams the whole
 kv-cache once. What to expect:
 
 - f32 decode runs at effective-bandwidth parity or better vs SDPA at
-  long caches (the README tables show up to 8.83x on an RTX 3060 at
+  long caches (the README tables show up to 8.84x on an RTX 3060 at
   T=16384 - the reference pays head expansion or small-query
   inefficiency there).
 - bf16/fp16 caches halve the bytes. At batch 1 the kernel is
   latency-bound, so the absolute win is modest and grows with batch.
-- The paged indirection costs ~1.09-1.14x over the contiguous op.
+- The paged indirection costs ~1.09-1.13x over the contiguous op.
 - Prefill is deliberately not competitive with flash backends.
 
 See [benchmarks.md](benchmarks.md) for the measurement protocol and

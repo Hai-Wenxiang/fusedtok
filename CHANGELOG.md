@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-09-10
+
+The 2.0 maintenance release. No new operators, no kernel changes, no
+API changes. 49 public names; 659 tests green on RTX 3060 (Windows,
+CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Docs
+- Bilingual audit round: all benchmark-derived prose numbers verified
+  against the shipped 2.0.0 JSONs (no drift found — the tables were
+  already correct). Both benchmark tables re-measured on the shipping
+  2.0.1 build (3 rounds per GPU, shipping the most-stable round).
+- Quickstart (en+zh) install text updated to reflect the 3.11 floor.
+
 ## [2.0.0] - 2026-09-10
 
 The Python 3.10 end-of-life release. No new operators; every kernel

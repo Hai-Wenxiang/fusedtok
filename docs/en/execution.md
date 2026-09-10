@@ -125,7 +125,7 @@ Stable since 1.0 and pinned by `tests/test_api.py`:
 | Exception | Raised for | Examples |
 |---|---|---|
 | `ValueError` | shapes and value ranges | `k` outside `[0, n]`, `p` outside `(0, 1]`, negative `pos_offset`, `lens` entries beyond the cache, mismatched shapes, host-origin `lens`/`block_table` values out of range |
-| `TypeError` | dtype / device-family problems | float64 input on the zero-copy path, CPU tensor where the primary input is CUDA, mixed dtypes between q/k/v, non-contiguous tensors where the kernel reads raw pointers |
+| `TypeError` | dtype / device-family problems | float64 input on the zero-copy path, CPU tensor where the primary input is CUDA, mixed dtypes between q/k/v, MISMATCHED DEVICES (see the mixed-device rule above) |
 | `RuntimeError` | CUDA execution failures | kernel launch faults, driver errors, failed copies |
 
 Note the contiguity rule: zero-copy kernels address device memory

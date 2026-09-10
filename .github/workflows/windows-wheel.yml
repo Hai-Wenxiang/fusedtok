@@ -10,7 +10,7 @@
 # documented enterprise route that bypasses the broken action).
 #
 # SINCE 1.0 this workflow mirrors the publish.yml wheel MATRIX as a
-# dispatchable dry run: Linux manylinux wheels (cp310-cp313, inside the
+# dispatchable dry run: Linux manylinux wheels (cp311-cp313, inside the
 # same CUDA container publish.yml uses) and Windows wheels (cp311-313,
 # same manual silent CUDA install). Dispatching it on a dev ref
 # validates the full release build matrix WITHOUT publishing anything.
@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13"]
     container:
       image: nvidia/cuda:12.4.1-devel-ubuntu22.04
     steps:

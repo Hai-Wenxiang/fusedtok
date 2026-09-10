@@ -37,7 +37,7 @@ python benchmarks/bench.py            # 全套，几分钟
 - **（落败）** 标注的是 fusedtok 输掉的行：attention_prefill 对
   SDPA 的 flash 后端（约 0.45x）、INT8 GEMM 对 cuBLASLt
   （0.40-0.58x）、平坦分布的 sample_topp 对 torch 全并行排序
-  （单行 0.16-0.28x；批量平坦行再低一档，0.05-0.06x，见批量表）、
+  （单行 0.16-0.39x；批量平坦行再低一档，0.05-0.06x，见批量表）、
   宽核的 sample_minp 行（0.34-0.39x——一次加宽重试加一次
   32-64k 排序；torch 的布尔掩码组合式从不排序），以及
   sample_nsigma 行（0.08-0.11x——σ 门槛会保留尖峰行约前 94% 的
