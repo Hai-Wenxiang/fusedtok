@@ -70,7 +70,7 @@ case may pick a neighboring token after a process restart. Details:
 distribution via a cumulative-sum pass. The fusedtok samplers must
 sort the nucleus (the selection pipeline), and on near-uniform
 logits the nucleus is ~90% of the vocabulary, so they honestly lose
-that regime (0.05-0.06x batched, 0.16-0.28x single-row). Real decode
+that regime (0.05-0.06x batched, 0.16-0.39x single-row). Real decode
 logits are peaked, where the samplers sit at native-multinomial
 level or better. Details:
 [sampling - flat distributions](sampling.md#flat-distributions---the-honest-worst-case).
