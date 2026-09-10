@@ -16,7 +16,7 @@ pip install fusedtok
 ```
 
 Prebuilt wheels (built with CUDA 12.4) cover **Linux x86_64**
-(manylinux, CPython 3.10-3.13) and **Windows x86_64** (3.11-3.13). On
+(manylinux, CPython 3.11-3.13) and **Windows x86_64** (3.11-3.13). On
 other platforms or Python versions, pip builds from source
 automatically:
 
