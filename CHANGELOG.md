@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] - 2026-09-11
+
+Documentation accuracy round. No new operators, no kernel changes, no
+API changes. 49 public names; 659 tests green on RTX 3060 (Windows,
+CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Docs
+- Bilingual re-audit (18 findings, all fixed): every benchmark-derived
+  prose number resynced to the shipped 2.0.1 JSONs (the 2.0.1 table
+  re-measurement shifted several values that the prose paragraphs
+  hadn't caught up with). Highlights: the 3060 int8 TOPS annotations
+  39.3 → 37.7/37.6, the small-shape Blackwell claims softmax 1.72x →
+  1.71x and RMSNorm 3.09x → 3.06x, the sampler prose (topp peaked
+  2.59x → 2.80x, flat worst 0.39x → 0.28x), the batched peaked trio
+  3060 column (1.24/1.54/1.12 → 1.31/1.48/1.07), the kv_append
+  performance note (14.3/52.0/3.64x → 13.6/58.3/4.29x on the 3060),
+  the attention headline 8.84x → 8.79x, and the paged indirection
+  ~1.11x → ~1.10x. The missing 2.0.1 roadmap rows added to both
+  READMEs. The honest-loss ranges (flat-topp 0.16-0.28x, wide-nucleus
+  min-p 0.34-0.59x, nsigma 0.07-0.10x) resynced across all 6 files
+  where they appear.
+
 ## [2.0.1] - 2026-09-10
 
 The 2.0 maintenance release. No new operators, no kernel changes, no

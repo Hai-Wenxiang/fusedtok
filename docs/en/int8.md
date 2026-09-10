@@ -86,7 +86,7 @@ bug.
   projection and runs at full memory bandwidth - roughly 2x the fp16
   projection. This is the per-token hot path and the point of INT8
   weights.
-- The **pipelined IMMA GEMM** reaches ~39 TOPS on an RTX 3060 and ~67
+- The **pipelined IMMA GEMM** reaches ~38 TOPS on an RTX 3060 and ~67
   TOPS on an RTX 5060 Ti (2x-4x the original v0.4 kernel), but
   cuBLASLt (`torch._int_mm`) retains roughly a 2.1-2.5x lead on the
   per-tensor rows (about 1.7-1.8x on the W8A8 rows) with
