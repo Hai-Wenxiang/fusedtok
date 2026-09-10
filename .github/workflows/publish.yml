@@ -6,8 +6,8 @@ name: Publish to PyPI
 #   workflow=publish.yml  environment=(none)
 #
 # Jobs (1.0: per-python wheel matrix; the sdist is built exactly once):
-#   build (matrix 3.10-3.13)
-#                    - manylinux wheel per python, sdist from the 3.10
+#   build (matrix 3.11-3.13)
+#                    - manylinux wheel per python, sdist from the 3.11
 #                    entry only (duplicate sdists would fail the PyPI
 #                    upload). CUDA container; the Docker publish action
 #                    cannot run inside container jobs, so artifacts pass
@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13"]
     container:
       image: nvidia/cuda:12.4.1-devel-ubuntu22.04
     steps:
@@ -63,10 +63,10 @@ jobs:
           # auditwheel's required >= 0.14.5
           pip install --no-cache-dir build auditwheel "patchelf>=0.14.5"
 
-      - name: Build sdist (once, from the 3.10 entry) and wheel
+      - name: Build sdist (once, from the 3.11 entry) and wheel
         run: |
           export PATH="$pythonLocation/bin:$PATH"
-          if [ "${{ matrix.python }}" = "3.10" ]; then
+          if [ "${{ matrix.python }}" = "3.11" ]; then
             python -m build --sdist --outdir dist
           fi
           python -m build --wheel --outdir dist .

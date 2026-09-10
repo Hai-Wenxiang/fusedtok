@@ -140,9 +140,9 @@ The cache-write side of the contiguous decode loop (the twin of
 - One tiny kernel, stream-ordered, CUDA-graph capturable.
 - Host-origin `lens` values are validated in `[0, T)`; device-resident
   tensors are trusted (the standard zero-copy boundary).
-- Performance (benchmark tables): 14.6 µs vs 95.0 µs for the torch
-  advanced-indexing scatter on a 3060 (6.52x), 9.4 vs 21.1 µs on a
-  5060 Ti (2.23x) - a tiny launch-bound op whose ratio tracks the
+- Performance (benchmark tables): 14.4 µs vs 95.5 µs for the torch
+  advanced-indexing scatter on a 3060 (3.64x), 9.4 vs 21.3 µs on a
+  5060 Ti (2.26x) - a tiny launch-bound op whose ratio tracks the
   reference's own WDDM swing; the row prices the
   fixed cost per decode step.
 

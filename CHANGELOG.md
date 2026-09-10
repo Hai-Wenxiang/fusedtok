@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-09-10
+
+The Python 3.10 end-of-life release. No new operators; every kernel
+is unchanged from 1.8.2. 49 public names; 659 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Breaking
+- **Python >= 3.11 required** (was >= 3.10). Python 3.10 reached
+  end-of-life in October 2024; the build matrix, the PyPI publish
+  workflow and the packaging metadata all drop it. The C++17 kernel
+  side is unchanged. If you need Python 3.10, pin fusedtok < 2.0.
+
+### Changed
+- **INT8 GEMM larger-tile evaluation**: the 256×128 and 128×128/SLAB-32
+  tile configurations were evaluated and rejected — the 256-wide C
+  staging alone needs 128 KB of shared memory (past the ~99 KB
+  hardware ceiling), and SLAB-32's shallower pipeline costs more in
+  __syncthreads() than it saves in smem pressure. Closing the
+  cuBLASLt gap requires architectural changes (direct-to-global
+  fragment stores or TMA-driven pipelines) deferred to the 2.1
+  roadmap. The existing 64×64 and 128×128 configurations are
+  unchanged and remain the tested paths.
+- **Tensor-core attention prefill** (bf16/fp16 WMMA flash attention)
+  deferred to the 2.1 roadmap: the WMMA-based kernel requires
+  careful design of the online-softmax accumulator rescaling path
+  (the wmma fragment layout is opaque, so every rescale is a
+  shared-memory round-trip). The existing CUDA-core prefill
+  continues to serve as the honest convenience path (~0.45x SDPA
+  flash; correct for all dtypes and head dims).
+
 ## [1.8.2] - 2026-09-09
 
 Documentation accuracy and tooling-gate round; no new operators, no

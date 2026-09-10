@@ -4,12 +4,12 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "fusedtok"
-version = "1.8.2"
+version = "2.0.0"
 description = "Fused CUDA kernels for LLM inference: attention decode (contiguous + paged kv-cache), RMSNorm, RoPE, SwiGLU, fused sampling, INT8 quantized GEMM - zero-copy torch support"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Hai-Wenxiang" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = ["numpy>=1.24"]
 keywords = ["cuda", "llm", "inference", "kernels", "deep-learning", "pytorch", "attention", "int8", "sampling"]
 classifiers = [
@@ -19,7 +19,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
