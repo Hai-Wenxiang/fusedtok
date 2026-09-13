@@ -207,7 +207,7 @@ tok = fusedtok.sample_tfs(logits, z=0.95, temperature=0.8, seed=step)
   需要两遍（第一遍找最大值，第二遍找截断），但排序窗口很小。扩窗
   策略与 sample_typical 相同——诚实的 x8 阶梯。批量版走逐行调用。
 
-## sample_eta——熵自适应截断采样（v1.6)
+## sample_eta——熵自适应截断采样（v1.6）
 
 ```python
 tok = fusedtok.sample_eta(logits, eta=0.3, temperature=0.8, seed=step)
@@ -376,7 +376,7 @@ CUDA graph 捕获。
   274 µs、minp 1399 -> 237 µs；README 中的事件计时基准表量的是
   GPU 时间，协议不同）。尖峰 logits 下与 torch 原生批量
   multinomial 处于同一档位，`sample_topk_batched` 明确胜出
-  （1.48x / 1.19x）；平坦最坏情况则比单行版再低一档
+  （1.34x / 1.20x）；平坦最坏情况则比单行版再低一档
   （0.05-0.06x），差距同样如实给出。
 - `decode_step` 的批量版见下一节（v1.5）。
 
@@ -406,7 +406,7 @@ tokens = fusedtok.decode_step_batched(
   logits 比逐行循环 `decode_step` 快 5.2 倍（3060：1676 ->
   321 µs；5060 Ti：646 -> 145 µs），与 torch 原生"惩罚 +
   softmax + 批量 multinomial"组合慢约两成（3060 墙钟探针；5060 Ti
-  表中为 147 vs 100 µs）；中尾 logits 快
+  表中为 147 vs 99 µs）；中尾 logits 快
   3.1 倍（3060：17.3 -> 5.5 ms）。
 
 ## 同 token 保证
@@ -440,7 +440,7 @@ softmax 总量靠逐 block 的浮点原子加累加，而 GPU 调度这些 block
 
 当核（nucleus）盖住几乎整个词表（接近均匀的 logits）时，
 `sample_topp` 实际上要给全词表排序，torch 的全并行排序仍然更快
-——基准表里明确标着 0.16-0.28x 的差距。v1.2 用三个不破坏契约的改动把
+——基准表里明确标着 0.16-0.25x 的差距。v1.2 用三个不破坏契约的改动把
 该最坏情况的耗时压到约 1/8.5（快约 8.5 倍；3060 上 n=131072
 实测 18.2ms -> 2.2ms）：
 

@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] - 2026-09-11
+
+Documentation accuracy round. No new operators, no kernel changes, no
+API changes. 51 public names; 680 tests green on RTX 3060 (Windows,
+CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Docs
+- Bilingual re-audit (22 findings, all fixed): every benchmark-derived
+  prose number resynced to the shipped 2.1.0 JSONs (the 2.1.0 table
+  re-measurement shifted values the prose hadn't caught up with).
+  Highlights: sampler prose topp peaked 2.80x → 2.10x (3060), batched
+  trio 3060 column 1.24/1.54/1.12 → 1.29/1.34/1.14, int8 TOPS
+  37.7 → 39.4/39.3, argmax spread → 0.74-1.48x, kv_append →
+  13.7/46.6/3.40x (3060), attention headline 8.79x → 8.82x, paged
+  indirection → 1.09-1.11x, small-shape Blackwell softmax 1.71x →
+  1.74x / RMSNorm 3.06x → 3.11x. The zh API count "49 个" corrected
+  to "51 个". The windows-wheel.yml dry-run matrix updated to match
+  the 3.11+ requirement.
+
 ## [2.1.0] - 2026-09-11
 
 A new sampling algorithm: tail-free sampling (TFS). 51 public names;
