@@ -68,6 +68,8 @@ __all__ = [
     "sample_typical_batched",
     "sample_tfs",
     "sample_tfs_batched",
+    "sample_xtc",
+    "sample_xtc_batched",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
@@ -150,6 +152,13 @@ def sample_tfs(logits: Array, z: float, *, temperature: float = 1.0,
 def sample_tfs_batched(logits: Array, z: float, *,
                        temperature: float = 1.0,
                        seeds: Optional[Array] = None,
+                       cuda: bool = False) -> Array: ...
+def sample_xtc(logits: Array, top_n: int, probability: float, *,
+               temperature: float = 1.0, seed: int = 0,
+               cuda: bool = False) -> int: ...
+def sample_xtc_batched(logits: Array, top_n: int, probability: float, *,
+                       temperature: float = 1.0,
+                       seeds: "Array | None" = None,
                        cuda: bool = False) -> Array: ...
 def sample_typical_batched(logits: Array, typical: float, *,
                            temperature: float = 1.0,

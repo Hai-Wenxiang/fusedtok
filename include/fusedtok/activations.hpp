@@ -81,6 +81,15 @@ std::vector<long long> sample_tfs_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float z,
     float t, const std::vector<unsigned long long>& seeds);
 
+// XTC sampling (v2.2): with probability p, skip the top top_n tokens.
+long long sample_xtc_cpu(const std::vector<float>& logits, int top_n,
+                          float probability, float t,
+                          unsigned long long seed);
+std::vector<long long> sample_xtc_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, int top_n,
+    float probability, float t,
+    const std::vector<unsigned long long>& seeds);
+
 long long argmax_cpu(const std::vector<float>& x);
 
 // Batched greedy argmax over a [rows, n] batch: one index per row,

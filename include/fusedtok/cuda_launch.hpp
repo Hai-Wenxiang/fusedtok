@@ -221,6 +221,14 @@ std::vector<long long> sample_tfs_batched_launch(
     const float* x, int rows, int n, float z, float t,
     const std::vector<unsigned long long>& seeds,
     std::uintptr_t stream = 0);
+long long sample_xtc_launch(const float* x, int n, int top_n,
+                             float probability, float t,
+                             unsigned long long seed,
+                             std::uintptr_t stream = 0);
+std::vector<long long> sample_xtc_batched_launch(
+    const float* x, int rows, int n, int top_n, float probability,
+    float t, const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
 long long sample_tfs_launch(const float* x, int n, float z, float t,
                             unsigned long long seed,
                             std::uintptr_t stream = 0);
