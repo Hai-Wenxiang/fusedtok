@@ -2,7 +2,7 @@
 
 The selection operators (top-k, top-p, argmax) and the fused samplers
 (`sample_topp`, `sample_topk`, `sample_minp`, `sample_topa`,
-`sample_nsigma`, `sample_eta`, `sample_typical`, `decode_step`, plus
+`sample_nsigma`, `sample_tfs`, `sample_eta`, `sample_typical`, `decode_step`, plus
 the `_batched` variants) share
 one pipeline and one determinism
 contract, and `logit_penalties` applies the HF penalty trio in one
@@ -455,7 +455,7 @@ inherent to returning tokens at all, so - like the single-row samplers
   benchmark tables in the README measure GPU time, a different
   protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
-  (**1.48x / 1.19x**). The flat worst case keeps the singles' honest
+  (**1.34x / 1.20x**). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05-0.06x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.
@@ -535,7 +535,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.16-0.28x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.16-0.25x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its
