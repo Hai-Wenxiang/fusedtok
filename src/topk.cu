@@ -2989,6 +2989,182 @@ long long sample_typical_launch(const float* x, int n, float typical,
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// tail-free sampling (v2.1, Filazzola & Trottet 2023): softmax ->
+// compute the CDF second derivative over the sorted window -> keep the
+// prefix where the normalized |d2| stays above (1-z) -> renormalize ->
+// inverse-CDF draw. Same windowing strategy as sample_typical (the
+// honest x8 ladder, no analytic widening bound). Not CUDA-graph
+// capturable (per-attempt readback).
+// ---------------------------------------------------------------------------
+
+// TFS serial tail (one thread, one pass per attempt): reads the sorted
+// exp column, computes the normalized second derivative, finds the
+// cutoff, and draws from the prefix. The d2 computation needs three
+// consecutive probs per element and two passes (pass 1 for d2_max,
+// pass 2 for the cutoff), but k is the sorted window (typically small).
+__global__ void sample_tfs_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
+    int* __restrict__ token_out,
+    int k, int n, float z, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const float total =
+        *reinterpret_cast<const float*>(&ws[kWsTotal]);
+
+    // Pass 1: find max(|d2|) over the window.
+    // d2[i] = 2*exps[i+1] - exps[i] - exps[i+2] (pre-normalization; the
+    // /total scaling cancels in the normalization step)
+    float d2_max = 0.0f;
+    for (int i = 0; i + 2 < k; ++i) {
+        const float d2 = fabsf(2.0f * exps[i+1] - exps[i] - exps[i+2]);
+        if (d2 > d2_max) d2_max = d2;
+    }
+
+    // Pass 2: find the cutoff (first i where |d2[i]| < (1-z)*d2_max)
+    int cutoff = k;
+    if (d2_max > 0.0f) {
+        const float threshold = (1.0f - z) * d2_max;
+        for (int i = 0; i + 2 < k; ++i) {
+            const float d2 = fabsf(2.0f * exps[i+1] - exps[i] - exps[i+2]);
+            if (d2 < threshold) {
+                cutoff = i + 2;
+                break;
+            }
+        }
+    }
+    if (cutoff < 1) cutoff = 1;
+    if (cutoff > k) cutoff = k;
+
+    // An uncovered window (cutoff == k && k < n) means the threshold was
+    // never crossed in this window, so the nucleus may extend past it.
+    if (cutoff >= k && k < n) {
+        float cum_mass = 0.0f;
+        for (int i = 0; i < k; ++i) cum_mass += exps[i];
+        *reinterpret_cast<float*>(&ws[kWsCumW]) = cum_mass;
+        return;
+    }
+
+    // Accumulate the nucleus mass (the prefix sum to the cutoff)
+    float nucleus_mass = 0.0f;
+    for (int i = 0; i < cutoff; ++i) nucleus_mass += exps[i];
+
+    const int nucleus = cutoff > 0 ? cutoff : 1;
+    const float u = splitmix_uniform(seed);
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    int idx = nucleus - 1;
+    for (int i = 0; i < nucleus; ++i) {
+        cum += exps[i];
+        if (cum >= target) { idx = i; break; }
+    }
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// TFS launcher: same windowing strategy as sample_typical (the honest
+// x8 ladder is the whole story — TFS has no analytic widening bound).
+// Not CUDA-graph capturable (per-attempt readback).
+long long sample_tfs_launch(const float* x, int n, float z, float t,
+                            unsigned long long seed,
+                            std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(z > 0.0f && z <= 1.0f))
+        throw std::invalid_argument("z must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window,
+                    inv_t, kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, inv_t, kNoPen);
+        }
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                    kNoPen);
+        check_launch("tfs mass launch");
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                 inv_t, kNoPen);
+        check_launch("tfs selection launch");
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
+        sample_tfs_serial_kernel<<<1, 32,
+                                   walk_cp_slots(window) * sizeof(float),
+                                   cs>>>(
+            sorted, exps, ws, token_out, window, n, z, seed);
+        check_launch("tfs tail launch");
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("tfs kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("tfs readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("tfs nucleus not covered");
+        window = window >= n ? n : window * 8;
+        if (window > n) window = n;
+    }
+}
+
+
+// Batched TFS: one call per row through the single-row launcher (the
+// readback-per-row cost is acceptable for a v2.1 first implementation;
+// a proper batched kernel with the chunked pipeline is future work).
+std::vector<long long> sample_tfs_batched_launch(
+    const float* x, int rows, int n, float z, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(z > 0.0f && z <= 1.0f))
+        throw std::invalid_argument("z must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        out[r] = sample_tfs_launch(x + (size_t)r * n, n, z, t,
+                                    seeds[r], stream);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // batched sampling (v1.4): sample_topp/minp/topk_batched (v1.5 adds
 // decode_step_batched) - [rows, n] logits in, one token per row out.

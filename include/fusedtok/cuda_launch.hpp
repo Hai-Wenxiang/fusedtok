@@ -214,6 +214,17 @@ void qgemm_perchannel_launch(const signed char* aq, const signed char* bq,
                              int m, int n, int k, float sa,
                              std::uintptr_t stream = 0);
 
+// Tail-free sampling (v2.1, Filazzola & Trottet 2023): keep the
+// prefix whose CDF second derivative (normalized) stays above 1-z.
+// Honest x8 widening (no analytic bound). Deterministic per seed.
+std::vector<long long> sample_tfs_batched_launch(
+    const float* x, int rows, int n, float z, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+long long sample_tfs_launch(const float* x, int n, float z, float t,
+                            unsigned long long seed,
+                            std::uintptr_t stream = 0);
+
 // Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream = 0);
 

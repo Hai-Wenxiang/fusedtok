@@ -1128,4 +1128,116 @@ std::vector<long long> argmax_batched_cpu(const std::vector<float>& x,
     return out;
 }
 
+
+// Tail-free sampling (v2.1, Filazzola & Trottet 2023): keep the prefix
+// whose CDF second derivative (normalized to [0,1]) stays above 1-z.
+// The prefix is a data-dependent index into the value-sorted window.
+long long sample_tfs_cpu(const std::vector<float>& logits, float z,
+                          float t, unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (!(z > 0.0f && z <= 1.0f))
+        throw std::invalid_argument("z must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+
+    // Compute exp values and total
+    std::vector<float> exps(n);
+    double total = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        exps[i] = mass_at(i);
+        total += exps[i];
+    }
+
+    // Compute probabilities
+    std::vector<float> probs(n);
+    for (size_t i = 0; i < n; ++i) probs[i] = (float)(exps[i] / total);
+
+    // First derivative d1[i] = probs[i] - probs[i+1] (n-1 elements, >=0)
+    // Second derivative d2[i] = |d1[i] - d1[i+1]| (n-2 elements)
+    if (n >= 3) {
+        std::vector<float> d2(n - 2);
+        float d2_max = 0.0f;
+        for (size_t i = 0; i + 2 < n; ++i) {
+            d2[i] = std::fabs(2.0f * probs[i+1] - probs[i] - probs[i+2]);
+            if (d2[i] > d2_max) d2_max = d2[i];
+        }
+
+        // Find cutoff
+        size_t cutoff = n;   // default: keep everything
+        if (d2_max > 0.0f) {
+            const float threshold = (1.0f - (double)z) * d2_max;
+            for (size_t i = 0; i + 2 < n; ++i) {
+                if (d2[i] < threshold) {
+                    cutoff = i + 2;
+                    break;
+                }
+            }
+        }
+        if (cutoff < 1) cutoff = 1;
+        (void)cutoff;  // used implicitly via the nucleus below
+
+        // Nucleus is probs[0..cutoff-1]
+        float nucleus_mass = 0.0f;
+        for (size_t i = 0; i < cutoff && i < n; ++i)
+            nucleus_mass += exps[i];
+
+        const float u = splitmix_uniform(seed);
+        const float target = u * nucleus_mass;
+        float cum = 0.0f;
+        for (size_t i = 0; i < cutoff && i < n; ++i) {
+            cum += exps[i];
+            if (cum >= target) return (long long)order[i];
+        }
+        return (long long)order[std::min(cutoff, n) - 1];
+    }
+
+    // n < 3: d2 is degenerate, keep everything (TFS is a no-op)
+    float nucleus_mass = 0.0f;
+    for (size_t i = 0; i < n; ++i) nucleus_mass += mass_at(i);
+    const float u = splitmix_uniform(seed);
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        cum += mass_at(i);
+        if (cum >= target) return (long long)order[i];
+    }
+    return (long long)order[n - 1];
+}
+
+std::vector<long long> sample_tfs_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float z,
+    float t, const std::vector<unsigned long long>& seeds) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_tfs_cpu(std::vector<float>(row, row + n),
+                                      z, t, seeds[r]));
+    }
+    return out;
+}
+
 } // namespace fusedtok

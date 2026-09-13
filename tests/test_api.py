@@ -49,6 +49,8 @@ FROZEN_API = frozenset({
     "sample_eta_batched",
     "sample_typical",
     "sample_typical_batched",
+    "sample_tfs",
+    "sample_tfs_batched",
     "sample_topk_batched",
     "sample_minp_batched",
     "sample_topa_batched",

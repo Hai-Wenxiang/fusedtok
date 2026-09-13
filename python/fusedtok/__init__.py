@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 __all__ = [
     "cuda_available",
@@ -67,6 +67,8 @@ __all__ = [
     "sample_eta_batched",
     "sample_typical",
     "sample_typical_batched",
+    "sample_tfs",
+    "sample_tfs_batched",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
@@ -1888,6 +1890,64 @@ def sample_typical_batched(logits, typical, *, temperature=1.0, seeds=None,
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
     return _sample_batched("sample_typical", logits, typical,
+                           temperature=temperature, seeds=seeds,
+                           cuda=cuda)
+
+
+def sample_tfs(logits, z, *, temperature=1.0, seed=0, cuda=False):
+    """Fused tail-free sampling: one GPU round trip from raw logits to
+    a token.
+
+    Pipeline: softmax of ``logits / temperature`` -> sort descending ->
+    compute the CDF second derivative -> normalize to [0,1] -> keep
+    the prefix where the normalized second derivative stays above
+    ``1 - z`` -> renormalize -> inverse-CDF draw using a hash-uniform
+    of ``seed`` (Filazzola & Trottet 2023). ``z = 1`` keeps everything;
+    lower values cut the flat tail more aggressively. Deterministic per
+    seed; the RNG is a splitmix-style hash (reproducible, NOT
+    cryptographically secure).
+
+    Returns the sampled token id (int). ``z`` in (0, 1], temperature
+    > 0. The nucleus always keeps at least one token.
+    """
+    if not 0.0 < z <= 1.0:
+        raise ValueError("z must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_tfs_launch(logits.data_ptr(),
+                                                logits.numel(), z,
+                                                temperature, seed,
+                                                _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_tfs if path == "staged"
+            else _fusedtok.sample_tfs_cpu)
+    return int(call(arr, z, temperature, seed))
+
+
+def sample_tfs_batched(logits, z, *, temperature=1.0, seeds=None,
+                        cuda=False):
+    """Fused tail-free sampling for a batch of rows.
+
+    ``logits`` is 2-D ``[rows, vocab]`` (contiguous, float32); every
+    row runs the exact ``sample_tfs`` pipeline and the call returns
+    one token id per row (int64 array / torch tensor on CPU).
+
+    ``seeds`` is one non-negative integer per row; ``None`` defaults
+    to ``0..rows-1``. ``z`` in (0, 1], temperature > 0. Deterministic
+    per (row, seed); not CUDA-graph capturable.
+    """
+    if not 0.0 < z <= 1.0:
+        raise ValueError("z must be in (0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    return _sample_batched("sample_tfs", logits, z,
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 

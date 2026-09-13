@@ -14,6 +14,7 @@ CPU 与 GPU 抽签可能不一致的精确边界。
 - [sample_minp——按最大值阈值截断的采样（v1.3）](#sample_minp按最大值阈值截断的采样v13)
 - [sample_topa——平方峰值截断采样（v1.8）](#sample_topa平方峰值截断采样v18)
 - [sample_nsigma——按离散度截断的采样（v1.8）](#sample_nsigma按离散度截断的采样v18)
+- [sample_tfs——尾部自由采样（v2.1）](#sample_tfs尾部自由采样v21)
 - [sample_eta——熵自适应截断采样（v1.6）](#sample_eta熵自适应截断采样v16)
 - [sample_typical——局部典型采样（v1.6）](#sample_typical局部典型采样v16)
 - [logit_penalties——一次调用套齐 HF 三件惩罚（v1.6.1）](#logit_penalties一次调用套齐-hf-三件惩罚v161)
@@ -183,7 +184,30 @@ logits 除以温度，保留所有缩放后 logit 不低于 `均值 − nsigma �
   这个阈值）。每次尝试跑一遍 expmax 加一遍新的矩 pass（外加扩窗界
   要用的全局总量），结构与 eta 一致。
 
-## sample_eta——熵自适应截断采样（v1.6）
+## sample_tfs——尾部自由采样（v2.1）
+
+```python
+tok = fusedtok.sample_tfs(logits, z=0.95, temperature=0.8, seed=step)
+```
+
+尾部自由采样（Filazzola & Trottet 2023，llama.cpp/KoboldAI 等广泛支持）
+按排序概率曲线 CDF 的**二阶导数**截断：保留排序后概率曲线仍在"弯曲"
+（归一化的二阶导数绝对值 ≥ `1-z`）的前缀。与 min-p 或 top-a 使用固定值
+阈值不同，TFS 的截断点是数据依赖的——它标记了排序概率分布从弯曲变为
+平坦的位置。
+
+- 取值范围：`z` 必须在 `(0, 1]` 内（越界抛 `ValueError`），
+  `temperature` 必须大于 0。`z = 1.0` 保留全部（阈值 = 0，全通过）；
+  越低剪得越激进。论文推荐值 `0.95`。
+- 核永远至少保留一个 token（排序最高的 token 总被保留），实现里另加
+  min-token 守卫。
+- 按种子确定，与其余采样器共用 RNG。截断索引是排序概率的纯函数，
+  属于文档记录的边界情形。
+- 实现说明：d2 的计算天然是串行的（每个元素依赖三个连续概率），
+  需要两遍（第一遍找最大值，第二遍找截断），但排序窗口很小。扩窗
+  策略与 sample_typical 相同——诚实的 x8 阶梯。批量版走逐行调用。
+
+## sample_eta——熵自适应截断采样（v1.6)
 
 ```python
 tok = fusedtok.sample_eta(logits, eta=0.3, temperature=0.8, seed=step)
@@ -325,7 +349,8 @@ tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 ```
 
 `sample_topp_batched` / `sample_minp_batched` / `sample_topa_batched` /
-`sample_nsigma_batched` / `sample_topk_batched` /
+`sample_nsigma_batched` / `sample_tfs_batched` /
+`sample_topk_batched` /
 `sample_eta_batched` / `sample_typical_batched`
 一次调用采样整个 `[行数, 词表]` 批，每行返回一个 token。返回值是
 **主机侧**的 int64：torch 输入回 CPU torch 张量，numpy 输入回 numpy

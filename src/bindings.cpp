@@ -1206,6 +1206,48 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("n"), py::arg("nsigma"), py::arg("t") = 1.0,
        py::arg("seed") = 0, py::arg("stream") = 0);
 
+    m.def("sample_tfs_cpu", [](FArray logits, double z, double t,
+                                unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_tfs_cpu(to_vec(logits), (float)z, (float)t, seed);
+    }, py::arg("logits"), py::arg("z"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_tfs", [](FArray logits, double z, double t,
+                            unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(z > 0.0 && z <= 1.0))
+            throw std::invalid_argument("z must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_tfs_launch(dx.fget(), n,
+                                                       (float)z, (float)t, seed);
+        sync_device("sample tfs kernel");
+        return token;
+    }, py::arg("logits"), py::arg("z"), py::arg("t") = 1.0,
+       py::arg("seed") = 0);
+
+    m.def("sample_tfs_launch", [](py::int_ x, int n, double z,
+                                   double t, unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (!(z > 0.0 && z <= 1.0))
+            throw std::invalid_argument("z must be in (0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_tfs_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                      n, (float)z, (float)t, seed, stream);
+    }, py::arg("x"), py::arg("n"), py::arg("z"), py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
     m.def("sample_eta_cpu", [](FArray logits, double eta, double t,
                                unsigned long long seed) -> long long {
         if (logits.ndim() != 1)
@@ -1567,6 +1609,55 @@ PYBIND11_MODULE(_fusedtok, m) {
             df(x), rows, n, (float)nsigma, (float)t, seeds_vec(seeds),
             stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("nsigma"),
+       py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
+
+    m.def("sample_tfs_batched_cpu",
+          [](FArray logits, int rows, int n, double z, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        if (!(z > 0.0 && z <= 1.0))
+            throw std::invalid_argument("z must be in (0, 1]");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_tfs_batched_cpu(
+            to_vec(logits), rows, n, (float)z, (float)t, seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("z"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_tfs_batched",
+          [](FArray logits, int rows, int n, double z, double t,
+             const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        if (!(z > 0.0 && z <= 1.0))
+            throw std::invalid_argument("z must be in (0, 1]");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return wrap_ivec({});
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const std::vector<long long> tokens = ft::sample_tfs_batched_cpu(
+            to_vec(logits), rows, n, (float)z, (float)t, seeds_vec(seeds));
+        sync_device("sample tfs batched kernel");
+        return wrap_ivec(tokens);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("z"),
+       py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_tfs_batched_launch",
+          [](py::int_ x, int rows, int n, double z, double t,
+             const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        if (rows < 0)
+            throw std::invalid_argument("rows must be >= 0");
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (!(z > 0.0 && z <= 1.0))
+            throw std::invalid_argument("z must be in (0, 1]");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_tfs_batched_launch(
+            df(x), rows, n, (float)z, (float)t, seeds_vec(seeds), stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("z"),
        py::arg("t") = 1.0, py::arg("seeds"), py::arg("stream") = 0);
 
     m.def("sample_eta_batched_cpu",
