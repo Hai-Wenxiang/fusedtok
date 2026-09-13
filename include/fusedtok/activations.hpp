@@ -73,6 +73,14 @@ topp_cpu(const std::vector<float>& probs, float p);
 //     id is penalized exactly once no matter how often it appears in ids.
 // ---------------------------------------------------------------------------
 
+// Tail-free sampling (v2.1): keep the prefix whose CDF second
+// derivative (normalized) stays above 1-z.
+long long sample_tfs_cpu(const std::vector<float>& logits, float z,
+                         float t, unsigned long long seed);
+std::vector<long long> sample_tfs_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float z,
+    float t, const std::vector<unsigned long long>& seeds);
+
 long long argmax_cpu(const std::vector<float>& x);
 
 // Batched greedy argmax over a [rows, n] batch: one index per row,

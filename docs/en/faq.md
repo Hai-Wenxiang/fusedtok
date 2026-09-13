@@ -129,6 +129,10 @@ micro-benchmark yourself, prefer events over wall clock and expect
   distributions keep a tight head, while near-uniform ones keep almost
   the whole vocabulary - the bar collapses faster than the peak itself
   flattens.
+- **tail-free sampling (TFS)** - a truncation whose cutoff tracks the
+  second derivative of the sorted CDF: keep the prefix where the
+  probability curve still "bends" (normalized |d2| >= 1-z), cutting
+  the effectively flat tail.
 - **top-n-sigma** - a sampling truncation whose threshold tracks the
   row's own spread (keep every token whose scaled logit stays at or
   above `mean - nsigma * sigma`, moments over the whole row): the long

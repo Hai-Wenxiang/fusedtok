@@ -16,6 +16,7 @@ and GPU draws may differ.
 - [sample_minp - threshold-by-max sampling (v1.3)](#sample_minp---threshold-by-max-sampling-v13)
 - [sample_topa - squared-peak cutoff sampling (v1.8)](#sample_topa---squared-peak-cutoff-sampling-v18)
 - [sample_nsigma - sigma-spread cutoff sampling (v1.8)](#sample_nsigma---sigma-spread-cutoff-sampling-v18)
+- [sample_tfs - tail-free sampling (v2.1)](#sample_tfs---tail-free-sampling-v21)
 - [sample_eta - entropy-adaptive cutoff sampling (v1.6)](#sample_eta---entropy-adaptive-cutoff-sampling-v16)
 - [sample_typical - locally typical sampling (v1.6)](#sample_typical---locally-typical-sampling-v16)
 - [logit_penalties - the HF penalty trio in one call (v1.6.1)](#logit_penalties---the-hf-penalty-trio-in-one-call-v161)
@@ -218,6 +219,37 @@ just the row's first two moments.
   new moments pass (and the global total for the widening bound),
   mirroring eta's per-attempt structure.
 
+## sample_tfs - tail-free sampling (v2.1)
+
+```python
+tok = fusedtok.sample_tfs(logits, z=0.95, temperature=0.8, seed=step)
+```
+
+Tail-free sampling (Filazzola & Trottet 2023) truncates by the
+CUMULATIVE probability curve's second derivative: it keeps the prefix
+where the sorted probability curve still "curves" (the second
+derivative, normalized to [0,1], stays above `1 - z`). Unlike min-p or
+top-a which use a fixed value threshold, the TFS cutoff is
+data-dependent — it marks where the sorted probability distribution
+stops bending and becomes effectively flat.
+
+- `z` must be in `(0, 1]` (`ValueError` otherwise); `temperature`
+  must be greater than 0. `z = 1.0` keeps everything (the threshold
+  is 0 and every token passes); lower `z` values cut more
+  aggressively. The paper's sweet spot is `0.95`.
+- The nucleus always keeps at least one token (the sorted-top token
+  is always kept), and a min-token guard makes that explicit.
+- Deterministic per seed, same RNG as the other samplers. The cutoff
+  is a pure function of the sorted probabilities, so it lives in the
+  documented boundary class (CPU-vs-GPU neighbor-rank on rounding
+  boundaries; bit-stable within one process and input buffer).
+- Implementation note: the d2 computation is inherently serial (three
+  consecutive probs per element) and needs two passes (pass 1 for the
+  max, pass 2 for the cutoff), but the sorted window is small. The
+  widening strategy is the honest x8 ladder (no analytic bound,
+  same treatment as sample_typical). Batched rides a per-row loop
+  through the single-row launcher.
+
 ## sample_eta - entropy-adaptive cutoff sampling (v1.6)
 
 ```python
@@ -391,7 +423,8 @@ tokens = fusedtok.sample_topp_batched(batch_logits, p=0.9, seeds=seeds)
 ```
 
 `sample_topp_batched` / `sample_minp_batched` / `sample_topa_batched` /
-`sample_nsigma_batched` / `sample_topk_batched` /
+`sample_nsigma_batched` / `sample_tfs_batched` /
+`sample_topk_batched` /
 `sample_eta_batched` / `sample_typical_batched`
 sample a whole `[rows, vocab]` batch in one call and return one token
 per row. The return is int64 on the HOST: a CPU torch tensor for torch

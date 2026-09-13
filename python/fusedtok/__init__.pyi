@@ -66,6 +66,8 @@ __all__ = [
     "sample_eta_batched",
     "sample_typical",
     "sample_typical_batched",
+    "sample_tfs",
+    "sample_tfs_batched",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
@@ -143,6 +145,12 @@ def sample_eta_batched(logits: Array, eta: float, *,
 def sample_typical(logits: Array, typical: float, *,
                    temperature: float = 1.0,
                    seed: int = 0, cuda: bool = False) -> int: ...
+def sample_tfs(logits: Array, z: float, *, temperature: float = 1.0,
+               seed: int = 0, cuda: bool = False) -> int: ...
+def sample_tfs_batched(logits: Array, z: float, *,
+                       temperature: float = 1.0,
+                       seeds: Optional[Array] = None,
+                       cuda: bool = False) -> Array: ...
 def sample_typical_batched(logits: Array, typical: float, *,
                            temperature: float = 1.0,
                            seeds: Optional[Array] = None,

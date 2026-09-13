@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-09-11
+
+A new sampling algorithm: tail-free sampling (TFS). 51 public names;
+680 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2).
+
+### Added
+- **`sample_tfs(logits, z, *, temperature, seed)`** and
+  **`sample_tfs_batched`** - tail-free sampling (Filazzola & Trottet
+  2023): keep the prefix whose CDF second derivative (normalized to
+  [0,1]) stays above 1-z. A data-dependent cutoff on the flat tail of
+  the sorted probability distribution — unlike min-p or top-a which
+  use fixed value thresholds. The widening strategy is the honest x8
+  ladder (no analytic bound, same treatment as sample_typical).
+  API count 49 -> 51.
+
 ## [2.0.2] - 2026-09-11
 
 Documentation accuracy round. No new operators, no kernel changes, no
