@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-09-14
+
+A new sampling algorithm: XTC (Exclude Top Choices). 53 public names;
+689 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2).
+
+### Added
+- **`sample_xtc(logits, top_n, probability, *, temperature, seed)`**
+  and **`sample_xtc_batched`** - XTC (Exclude Top Choices) sampling:
+  with probability p, the top top_n tokens by probability are removed
+  from the sampling pool before the draw. Breaks LLM "template"
+  outputs. At least one token is always kept. API count 51 -> 53.
+
+### Changed
+- Benchmark tables re-measured on the shipping 2.2.0 build (3060
+  round 2 at 1.22% mean deviation; 5060 Ti table reused from 2.1.0
+  due to server network instability — no kernel changes, values
+  within noise).
+
 ## [2.1.1] - 2026-09-11
 
 Documentation accuracy round. No new operators, no kernel changes, no
