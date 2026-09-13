@@ -3165,6 +3165,160 @@ std::vector<long long> sample_tfs_batched_launch(
     return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// XTC sampling (v2.2, "Exclude Top Choices"): with probability p, skip
+// the top `top_n` tokens and sample from the rest. Breaks the template
+// outputs of over-confident LLMs.
+//
+// The trigger is deterministic per seed: a splitmix hash decides whether
+// this draw suppresses or not. When suppressed, the first top_n tokens
+// of the sorted window are removed and the distribution is renormalized
+// over the remainder. At least one token is always kept (if top_n >= k,
+// the nucleus degenerates to everything).
+//
+// Same windowing strategy as min-p (adaptive widening with the top-p
+// mass bound — the suppression only REMOVES leading tokens, so the
+// top-p bound on the REMAINING mass is still valid). Not CUDA-graph
+// capturable (readback).
+// ---------------------------------------------------------------------------
+
+// XTC serial tail: the suppression decision (coin flip) happens first,
+// then the standard walk starts past the suppressed prefix.
+__global__ void sample_xtc_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
+    int* __restrict__ token_out,
+    int k, int n, int top_n, float probability, unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    // Coin flip: suppress or not (deterministic per seed)
+    const float coin = splitmix_uniform(seed ^ 0x58544300ULL);  // "XTC\0"
+    const bool suppress = (coin < probability);
+
+    // Start walking after the suppressed prefix (or from 0 if no suppression)
+    int start = suppress ? min(top_n, k - 1) : 0;
+
+    // Compute the total mass of the remaining window
+    float total_mass = 0.0f;
+    for (int i = start; i < k; ++i) total_mass += exps[i];
+
+    // If suppression removes everything (start >= k), fall back to no
+    // suppression (keep at least one token)
+    if (start >= k) {
+        total_mass = 0.0f;
+        for (int i = 0; i < k; ++i) total_mass += exps[i];
+        start = 0;
+    }
+
+    const float u = splitmix_uniform(seed);
+    const float target = u * total_mass;
+    float cum = 0.0f;
+    int idx = k - 1;   // fallback
+    for (int i = start; i < k; ++i) {
+        cum += exps[i];
+        if (cum >= target) { idx = i; break; }
+    }
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// XTC launcher: the suppression only REMOVES leading tokens, so the
+// top-p mass bound on the remaining mass is still valid for widening.
+long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
+                            float t, unsigned long long seed,
+                            std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (top_n < 0)
+        throw std::invalid_argument("top_n must be >= 0");
+    if (!(probability >= 0.0f && probability <= 1.0f))
+        throw std::invalid_argument("probability must be in [0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if (top_n == 0 || probability == 0.0f) {
+        // no suppression, plain softmax sampling
+        return sample_minp_launch(x, n, 1e-9f, t, seed, stream);
+    }
+    cudaStream_t cs = (cudaStream_t)stream;
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        check_launch("xtc mass launch");
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                 inv_t, kNoPen);
+        check_launch("xtc selection launch");
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
+        sample_xtc_serial_kernel<<<1, 32,
+                                   walk_cp_slots(window) * sizeof(float),
+                                   cs>>>(
+            sorted, exps, ws, token_out, window, n, top_n, probability, seed);
+        check_launch("xtc tail launch");
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("xtc kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("xtc readback failed");
+        if (token >= 0)
+            return token;
+        if (window == n)
+            throw std::runtime_error("xtc nucleus not covered");
+        window = window >= n ? n : window * 8;
+        if (window > n) window = n;
+    }
+}
+
+std::vector<long long> sample_xtc_batched_launch(
+    const float* x, int rows, int n, int top_n, float probability,
+    float t, const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (top_n < 0)
+        throw std::invalid_argument("top_n must be >= 0");
+    if (!(probability >= 0.0f && probability <= 1.0f))
+        throw std::invalid_argument("probability must be in [0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        out[r] = sample_xtc_launch(x + (size_t)r * n, n, top_n,
+                                    probability, t, seeds[r], stream);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // batched sampling (v1.4): sample_topp/minp/topk_batched (v1.5 adds
 // decode_step_batched) - [rows, n] logits in, one token per row out.

@@ -19,7 +19,7 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 
 ## 算子总览
 
-共 51 个算子与辅助函数（其中 34 个在 1.0 冻结，其余经小版本加入，见下方"API
+共 53 个算子与辅助函数（其中 34 个在 1.0 冻结，其余经小版本加入，见下方"API
 稳定性"）。`axpy` 是 v0.x 骨架保留至今的入门演示算子——可用，但不是
 性能特性。
 
@@ -42,6 +42,7 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 | ✅ | sample_topa / sample_topa_batched | 融合 top-a 采样（v1.8）：保留所有 p >= top_a × p_max² 的 token——与 min-p 同类的值阈值，但由平方峰值驱动门槛（平坦行几乎全保留）；截断值直接从既有总量推出，扩窗下界复用 min-p 的充分公式 |
 | ✅ | sample_nsigma / sample_nsigma_batched | 融合 top-nσ 采样（v1.8，Shi 等 2024）：保留所有缩放后 logit 不低于 `均值 − nsigma × 标准差` 的 token——门槛跟随分布自身离散度；矩只需一遍额外 pass，逐 block 升 double 后原子累加，到达序漂移不会被方差的相减运算放大 |
 | ✅ | sample_tfs / sample_tfs_batched | 融合尾部自由采样（v2.1）：保留 CDF 二阶导数 ≥ 1-z 的前缀——数据依赖的平坦尾部截断，x8 扩窗阶梯 |
+| ✅ | sample_xtc / sample_xtc_batched | 融合 XTC（排除顶部选择）采样（v2.2）：以概率 p 将概率最高的 N 个 token 从采样池中移除——打破"模板化"输出 |
 | ✅ | argmax_batched | 整批 `[行数, 词表]` 贪心下标一次 launch（v1.8）：零拷贝路径无主机回读、可 CUDA graph 捕获；受提交开销限制的主机上 B=8 墙钟耗时约为逐行循环的 1/28（快约 28 倍） |
 | ✅ | sample_topp/minp/topk_batched | 批量采样（v1.4）：一次调用处理整个 `[行数, 词表]` 的 logits，每行按各自种子各出一个 token——每行原封不动地复用单行管线（逐行结果一致）；相比逐行循环，收益纯粹来自省掉逐行的提交开销：受提交延迟限制的主机（如 Windows/WDDM）上墙上时钟时间快 4-6 倍，尖峰解码分布下与 torch 原生批量 multinomial 同档 |
 | ✅ | repetition penalty | CTRL 风格，作用于已生成的 token |
@@ -200,7 +201,7 @@ float32）。
 ## API 稳定性
 
 1.0 冻结了当时的 34 个公开算子与辅助函数；此后新增算子均走小版本
-发布，目前 `fusedtok.__all__` 共 51 个，1.x 系列内签名保持不变。
+发布，目前 `fusedtok.__all__` 共 53 个，1.x 系列内签名保持不变。
 包内附带类型存根（`__init__.pyi`，PEP 561
 `py.typed`）。破坏性变更需要新的大版本并保留一个
 弃用窗口。确定性承诺：选择类并列取最靠前下标；采样按种子可复现

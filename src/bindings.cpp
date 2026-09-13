@@ -1206,6 +1206,89 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("x"), py::arg("n"), py::arg("nsigma"), py::arg("t") = 1.0,
        py::arg("seed") = 0, py::arg("stream") = 0);
 
+    m.def("sample_xtc_cpu", [](FArray logits, int top_n, double probability,
+                                double t, unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        return ft::sample_xtc_cpu(to_vec(logits), top_n, (float)probability,
+                                   (float)t, seed);
+    }, py::arg("logits"), py::arg("top_n"), py::arg("probability"),
+       py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_xtc", [](FArray logits, int top_n, double probability,
+                            double t, unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (top_n < 0)
+            throw std::invalid_argument("top_n must be >= 0");
+        if (!(probability >= 0.0 && probability <= 1.0))
+            throw std::invalid_argument("probability must be in [0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const long long token = ft::sample_xtc_launch(
+            dx.fget(), n, top_n, (float)probability, (float)t, seed);
+        sync_device("sample xtc kernel");
+        return token;
+    }, py::arg("logits"), py::arg("top_n"), py::arg("probability"),
+       py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_xtc_launch", [](py::int_ x, int n, int top_n,
+                                   double probability, double t,
+                                   unsigned long long seed,
+                                   std::uintptr_t stream) -> long long {
+        if (n <= 0)
+            throw std::invalid_argument("sample of empty logits");
+        if (top_n < 0)
+            throw std::invalid_argument("top_n must be >= 0");
+        if (!(probability >= 0.0 && probability <= 1.0))
+            throw std::invalid_argument("probability must be in [0, 1]");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        return ft::sample_xtc_launch(reinterpret_cast<const float*>((uintptr_t)x),
+                                      n, top_n, (float)probability, (float)t,
+                                      seed, stream);
+    }, py::arg("x"), py::arg("n"), py::arg("top_n"), py::arg("probability"),
+       py::arg("t") = 1.0, py::arg("seed") = 0, py::arg("stream") = 0);
+
+    m.def("sample_xtc_batched_cpu",
+          [](FArray logits, int rows, int n, int top_n, double probability,
+             double t, const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        if (top_n < 0)
+            throw std::invalid_argument("top_n must be >= 0");
+        if (!(probability >= 0.0 && probability <= 1.0))
+            throw std::invalid_argument("probability must be in [0, 1]");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_xtc_batched_cpu(
+            to_vec(logits), rows, n, top_n, (float)probability, (float)t,
+            seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_n"),
+       py::arg("probability"), py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_xtc_batched_launch",
+          [](py::int_ x, int rows, int n, int top_n, double probability,
+             double t, const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        check_batch_rows_n(rows, n);
+        if (top_n < 0)
+            throw std::invalid_argument("top_n must be >= 0");
+        if (!(probability >= 0.0 && probability <= 1.0))
+            throw std::invalid_argument("probability must be in [0, 1]");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        return wrap_ivec(ft::sample_xtc_batched_launch(
+            df(x), rows, n, top_n, (float)probability, (float)t,
+            seeds_vec(seeds), stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_n"),
+       py::arg("probability"), py::arg("t") = 1.0, py::arg("seeds"),
+       py::arg("stream") = 0);
+
     m.def("sample_tfs_cpu", [](FArray logits, double z, double t,
                                 unsigned long long seed) -> long long {
         if (logits.ndim() != 1)

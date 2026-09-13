@@ -69,6 +69,8 @@ __all__ = [
     "sample_typical_batched",
     "sample_tfs",
     "sample_tfs_batched",
+    "sample_xtc",
+    "sample_xtc_batched",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
@@ -1950,6 +1952,67 @@ def sample_tfs_batched(logits, z, *, temperature=1.0, seeds=None,
     return _sample_batched("sample_tfs", logits, z,
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
+
+
+def sample_xtc(logits, top_n, probability, *, temperature=1.0, seed=0,
+               cuda=False):
+    """Fused XTC (Exclude Top Choices) sampling: with probability
+    `probability`, the top `top_n` tokens are removed from the pool.
+    """
+    if top_n < 0:
+        raise ValueError("top_n must be >= 0")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("probability must be in [0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        return int(_fusedtok.sample_xtc_launch(logits.data_ptr(),
+                                                logits.numel(), top_n,
+                                                probability, temperature,
+                                                seed, _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_xtc if path == "staged"
+            else _fusedtok.sample_xtc_cpu)
+    return int(call(arr, top_n, probability, temperature, seed))
+
+
+def sample_xtc_batched(logits, top_n, probability, *, temperature=1.0,
+                       seeds=None, cuda=False):
+    """Fused XTC sampling for a batch of rows."""
+    if top_n < 0:
+        raise ValueError("top_n must be >= 0")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("probability must be in [0, 1]")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        s = _batch_seeds(seeds, rows, "seeds")
+        toks = getattr(_fusedtok, "sample_xtc_batched_launch")(
+            logits.data_ptr(), rows, n, top_n, probability,
+            temperature, s, _cuda_stream())
+        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    s = _batch_seeds(seeds, rows, "seeds")
+    call = getattr(_fusedtok,
+                   "sample_xtc_batched" if path == "staged"
+                   else "sample_xtc_batched_cpu")
+    out = np.asarray(call(arr, rows, n, top_n, probability,
+                          temperature, s), dtype=np.int64)
+    return _numpy_to_torch_like(out) if _is_torch(logits) else out
 
 
 def _sample_batched(kind, logits, arg, *, temperature, seeds, cuda):

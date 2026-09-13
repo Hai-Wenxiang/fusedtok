@@ -1240,4 +1240,72 @@ std::vector<long long> sample_tfs_batched_cpu(
     return out;
 }
 
+// XTC sampling (v2.2): with probability p, skip the top top_n tokens.
+long long sample_xtc_cpu(const std::vector<float>& logits, int top_n,
+                          float probability, float t,
+                          unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (top_n < 0)
+        throw std::invalid_argument("top_n must be >= 0");
+    if (!(probability >= 0.0f && probability <= 1.0f))
+        throw std::invalid_argument("probability must be in [0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+
+    const float row_max = logits[order[0]] * inv_t;
+    auto mass_at = [&](size_t i) {
+        return std::exp(logits[order[i]] * inv_t - row_max);
+    };
+
+    // Coin flip (splitmix hash with a different seed offset for the coin)
+    const float coin = splitmix_uniform(seed ^ 0x58544300ULL);
+    const bool suppress = (coin < probability);
+    const size_t start = suppress ? std::min((size_t)top_n, n - 1) : 0;
+
+    float total_mass = 0.0f;
+    for (size_t i = start; i < n; ++i) total_mass += mass_at(i);
+
+    const float u = splitmix_uniform(seed);
+    const float target = u * total_mass;
+    float cum = 0.0f;
+    for (size_t i = start; i < n; ++i) {
+        cum += mass_at(i);
+        if (cum >= target) return (long long)order[i];
+    }
+    return (long long)order[n - 1];
+}
+
+
+std::vector<long long> sample_xtc_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, int top_n,
+    float probability, float t,
+    const std::vector<unsigned long long>& seeds) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
+    std::vector<long long> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        out.push_back(sample_xtc_cpu(std::vector<float>(row, row + n),
+                                      top_n, probability, t, seeds[r]));
+    }
+    return out;
+}
+
 } // namespace fusedtok

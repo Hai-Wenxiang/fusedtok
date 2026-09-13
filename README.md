@@ -20,7 +20,7 @@ traffic and launch overhead.
 
 ## Operators
 
-51 operators + helpers (`fusedtok.__all__`; 34 were frozen at 1.0, the
+53 operators + helpers (`fusedtok.__all__`; 34 were frozen at 1.0, the
 rest arrived in minor releases - see "API stability" below). `axpy` is
 the hello-world demo op kept from
 the v0.x skeleton - functional, but not a performance feature.
@@ -44,6 +44,7 @@ the v0.x skeleton - functional, but not a performance feature.
 | ✅ | sample_topa / sample_topa_batched | fused top-a sampling (v1.8): keep every token with p >= top_a * p_max^2 - a value threshold like min-p with the squared peak driving the bar (flat rows keep almost everything); min-p's widening bound with the cutoff derived from the existing total |
 | ✅ | sample_nsigma / sample_nsigma_batched | fused top-n-sigma sampling (v1.8, Shi et al. 2024): keep every token whose scaled logit stays at or above `mean - nsigma * sigma` - the row's own spread sets the bar; moments from one extra pass, accumulated in doubles so arrival-order drift cannot survive the variance's cancellation |
 | ✅ | sample_tfs / sample_tfs_batched | fused tail-free sampling (v2.1): keep the prefix whose CDF second derivative stays above 1-z - a data-dependent cutoff on the flat tail; the x8 widening ladder |
+| ✅ | sample_xtc / sample_xtc_batched | fused XTC (Exclude Top Choices) sampling (v2.2): with probability p, the top N tokens are removed from the pool — breaks "template" outputs |
 | ✅ | argmax_batched | row-wise greedy argmax for a whole `[rows, vocab]` batch in one launch (v1.8): no readback on the zero-copy path, CUDA-graph capturable; ~28x the per-row loop in wall time at B=8 on a submission-bound host |
 | ✅ | sample_topp/minp/topk_batched | batched sampling (v1.4): one call, `[rows, vocab]` logits in, one seeded token per row out - every row runs the single-row pipeline verbatim; the batched call is 4-6x faster in wall time than looping per row on submission-bound hosts, and sits at native batched-multinomial level on peaked decode logits |
 | ✅ | repetition penalty | CTRL-style, applied to sampled token ids |
@@ -211,7 +212,7 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 ## API stability
 
 1.0 froze the public surface at 34 names; new operators arrive in
-minor releases (51 as of v2.1), and every name in `fusedtok.__all__`
+minor releases (53 as of v2.2), and every name in `fusedtok.__all__`
 keeps its signature across the 1.x series.
 Type stubs (`__init__.pyi`, PEP 561 `py.typed`) ship with the package.
 Breaking changes require a new major version and a deprecation window.
