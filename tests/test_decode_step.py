@@ -127,3 +127,32 @@ class TestTorchZeroCopy:
                                     seed=11) == \
             fusedtok.decode_step(logits, ids, 1.25, p=0.9, temperature=0.7,
                                  seed=11)
+
+    def test_out_of_range_device_ids_are_dropped_safely(self):
+        # Trust boundary (documented on _ids_arg): host-origin ids are
+        # validated with ValueError before upload; device-resident ids
+        # are trusted without a stream sync. A bad device tensor must
+        # not corrupt the selection workspace - the penalty bitmap
+        # kernel's range guard (2.2.1, mirroring penalty_count_kernel)
+        # drops invalid ids, so sampling proceeds as if they were
+        # absent. Values here survive the kernel's int32 cast intact,
+        # which is exactly the case the guard covers.
+        rng = np.random.default_rng(38)
+        logits = (rng.standard_normal(3000) * 2).astype(np.float32)
+        good = rng.integers(0, 3000, size=50).tolist()
+        bad = [3000, -7, 2**31 - 1]
+        t = torch.from_numpy(logits).cuda()
+
+        # mixed valid + invalid device ids == valid ids only
+        ti = torch.tensor(good + bad, dtype=torch.int64).cuda()
+        assert fusedtok.decode_step(t, ti, 1.25, p=0.9, temperature=0.7,
+                                    seed=11) == \
+            fusedtok.decode_step(logits, good, 1.25, p=0.9,
+                                 temperature=0.7, seed=11)
+
+        # only-invalid device ids == no penalty at all (empty bitmap)
+        ti = torch.tensor(bad, dtype=torch.int64).cuda()
+        assert fusedtok.decode_step(t, ti, 1.25, p=0.9, temperature=0.7,
+                                    seed=11) == \
+            fusedtok.decode_step(logits, [], 1.25, p=0.9, temperature=0.7,
+                                 seed=11)

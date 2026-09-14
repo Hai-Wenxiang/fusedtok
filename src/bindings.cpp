@@ -196,7 +196,7 @@ void check_batch_ids(const I64Array& ids, const I64Array& offs, int rows,
     if (offs.size() != rows + 1)
         throw std::invalid_argument(
             std::string(what) + " offsets must have rows + 1 entries");
-    if (offs.size() == 0 || offs.at(0) != 0 ||
+    if (offs.at(0) != 0 ||
         offs.at(offs.size() - 1) != (long long)ids.size())
         throw std::invalid_argument(
             std::string(what) +
@@ -706,9 +706,11 @@ PYBIND11_MODULE(_fusedtok, m) {
         DevBuf dout(sizeof(int));
         h2d(dx.get(), x.data(), n * 4);
         ft::argmax_launch(dx.fget(), n, static_cast<int*>(dout.get()));
+        // sync first (surfaces kernel faults with this label), then the
+        // synchronous readback - one stall, not two
+        sync_device("argmax kernel");
         long long idx = 0;
         d2h(&idx, dout.get(), sizeof(int));
-        sync_device("argmax kernel");
         return idx;
     }, py::arg("x"));
 
@@ -781,9 +783,11 @@ PYBIND11_MODULE(_fusedtok, m) {
         h2d(dx.get(), x.data(), n * 4);
         ft::topk_launch(dx.fget(), dv.fget(),
                         static_cast<long long*>(di.get()), n, k);
+        // sync first (surfaces kernel faults with this label), then the
+        // synchronous readbacks - one stall, not two
+        sync_device("topk kernel");
         d2h(vals.mutable_data(), dv.get(), (size_t)k * 4);
         d2h(idxs.mutable_data(), di.get(), (size_t)k * sizeof(long long));
-        sync_device("topk kernel");
         return py::make_tuple(vals, idxs);
     }, py::arg("x"), py::arg("k"));
 
@@ -811,8 +815,10 @@ PYBIND11_MODULE(_fusedtok, m) {
                                static_cast<long long*>(di.get()), n, (float)p,
                                static_cast<int*>(dc.get()));
         int count = 0;
-        d2h(&count, dc.get(), sizeof(int));
+        // sync first (surfaces kernel faults with this label), then the
+        // synchronous readback - one stall, not two
         sync_device("topp kernels");
+        d2h(&count, dc.get(), sizeof(int));
         py::array_t<float> vals(std::vector<py::ssize_t>{(py::ssize_t)count});
         py::array_t<long long> idxs(std::vector<py::ssize_t>{(py::ssize_t)count});
         if (count > 0) {
@@ -1271,6 +1277,28 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_n"),
        py::arg("probability"), py::arg("t") = 1.0, py::arg("seeds"));
 
+    m.def("sample_xtc_batched",
+          [](FArray logits, int rows, int n, int top_n, double probability,
+             double t, const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        if (top_n < 0)
+            throw std::invalid_argument("top_n must be >= 0");
+        if (!(probability >= 0.0 && probability <= 1.0))
+            throw std::invalid_argument("probability must be in [0, 1]");
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return wrap_ivec({});
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const std::vector<long long> tokens = ft::sample_xtc_batched_launch(
+            dx.fget(), rows, n, top_n, (float)probability, (float)t,
+            seeds_vec(seeds));
+        sync_device("sample xtc batched kernel");
+        return wrap_ivec(tokens);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_n"),
+       py::arg("probability"), py::arg("t") = 1.0, py::arg("seeds"));
+
     m.def("sample_xtc_batched_launch",
           [](py::int_ x, int rows, int n, int top_n, double probability,
              double t, const I64Array& seeds,
@@ -1719,8 +1747,8 @@ PYBIND11_MODULE(_fusedtok, m) {
             return wrap_ivec({});
         DevBuf dx((size_t)rows * n * 4);
         h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_tfs_batched_cpu(
-            to_vec(logits), rows, n, (float)z, (float)t, seeds_vec(seeds));
+        const std::vector<long long> tokens = ft::sample_tfs_batched_launch(
+            dx.fget(), rows, n, (float)z, (float)t, seeds_vec(seeds));
         sync_device("sample tfs batched kernel");
         return wrap_ivec(tokens);
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("z"),

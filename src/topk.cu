@@ -229,12 +229,17 @@ __device__ __forceinline__ float step_logit(const float* __restrict__ x,
 }
 
 // Marks the sampled ids in the vocab bitmap (one bit per token).
+// Host-side validation already rejected out-of-range ids; the guard
+// keeps a bad device-resident tensor (trusted, not synced - see
+// _ids_arg) from corrupting memory - same convention as the v1.5
+// penalty_count_kernel.
 __global__ void penalty_bitmap_kernel(const long long* __restrict__ ids,
-                                      int m,
+                                      int m, int n,
                                       unsigned long long* __restrict__ bm) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= m) return;
     const int id = (int)ids[j];
+    if (id < 0 || id >= n) return;   // validated on host; defensive guard
     atomicOr(&bm[id >> 6], 1ULL << (id & 63));
 }
 
@@ -260,7 +265,9 @@ constexpr PenCtxB kNoPenB{nullptr, 1.0f, 0, 0};
 // id; the owning row comes from a short binary search over the offsets
 // (rows <= kBMaxBatch + 1 entries). atomicOr tolerates duplicate ids;
 // id values were validated host-side before the upload (the offsets
-// themselves too - monotone, in [0, m]).
+// themselves too - monotone, in [0, m]); the range guard mirrors
+// penalty_count_kernel so a bad device-resident tensor cannot corrupt
+// neighboring rows' bitmaps.
 __global__ void penalty_bitmap_b_kernel(
     const long long* __restrict__ ids, const int* __restrict__ offs,
     int rows, int bmw, unsigned long long* __restrict__ bm_base) {
@@ -273,6 +280,7 @@ __global__ void penalty_bitmap_b_kernel(
         else hi = mid - 1;
     }
     const int id = (int)ids[j];
+    if (id < 0 || (id >> 6) >= bmw) return;   // host-validated; defensive
     atomicOr(&bm_base[(size_t)lo * bmw + (id >> 6)], 1ULL << (id & 63));
 }
 
@@ -1436,7 +1444,7 @@ void select_raw_pipeline(const SelArgs* dargs, unsigned long long* ws,
             src->count_out);
     const int grid = selection_grid(n);
     // per-call state reset
-    cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+    checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
     for (int level = 7; level >= 0; --level)
         select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
             dargs, ws, n, level, (unsigned long long)k, 1.0f, pen);
@@ -1874,7 +1882,7 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
         int token = -1;
         // reset the control head FIRST, then preset the token sentinel
         // (the memset would otherwise wipe it), then ship the args
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -1925,7 +1933,7 @@ long long sample_topp_launch(const float* x, int n, float p, float t,
                 token_out, nullptr);
             check_launch("sample tail launch");
         }
-        cudaError_t err = cudaDeviceSynchronize();   // surface kernel faults
+        cudaError_t err = cudaStreamSynchronize(cs);   // surface kernel faults
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("sample kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -1985,10 +1993,10 @@ long long decode_step_launch(const float* x, const long long* ids,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(mm));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0,
-                        (size_t)(bm - ws + bitmap_words) *
-                            sizeof(unsigned long long),
-                        cs);
+        checked_memset_async(ws,
+                             (size_t)(bm - ws + bitmap_words) *
+                                 sizeof(unsigned long long),
+                             cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice, cs) != cudaSuccess)
             throw std::runtime_error("token preset upload failed");
@@ -1996,7 +2004,7 @@ long long decode_step_launch(const float* x, const long long* ids,
         const PenCtx pen{bm, penalty, use_pen};
         if (use_pen)
             penalty_bitmap_kernel<<<(int)((m + kSelBlock - 1) / kSelBlock),
-                                    kSelBlock, 0, cs>>>(ids, m, bm);
+                                    kSelBlock, 0, cs>>>(ids, m, n, bm);
         const int grid = selection_grid(n);
         const float inv_t = 1.0f / t;
         // full-vocabulary fast path: same rationale as sample_topp (the
@@ -2035,7 +2043,7 @@ long long decode_step_launch(const float* x, const long long* ids,
                 token_out, nullptr);
             check_launch("decode step tail launch");
         }
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("decode step kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -2102,7 +2110,7 @@ long long sample_topk_launch(const float* x, int n, int k, float t,
     SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(mm));
     int* token_out = reinterpret_cast<int*>(ws + kWsToken);
     int token = -1;
-    cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+    checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
     cudaMemcpyAsync(token_out, &token, sizeof(int), cudaMemcpyHostToDevice,
                     cs);
     ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
@@ -2128,7 +2136,7 @@ long long sample_topk_launch(const float* x, int n, int k, float t,
                                 cs>>>(sorted, exps, token_out,
                                       k, seed);
     check_launch("sample topk tail launch");
-    cudaError_t err = cudaDeviceSynchronize();    // surface kernel faults
+    cudaError_t err = cudaStreamSynchronize(cs);    // surface kernel faults
     if (err != cudaSuccess)
         throw std::runtime_error(std::string("sample topk kernel failed: ") +
                                  cudaGetErrorString(err));
@@ -2508,7 +2516,7 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -2541,7 +2549,7 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
                                     cs>>>(
             sorted, exps, ws, token_out, window, n, min_p, seed);
         check_launch("minp tail launch");
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("min-p kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -2563,7 +2571,7 @@ long long sample_minp_launch(const float* x, int n, float min_p, float t,
             exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
                                                         kNoPen);
             check_launch("minp mass launch");
-            err = cudaDeviceSynchronize();
+            err = cudaStreamSynchronize(cs);
             if (err != cudaSuccess)
                 throw std::runtime_error(std::string("min-p mass failed: ") +
                                          cudaGetErrorString(err));
@@ -2612,7 +2620,7 @@ long long sample_topa_launch(const float* x, int n, float top_a, float t,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -2648,7 +2656,7 @@ long long sample_topa_launch(const float* x, int n, float top_a, float t,
                                     cs>>>(
             sorted, exps, ws, token_out, window, n, top_a, seed);
         check_launch("top-a tail launch");
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("top-a kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -2664,7 +2672,7 @@ long long sample_topa_launch(const float* x, int n, float top_a, float t,
             // bound (window-invariant, and already correct: the failed
             // attempt's own exptotal pass populated the slot - re-running
             // the pass would atomicAdd onto it and double the value)
-            err = cudaDeviceSynchronize();
+            err = cudaStreamSynchronize(cs);
             if (err != cudaSuccess)
                 throw std::runtime_error(std::string("top-a mass failed: ") +
                                          cudaGetErrorString(err));
@@ -2716,7 +2724,7 @@ long long sample_nsigma_launch(const float* x, int n, float nsigma,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -2753,7 +2761,7 @@ long long sample_nsigma_launch(const float* x, int n, float nsigma,
                                       cs>>>(
             sorted, exps, ws, token_out, window, n, nsigma, seed);
         check_launch("nsigma tail launch");
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("nsigma kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -2770,7 +2778,7 @@ long long sample_nsigma_launch(const float* x, int n, float nsigma,
             // correct: the failed attempt's own fused pass populated
             // the slots - re-running the pass would atomicAdd onto them
             // and double every value)
-            err = cudaDeviceSynchronize();
+            err = cudaStreamSynchronize(cs);
             if (err != cudaSuccess)
                 throw std::runtime_error(std::string("nsigma mass failed: ") +
                                          cudaGetErrorString(err));
@@ -2828,7 +2836,7 @@ long long sample_eta_launch(const float* x, int n, float eta, float t,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -2865,7 +2873,7 @@ long long sample_eta_launch(const float* x, int n, float eta, float t,
                                    cs>>>(
             sorted, exps, ws, token_out, window, n, eta, seed);
         check_launch("eta tail launch");
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("eta kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -2882,7 +2890,7 @@ long long sample_eta_launch(const float* x, int n, float eta, float t,
             // and already correct: the failed attempt's own fused pass
             // populated the slots - re-running the pass would atomicAdd
             // onto them and double every value)
-            err = cudaDeviceSynchronize();
+            err = cudaStreamSynchronize(cs);
             if (err != cudaSuccess)
                 throw std::runtime_error(std::string("eta mass failed: ") +
                                          cudaGetErrorString(err));
@@ -2935,7 +2943,7 @@ long long sample_typical_launch(const float* x, int n, float typical,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -2973,7 +2981,7 @@ long long sample_typical_launch(const float* x, int n, float typical,
                                        cs>>>(
             sorted, exps, ws, token_out, window, n, typical, seed);
         check_launch("typical tail launch");
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("typical kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -3088,7 +3096,7 @@ long long sample_tfs_launch(const float* x, int n, float z, float t,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -3122,7 +3130,7 @@ long long sample_tfs_launch(const float* x, int n, float z, float t,
                                    cs>>>(
             sorted, exps, ws, token_out, window, n, z, seed);
         check_launch("tfs tail launch");
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("tfs kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -3139,31 +3147,10 @@ long long sample_tfs_launch(const float* x, int n, float z, float t,
 }
 
 
-// Batched TFS: one call per row through the single-row launcher (the
-// readback-per-row cost is acceptable for a v2.1 first implementation;
-// a proper batched kernel with the chunked pipeline is future work).
-std::vector<long long> sample_tfs_batched_launch(
-    const float* x, int rows, int n, float z, float t,
-    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if (rows == 0)
-        return {};
-    if (n <= 0)
-        throw std::invalid_argument("sample of empty logits");
-    if (!(z > 0.0f && z <= 1.0f))
-        throw std::invalid_argument("z must be in (0, 1]");
-    if (!(t > 0.0f))
-        throw std::invalid_argument("temperature must be > 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    std::vector<long long> out((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        out[r] = sample_tfs_launch(x + (size_t)r * n, n, z, t,
-                                    seeds[r], stream);
-    }
-    return out;
-}
+// Batched TFS lives with the batched family below (sample_tfs_batched_launch,
+// sequencer mode 6) - it shares the chunked pipeline and the anonymous
+// namespace the other batched samplers use.
+
 
 
 // ---------------------------------------------------------------------------
@@ -3174,8 +3161,8 @@ std::vector<long long> sample_tfs_batched_launch(
 // The trigger is deterministic per seed: a splitmix hash decides whether
 // this draw suppresses or not. When suppressed, the first top_n tokens
 // of the sorted window are removed and the distribution is renormalized
-// over the remainder. At least one token is always kept (if top_n >= k,
-// the nucleus degenerates to everything).
+// over the remainder. At least one token is always kept: when
+// top_n >= k the clamp leaves exactly the smallest candidate.
 //
 // Same windowing strategy as min-p (adaptive widening with the top-p
 // mass bound — the suppression only REMOVES leading tokens, so the
@@ -3197,20 +3184,14 @@ __global__ void sample_xtc_serial_kernel(
     const float coin = splitmix_uniform(seed ^ 0x58544300ULL);  // "XTC\0"
     const bool suppress = (coin < probability);
 
-    // Start walking after the suppressed prefix (or from 0 if no suppression)
+    // Start walking after the suppressed prefix (or from 0 if no
+    // suppression). The min(top_n, k-1) clamp keeps at least one
+    // candidate, so start < k always holds and no fallback is needed.
     int start = suppress ? min(top_n, k - 1) : 0;
 
-    // Compute the total mass of the remaining window
+    // Total mass of the remaining window
     float total_mass = 0.0f;
     for (int i = start; i < k; ++i) total_mass += exps[i];
-
-    // If suppression removes everything (start >= k), fall back to no
-    // suppression (keep at least one token)
-    if (start >= k) {
-        total_mass = 0.0f;
-        for (int i = 0; i < k; ++i) total_mass += exps[i];
-        start = 0;
-    }
 
     const float u = splitmix_uniform(seed);
     const float target = u * total_mass;
@@ -3224,8 +3205,10 @@ __global__ void sample_xtc_serial_kernel(
                        (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
-// XTC launcher: the suppression only REMOVES leading tokens, so the
-// top-p mass bound on the remaining mass is still valid for widening.
+// XTC launcher: the window is the whole vocabulary from the start (see
+// the comment above sample_xtc_batched_launch's sequencer mode), so the
+// widening loop below is a safety net that never fires in practice.
+// Not CUDA-graph capturable (per-attempt readback).
 long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
                             float t, unsigned long long seed,
                             std::uintptr_t stream) {
@@ -3242,7 +3225,15 @@ long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
         return sample_minp_launch(x, n, 1e-9f, t, seed, stream);
     }
     cudaStream_t cs = (cudaStream_t)stream;
-    int window = std::min(kSelEarlyOut, n);
+    // The XTC distribution spans the WHOLE vocabulary: suppression only
+    // removes a leading prefix, and the serial walk resolves its CDF
+    // inside whatever window it is given (target = u * window mass), so
+    // the nucleus widening ladder can never trigger - starting below n
+    // would silently clip the tail (the 2.2.0 defect: every draw came
+    // from the top kSelEarlyOut ranks on vocab > 1024). Run the
+    // pipeline on the full window from the start, exactly like the CPU
+    // reference; the widen loop below stays as a safety net only.
+    int window = n;
     for (;;) {
         int m = 1;
         while (m < window) m <<= 1;
@@ -3253,7 +3244,7 @@ long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
         SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
         int* token_out = reinterpret_cast<int*>(ws + kWsToken);
         int token = -1;
-        cudaMemsetAsync(ws, 0, kWsHead * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
         if (cudaMemcpyAsync(token_out, &token, sizeof(int),
                             cudaMemcpyHostToDevice,
                             cs) != cudaSuccess)
@@ -3277,7 +3268,7 @@ long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
                                    cs>>>(
             sorted, exps, ws, token_out, window, n, top_n, probability, seed);
         check_launch("xtc tail launch");
-        cudaError_t err = cudaDeviceSynchronize();
+        cudaError_t err = cudaStreamSynchronize(cs);
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("xtc kernel failed: ") +
                                      cudaGetErrorString(err));
@@ -3293,31 +3284,9 @@ long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
     }
 }
 
-std::vector<long long> sample_xtc_batched_launch(
-    const float* x, int rows, int n, int top_n, float probability,
-    float t, const std::vector<unsigned long long>& seeds,
-    std::uintptr_t stream) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if (rows == 0)
-        return {};
-    if (n <= 0)
-        throw std::invalid_argument("sample of empty logits");
-    if (top_n < 0)
-        throw std::invalid_argument("top_n must be >= 0");
-    if (!(probability >= 0.0f && probability <= 1.0f))
-        throw std::invalid_argument("probability must be in [0, 1]");
-    if (!(t > 0.0f))
-        throw std::invalid_argument("temperature must be > 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    std::vector<long long> out((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        out[r] = sample_xtc_launch(x + (size_t)r * n, n, top_n,
-                                    probability, t, seeds[r], stream);
-    }
-    return out;
-}
+// Batched XTC lives with the batched family below
+// (sample_xtc_batched_launch, sequencer mode 7).
+
 
 // ---------------------------------------------------------------------------
 // batched sampling (v1.4): sample_topp/minp/topk_batched (v1.5 adds
@@ -4181,13 +4150,108 @@ __global__ void sample_typical_serial_b_kernel(
                               (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
+// TFS serial tail, row-decomposed: the same two passes as the
+// single-row kernel (d2 max, then cutoff search) over the row's sorted
+// exp stripe, one block per row. An uncovered window (cutoff reached
+// the window edge with vocabulary left) leaves the row's token at the
+// -1 sentinel and records the window mass in cumws - the host widens
+// x8 like sample_typical and retries. The /total scaling cancels in
+// the normalization (see the single-row kernel), so no totals pass
+// feeds this tail.
+__global__ void sample_tfs_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int n, float z,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens, float* __restrict__ cumws,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+
+    float d2_max = 0.0f;
+    for (int i = 0; i + 2 < k; ++i) {
+        const float d2 = fabsf(2.0f * exps[i+1] - exps[i] - exps[i+2]);
+        if (d2 > d2_max) d2_max = d2;
+    }
+    int cutoff = k;
+    if (d2_max > 0.0f) {
+        const float threshold = (1.0f - z) * d2_max;
+        for (int i = 0; i + 2 < k; ++i) {
+            const float d2 = fabsf(2.0f * exps[i+1] - exps[i] - exps[i+2]);
+            if (d2 < threshold) { cutoff = i + 2; break; }
+        }
+    }
+    if (cutoff < 1) cutoff = 1;
+    if (cutoff > k) cutoff = k;
+    if (cutoff >= k && k < n) {
+        float cum_mass = 0.0f;
+        for (int i = 0; i < k; ++i) cum_mass += exps[i];
+        cumws[row] = cum_mass;
+        return;
+    }
+    float nucleus_mass = 0.0f;
+    for (int i = 0; i < cutoff; ++i) nucleus_mass += exps[i];
+    const int nucleus = cutoff > 0 ? cutoff : 1;
+    const float u = splitmix_uniform(seeds[row]);
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    int idx = nucleus - 1;
+    for (int i = 0; i < nucleus; ++i) {
+        cum += exps[i];
+        if (cum >= target) { idx = i; break; }
+    }
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+// XTC serial tail, row-decomposed: the coin flip and the
+// post-suppression walk from the single-row kernel, one block per row.
+// The distribution spans the whole vocabulary (suppression only
+// removes a leading prefix), so the host starts this mode at
+// window = n and every row resolves on the first attempt; the
+// min(top_n, k-1) clamp keeps at least one candidate.
+__global__ void sample_xtc_serial_b_kernel(
+    const unsigned long long* __restrict__ ws, long long stride,
+    int keys_off, int exps_off, int k, int top_n, float probability,
+    const unsigned long long* __restrict__ seeds,
+    long long* __restrict__ tokens,
+    const int* __restrict__ active) {
+    const int row = blockIdx.x;
+    if (!active[row] || threadIdx.x != 0) return;
+    const unsigned long long* keys = ws + (size_t)row * stride + keys_off;
+    const float* exps = reinterpret_cast<const float*>(
+        ws + (size_t)row * stride + exps_off);
+
+    const float coin = splitmix_uniform(seeds[row] ^ 0x58544300ULL);
+    const bool suppress = (coin < probability);
+    const int start = suppress ? min(top_n, k - 1) : 0;
+    float total_mass = 0.0f;
+    for (int i = start; i < k; ++i) total_mass += exps[i];
+    const float u = splitmix_uniform(seeds[row]);
+    const float target = u * total_mass;
+    float cum = 0.0f;
+    int idx = k - 1;
+    for (int i = start; i < k; ++i) {
+        cum += exps[i];
+        if (cum >= target) { idx = i; break; }
+    }
+    tokens[row] = (long long)(0xFFFFFFFFu -
+                              (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
 // per-chunk attempt sequencer for the nucleus samplers (topp = mode 0,
-// minp = mode 1, eta = 2, typical = 3, top-a = 4, nsigma = 5). Drives
-// the shared kernel sequence above through the uniform-window widening
-// loop described in the section note.
+// minp = mode 1, eta = 2, typical = 3, top-a = 4, nsigma = 5,
+// tfs = 6, xtc = 7). Drives the shared kernel sequence above through
+// the uniform-window widening loop described in the section note.
+// XTC starts at window = n (its draw always resolves inside the
+// window, so a widening ladder could never fire - see the single-row
+// launcher); TFS widens on the plain x8 ladder like typical.
 std::vector<long long> sample_nucleus_batched_chunk(
     const float* x, int rows, int n, float thr, float t, int mode,
-    const unsigned long long* seeds, std::uintptr_t stream) {
+    const unsigned long long* seeds, std::uintptr_t stream,
+    int top_n = 0) {
     cudaStream_t cs = (cudaStream_t)stream;
     const int gpr = selection_grid(n);
     const float inv_t = 1.0f / t;
@@ -4195,7 +4259,7 @@ std::vector<long long> sample_nucleus_batched_chunk(
     std::vector<int> active(rows, 1);
     std::vector<double> total(rows, -1.0);   // lazy host cache (both modes)
     std::vector<float> cum_h(rows, 0.0f), tot_h(rows, 0.0f);
-    int window = std::min(kSelEarlyOut, n);
+    int window = (mode == 7) ? n : std::min(kSelEarlyOut, n);
     for (;;) {
         int m = 1;
         while (m < window) m <<= 1;
@@ -4227,7 +4291,7 @@ std::vector<long long> sample_nucleus_batched_chunk(
         batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
             tail.tokens, tail.cumws, tail.totals, tail.svals, tail.n1vals,
             tail.n2vals, tail.active, rows);
-        cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
+        checked_memset_async(ws, stripes * sizeof(unsigned long long), cs, "workspace memset");
         const int grid = rows * gpr;
         const bool full = (window == n);
         if (!full) {
@@ -4239,13 +4303,15 @@ std::vector<long long> sample_nucleus_batched_chunk(
                 x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
             check_launch("batch selection launch");
         }
-        if (mode != 1) {
+        if (mode != 1 && mode != 6 && mode != 7) {
             // the mass passes run per attempt (the per-attempt head
             // memset zeroes their tail/head slots). topp (mode 0) and
             // top-a (mode 4) need only the total; eta/typical/nsigma
             // (modes 2/3/5) take the fused pass - one full-row read
             // produces the total, the entropy accumulator and the
-            // nsigma moments
+            // nsigma moments. TFS and XTC (modes 6/7) walk the sorted
+            // exp column directly - their tails accumulate what they
+            // need, so no totals pass feeds them.
             expmax_b_kernel<<<grid, kSelBlock, 0, cs>>>(
                 x, ws, stride, n, inv_t, gpr, tail.active, kNoPenB);
             if (mode == 0 || mode == 4) {
@@ -4331,7 +4397,7 @@ std::vector<long long> sample_nucleus_batched_chunk(
                     ws, stride, sorted_off, mate_off, window, n, thr,
                     tail.seeds, tail.tokens, tail.cumws, tail.totals,
                     tail.active);
-            else
+            else if (mode == 5)
                 sample_nsigma_serial_b_kernel<<<rows, 32,
                                                 walk_cp_slots(window) *
                                                     sizeof(float),
@@ -4339,6 +4405,20 @@ std::vector<long long> sample_nucleus_batched_chunk(
                     ws, stride, sorted_off, mate_off, window, n, thr,
                     tail.seeds, tail.tokens, tail.cumws, tail.n1vals,
                     tail.n2vals, tail.active);
+            else if (mode == 6)
+                sample_tfs_serial_b_kernel<<<rows, 32,
+                                             walk_cp_slots(window) *
+                                                 sizeof(float),
+                                             cs>>>(
+                    ws, stride, sorted_off, mate_off, window, n, thr,
+                    tail.seeds, tail.tokens, tail.cumws, tail.active);
+            else
+                sample_xtc_serial_b_kernel<<<rows, 32,
+                                             walk_cp_slots(window) *
+                                                 sizeof(float),
+                                             cs>>>(
+                    ws, stride, sorted_off, mate_off, window, top_n,
+                    thr, tail.seeds, tail.tokens, tail.active);
             check_launch("batch tail launch");
         }
         cudaError_t err = cudaStreamSynchronize(cs);
@@ -4548,10 +4628,10 @@ std::vector<long long> decode_step_batched_chunk(
             tail.n2vals, tail.active, rows);
         // one contiguous clear over stripes + bitmaps (the bitmaps are
         // ORed, so they must start zero every attempt)
-        cudaMemsetAsync(ws, 0,
-                        (stripes + bm_words) *
-                            sizeof(unsigned long long),
-                        cs);
+        checked_memset_async(ws,
+                             (stripes + bm_words) *
+                                 sizeof(unsigned long long),
+                             cs, "workspace memset");
         if (use_pen)
             penalty_bitmap_b_kernel<<<
                 (int)((m_total + kSelBlock - 1) / kSelBlock), kSelBlock,
@@ -4709,7 +4789,7 @@ std::vector<long long> sample_topk_batched_chunk(
     batch_preset_kernel<<<1, kSelBlock, 0, cs>>>(
         tail.tokens, tail.cumws, tail.totals, tail.svals, tail.n1vals,
         tail.n2vals, tail.active, rows);
-    cudaMemsetAsync(ws, 0, stripes * sizeof(unsigned long long), cs);
+    checked_memset_async(ws, stripes * sizeof(unsigned long long), cs, "workspace memset");
     const int grid = rows * gpr;
     const bool full = (k == n);
     if (!full) {
@@ -4986,6 +5066,67 @@ std::vector<long long> sample_typical_batched_launch(
     return out;
 }
 
+// Batched TFS (2.1) moved onto the chunked pipeline in 2.2.1: the
+// v2.1 per-row loop spent one full pipeline + device sync + readback
+// per row. Mode 6, honest x8 widening like sample_typical.
+std::vector<long long> sample_tfs_batched_launch(
+    const float* x, int rows, int n, float z, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(z > 0.0f && z <= 1.0f))
+        throw std::invalid_argument("z must be in (0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, z, t, 6, seeds.data() + c, stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
+// Batched XTC (2.2) moved onto the chunked pipeline in 2.2.1 for the
+// same reason. Mode 7 starts at window = n (the XTC draw always
+// resolves inside its window, so a widening ladder could never fire -
+// see the single-row launcher).
+std::vector<long long> sample_xtc_batched_launch(
+    const float* x, int rows, int n, int top_n, float probability,
+    float t, const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (top_n < 0)
+        throw std::invalid_argument("top_n must be >= 0");
+    if (!(probability >= 0.0f && probability <= 1.0f))
+        throw std::invalid_argument("probability must be in [0, 1]");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        auto chunk = sample_nucleus_batched_chunk(
+            x + (size_t)c * n, b, n, probability, t, 7, seeds.data() + c,
+            stream, top_n);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // argmax: single plain kernel (packed-key max + arrival-counter finalize)
 // ---------------------------------------------------------------------------
@@ -5127,8 +5268,8 @@ void argmax_batched_launch(const float* x, int rows, int n, long long* out,
     unsigned int* counter =
         reinterpret_cast<unsigned int*>(ws + kWsHead + rows);
     cudaStream_t cs = (cudaStream_t)stream;
-    cudaMemsetAsync(best, 0,
-                    2 * (size_t)rows * sizeof(unsigned long long), cs);
+    checked_memset_async(best, 2 * (size_t)rows * sizeof(unsigned long long),
+                         cs, "argmax workspace memset");
     // same per-row launch shape a standalone call would see: gpr
     // blocks per row, grid-stride within the row
     const int gpr = (int)std::min<long long>(

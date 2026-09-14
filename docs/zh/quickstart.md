@@ -38,7 +38,7 @@ x = np.random.randn(4, 1024).astype(np.float32)
 w = np.random.rand(1024).astype(np.float32) + 0.5
 
 y = fusedtok.rmsnorm(x, w)              # CPU 参考实现，什么机器都能跑
-y = fusedtok.rmsnorm(x, w, cuda=True)   # 暂存式：拷上 GPU 算完再拷回来
+y = fusedtok.rmsnorm(x, w, cuda=True)   # staged 路径：拷上 GPU 算完再拷回来
 ```
 
 每个算子都同时接受 numpy 数组和 torch 张量（装了 torch 的话）。
@@ -90,12 +90,12 @@ token = fusedtok.sample_eta(logits, eta=1e-3, temperature=0.8, seed=0)
 token = fusedtok.sample_typical(logits, typical=0.9,
                                 temperature=0.8, seed=0)
 
-# 组合版 HF 惩罚（v1.6.1）：一次调用，每个去重 id 只罚一次
+# HF 三种惩罚的组合（v1.6.1）：一次调用，每个去重 id 只罚一次
 penalized = fusedtok.logit_penalties(logits, [3, 3, 7], repetition=1.2,
                                      presence=0.1, frequency=0.05)
 
 # 值阈值双件套（v1.8）：两者都沿用 min-p 的前缀机制——top-a 以平方
-# 峰值为门槛，nsigma 以整行自身的离散度为门槛
+# 峰值为阈值，nsigma 以整行自身的离散度为阈值
 token = fusedtok.sample_topa(logits, top_a=0.2, temperature=0.8, seed=0)
 token = fusedtok.sample_nsigma(logits, nsigma=1.5, temperature=0.8,
                                seed=0)
@@ -105,14 +105,13 @@ token = fusedtok.sample_nsigma(logits, nsigma=1.5, temperature=0.8,
 idx = fusedtok.argmax_batched(batch_logits)
 ```
 
-仓库里的 `examples/demo.py` 会把每个算子都逐个演示一遍并与解析
-参考对拍，本身就是一份可执行的文档。
+仓库里的 `examples/demo.py` 会把每个算子都逐个演示一遍并与解析（闭式）参考实现逐一比对，本身就是一份可执行的文档。
 
 ## 接下来读什么
 
 - [执行模型](execution.md) —— 三条执行路径、dtype 规则、流与
   CUDA graph、错误契约
-- [注意力算子](attention.md) —— 解码注意力、连续与分页 append 写侧、prefill
+- [注意力算子](attention.md) —— 解码注意力、连续与分页 append 写入侧、prefill
 - [采样与选择](sampling.md) —— top-k / top-p / min-p、值阈值双件套
   （top-a、top-nσ）、熵自适应采样器（eta、typical）、组合 logit
   惩罚、确定性契约

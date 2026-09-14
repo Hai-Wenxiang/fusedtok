@@ -24,6 +24,18 @@ inline void check_launch(const char* what) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
 }
 
+// Stream-ordered workspace clear whose ENQUEUE failure surfaces with its
+// own label: a silently skipped clear leaves stale head/state that would
+// only resurface later through check_launch, mislabeled (the quantize.cu
+// checked_copy_async rationale, shared by every sampler workspace).
+inline void checked_memset_async(void* dst, size_t bytes, cudaStream_t cs,
+                                 const char* what) {
+    cudaError_t err = cudaMemsetAsync(dst, 0, bytes, cs);
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string(what) + " memset failed: " +
+                                 cudaGetErrorString(err));
+}
+
 // Default threads-per-block for elementwise kernels.
 constexpr int kBlock = 256;
 

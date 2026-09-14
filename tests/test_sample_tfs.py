@@ -236,6 +236,29 @@ class TestCuda:
             rank = {int(t): i for i, t in enumerate(order)}
             assert abs(rank[int(got[r])] - rank[want]) <= 2
 
+    def test_batched_chunk_boundary_33(self):
+        # 33 rows crosses the kBMaxBatch = 32 device chunk boundary:
+        # chunk 0 has 32 rows, chunk 1 has 1 - both must track the
+        # row-wise singles. 2.2.1 moved TFS from the per-row loop to
+        # the chunked sequencer (mode 6), so this pins every chunk.
+        rng = np.random.default_rng(501)
+        b, n = 33, 4096
+        x = rng.standard_normal((b, n)).astype(np.float32)
+        x[0, 7] += 10.0
+        x[17] *= 1e-3
+        x[32, 3] += 12.0
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(b, dtype=np.int64)
+        got = fusedtok.sample_tfs_batched(dev, 0.95, seeds=seeds)
+        assert got.shape[0] == b
+        for r in (0, 1, 17, 31, 32):
+            want = int(fusedtok.sample_tfs(dev[r], 0.95, seed=r))
+            if got[r] == want:
+                continue
+            order = np.argsort(-x[r], kind="stable")
+            rank = {int(t): i for i, t in enumerate(order)}
+            assert abs(rank[int(got[r])] - rank[want]) <= 2, r
+
     def test_batched_determinism(self):
         rng = np.random.default_rng(178)
         x = rng.standard_normal((4, 4096)).astype(np.float32)

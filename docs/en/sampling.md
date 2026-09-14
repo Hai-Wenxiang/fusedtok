@@ -53,13 +53,13 @@ whole batch, no seeds and no temperature. Unlike the single-row op it
 returns int64 indices with NO host readback on the zero-copy path: a
 CUDA tensor for CUDA input (stream-ordered with the caller's ops),
 a CPU tensor or numpy array otherwise, which also makes the launcher
-CUDA-graph capturable once the workspace has been reserved by a prior
-call - a first-ever call may allocate, which cannot run inside an
-outer capture, so warm up before capturing. The per-row arrival slots are cleared once per
+CUDA-graph capturable once a prior call has reserved the workspace.
+A first-ever call may allocate, and allocating cannot run inside an
+outer capture - warm up before capturing. The per-row arrival slots are cleared once per
 call (one small memset per batch, not per row) because the slots share
 workspace region selection calls also use; each row's block team
 publishes its index from the last-arriving block, exactly the
-single-row arrival-ticket pattern row-decomposed.
+single-row arrival-ticket pattern, decomposed per row.
 
 ## The fused samplers
 
@@ -151,7 +151,7 @@ setting.
 
 - `top_a` must be in `(0, 1]` (`ValueError` otherwise); `temperature`
   must be greater than 0.
-- `top_a = 1.0` cutoffs at `p_max^2`: with one dominant token that is
+- with `top_a = 1.0` the cutoff is `p_max²`: with one dominant token that is
   exactly greedy, but when a runner-up's probability still reaches the
   squared peak BOTH leaders stay in the draw (where `min_p = 1.0`
   would keep only the maximum-probability tokens).
@@ -247,8 +247,9 @@ stops bending and becomes effectively flat.
   consecutive probs per element) and needs two passes (pass 1 for the
   max, pass 2 for the cutoff), but the sorted window is small. The
   widening strategy is the honest x8 ladder (no analytic bound,
-  same treatment as sample_typical). Batched rides a per-row loop
-  through the single-row launcher.
+  same treatment as sample_typical). Batched rides the shared chunked
+  pipeline (the same sequencer as the other batched samplers): one
+  stream sync and one bulk token readback per attempt.
 
 ## sample_eta - entropy-adaptive cutoff sampling (v1.6)
 
@@ -322,9 +323,9 @@ trimmed symmetrically, which is the design's point.
   rising again). The serial walker expands the band from the valley
   in ascending shifted order (merging the two monotone arms) and
   rejects any band that touches the window tail while the window is
-  smaller than the vocabulary, mass reached or not - canonical
-  members may live past the edge, so the host widens instead of
-  drawing a wrong band. At the full window the walked band's mass is
+  smaller than the vocabulary, mass reached or not - valid members may
+  lie past the edge, so the host widens the window rather than draw
+  from a wrong band. At the full window the walked band's mass is
   the row total up to summation order, so the draw proceeds (the
   full-vocabulary fallback, as in the other samplers). There is no
   analytic widening bound for the band: the honest x8 ladder is the
@@ -455,7 +456,7 @@ inherent to returning tokens at all, so - like the single-row samplers
   benchmark tables in the README measure GPU time, a different
   protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
-  (**1.34x / 1.20x**). The flat worst case keeps the singles' honest
+  (**1.44x / 1.19x**). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05-0.06x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.
@@ -535,7 +536,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.16-0.25x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.16-0.24x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its

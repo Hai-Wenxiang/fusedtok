@@ -1,7 +1,7 @@
 # 注意力算子
 
 fusedtok 提供五个注意力相关入口：解码步主力 `attention_decode`、
-分页 cache 变体 `attention_decode_paged`（v1.2）、配套的两条写侧
+分页 cache 变体 `attention_decode_paged`（v1.2）、配套的两个写入侧算子
 `kv_append_paged`（v1.2）与 `kv_append`（v1.3，连续 cache），以及
 prefill 便捷路径 `attention_prefill`。
 这一页讲清各种布局、GQA 映射、变长 batch，以及性能上的定位。
@@ -39,7 +39,7 @@ cache 很长时自动走 flash-decoding 式切分：序列切成若干片、各�
 `lens` 的取值校验只针对主机侧来源的输入（list、numpy、CPU 张量），
 在上传前完成；CUDA 上的 `lens` 张量直接信任——读回主机需要同步
 流、会破坏 CUDA graph 捕获（与裸设备指针同一信任边界）。图捕获前
-在捕获外先热身一次该形状（切分 workspace 必须先存在）。
+在捕获外先预热一次该形状（切分 workspace 必须先存在）。
 
 零拷贝路径的存储 dtype：float32、bfloat16、float16。半精度 cache
 把解码步的搬运字节减半（这正是解码步的瓶颈），softmax 仍是
@@ -71,7 +71,7 @@ GQA 映射、零长度序列输出零行的约定、dtype 矩阵与连续版完�
 - GQA 组大小（`Hq // Hkv`）限 1/2/4/8/16（其他倍数请用连续版）。
 - 主机侧来源的 `block_table` / `lens` 取值在上传前校验
   （`ValueError`）；设备上的张量直接信任（不同步流）。
-- CUDA graph 捕获前同样需要捕获外热身一次。
+- CUDA graph 捕获前同样需要在捕获外预热一次。
 
 间接寻址的实测开销（3060，b=1，GQA 32/8，D=128，T=16384，
 P=16）：连续版的 **1.11 倍**（5060 Ti 上 1.09 倍；基准表同口径），
@@ -93,7 +93,7 @@ fusedtok.kv_append_paged(k_pool, v_pool, block_table, k_new, v_new, lens)
   连续布局，转换会产生副本、写入被静默丢弃，所以直接以
   `TypeError` 拒绝而不是默默出错。torch 路径支持 f32/bf16/fp16
   全部存储组合。
-- 一个微型 kernel、流序、可 CUDA graph 捕获（照常先热身）。
+- 一个微型 kernel、流序、可 CUDA graph 捕获（照常先预热）。
 
 典型循环：在 `lens[b]` 处 append，再以 `lens + 1` 解码：
 
@@ -166,7 +166,7 @@ prefill 请交给 SDPA / FlashAttention（基准表里明确标着约 0.45x
   展开，且在小 query 下效率偏低）。
 - bf16/fp16 cache 把字节减半。batch 为 1 时 kernel 受延迟限制，
   绝对收益有限，batch 越大收益越大。
-- 分页间接寻址比连续版多付约 1.09-1.14 倍。
+- 分页间接寻址比连续版多付约 1.09-1.11 倍。
 - prefill 刻意不与 flash 后端竞争。
 
 测试协议与复现方法见[基准测试](benchmarks.md)。
