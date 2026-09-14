@@ -233,6 +233,23 @@ long long sample_tfs_launch(const float* x, int n, float z, float t,
                             unsigned long long seed,
                             std::uintptr_t stream = 0);
 
+// DRY sampling (v2.3): sequence-aware repeat penalty applied to a
+// scratch copy of the row, then the plain full-softmax draw (the
+// min_p=1e-9 pipeline). `ids`/`m` is the history (device-resident,
+// values in [0, n); trusted - same boundary as the penalty bitmaps).
+// Only the last kDryMaxScan history tokens participate.
+long long sample_dry_launch(const float* x, int n, const long long* ids,
+                             int m, int allowed_length, float multiplier,
+                             float t, unsigned long long seed,
+                             std::uintptr_t stream = 0);
+// Batched DRY over ragged per-row histories (flat ids + rows+1
+// offsets, decode_step_batched's layout, host-validated values).
+std::vector<long long> sample_dry_batched_launch(
+    const float* x, int rows, int n, const long long* ids,
+    const int* offs, int allowed_length, float multiplier, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
+
 // Greedy argmax; earliest index wins ties. Single parallel selection round.
 void argmax_launch(const float* x, int n, int* out, std::uintptr_t stream = 0);
 

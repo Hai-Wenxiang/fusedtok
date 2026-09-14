@@ -90,6 +90,12 @@ token = fusedtok.sample_eta(logits, eta=1e-3, temperature=0.8, seed=0)
 token = fusedtok.sample_typical(logits, typical=0.9,
                                 temperature=0.8, seed=0)
 
+# 尾部自由 / 创意 / 防重复（v2.1-v2.3）
+token = fusedtok.sample_tfs(logits, 0.95, temperature=0.8, seed=0)
+token = fusedtok.sample_xtc(logits, 3, 0.8, temperature=0.8, seed=0)
+token = fusedtok.sample_dry(logits, [7, 8, 9, 7, 8], allowed_length=2,
+                            multiplier=1.75, temperature=0.8, seed=0)
+
 # HF 三种惩罚的组合（v1.6.1）：一次调用，每个去重 id 只罚一次
 penalized = fusedtok.logit_penalties(logits, [3, 3, 7], repetition=1.2,
                                      presence=0.1, frequency=0.05)

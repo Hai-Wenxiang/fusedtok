@@ -39,6 +39,23 @@ inline void checked_memset_async(void* dst, size_t bytes, cudaStream_t cs,
 // Default threads-per-block for elementwise kernels.
 constexpr int kBlock = 256;
 
+// DRY (v2.3): only the most recent kDryMaxScan history tokens take part
+// in suffix matching (both the matched length and the search window are
+// capped) - this bounds the scan work and defines the documented
+// semantics. allowed_length may not exceed it.
+constexpr int kDryMaxScan = 64;
+
+// DRY penalty factor for a repeat that exceeds allowed_length by
+// (exponent - 1): multiplier ** exponent, computed as an exponent-long
+// chain of IEEE float multiplies so CPU reference and GPU kernel
+// produce identical bits. Exponent is in [1, kDryMaxScan].
+__host__ __device__ __forceinline__ float
+dry_penalty_factor(float multiplier, int exponent) {
+    float f = 1.0f;
+    for (int i = 0; i < exponent; ++i) f *= multiplier;
+    return f;
+}
+
 // Grid size covering n items with kBlock threads, rounded up.
 inline long long grid_for(long long n) { return (n + kBlock - 1) / kBlock; }
 

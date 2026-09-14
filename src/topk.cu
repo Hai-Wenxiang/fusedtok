@@ -3287,6 +3287,189 @@ long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
 // Batched XTC lives with the batched family below
 // (sample_xtc_batched_launch, sequencer mode 7).
 
+// ---------------------------------------------------------------------------
+// DRY sampling (v2.3, "Don't Repeat Yourself"): sequence-aware repeat
+// penalty + temperature + full-softmax draw. The scan mirrors the CPU
+// reference (dry_penalize_copy in sampling.cu) branch for branch:
+// window W = min(history, kDryMaxScan); for each suffix length L in
+// [allowed_length, W) every earlier in-window occurrence of the
+// current L-suffix contributes its following token, keeping the MAX
+// exponent per token. The apply pass rewrites a scratch copy of the
+// logits (repetition_penalty convention: positive divides, negative
+// multiplies) and the plain min_p=1e-9 pipeline draws from it.
+// ---------------------------------------------------------------------------
+
+// DRY scratch caches: the penalized copy plus the per-row trigger
+// tables, one growing pair of buffers - the selection-workspace
+// convention (never freed, bounded by the largest call).
+float* dry_scratch(size_t floats) {
+    static float* buf = nullptr;
+    static size_t capacity = 0;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    if (floats > capacity) {
+        float* nb = nullptr;
+        if (cudaMalloc(&nb, floats * sizeof(float)) != cudaSuccess)
+            throw std::runtime_error("dry scratch alloc failed");
+        if (buf) cudaFree(buf);
+        buf = nb;
+        capacity = floats;
+    }
+    return buf;
+}
+
+int* dry_pairs(size_t rows) {
+    // per row: [count, (token, exponent) * up to kDryMaxScan]
+    static int* buf = nullptr;
+    static size_t capacity = 0;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    const size_t words = rows * (1 + 2 * (size_t)kDryMaxScan);
+    if (words > capacity) {
+        int* nb = nullptr;
+        if (cudaMalloc(&nb, words * sizeof(int)) != cudaSuccess)
+            throw std::runtime_error("dry pairs alloc failed");
+        if (buf) cudaFree(buf);
+        buf = nb;
+        capacity = words;
+    }
+    return buf;
+}
+
+constexpr size_t kDryPairStride = 1 + 2 * (size_t)kDryMaxScan;
+
+// Shared table builder (one thread): mirrors dry_penalize_copy's scan.
+__device__ void dry_build_pairs(const long long* __restrict__ hist,
+                                long long m, int allowed_length,
+                                int* __restrict__ out) {
+    const long long W = m < (long long)kDryMaxScan
+                            ? m : (long long)kDryMaxScan;
+    int count = 0;
+    if (W > 0) {
+        const long long base = m - W;   // window start inside the history
+        for (long long L = allowed_length; L < W; ++L) {
+            for (long long j = 0; j + L < W; ++j) {
+                bool eq = true;
+                for (long long k = 0; k < L; ++k)
+                    if (hist[base + j + k] != hist[base + W - L + k]) {
+                        eq = false;
+                        break;
+                    }
+                if (!eq) continue;
+                const long long c = hist[base + j + L];
+                const int e = (int)(L - allowed_length) + 1;
+                int found = -1;
+                for (int p = 0; p < count; ++p)
+                    if (out[1 + 2 * p] == (int)c) { found = p; break; }
+                if (found < 0) {
+                    out[1 + 2 * count] = (int)c;
+                    out[2 + 2 * count] = e;
+                    ++count;
+                } else if (e > out[2 + 2 * found]) {
+                    out[2 + 2 * found] = e;
+                }
+            }
+        }
+    }
+    out[0] = count;
+}
+
+// Single-row scan: one block, one thread (the scan is inherently
+// sequential over suffix lengths; kDryMaxScan bounds the work).
+__global__ void dry_scan_kernel(const long long* __restrict__ ids,
+                                long long m, int allowed_length,
+                                int* __restrict__ pairs) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    dry_build_pairs(ids, m, allowed_length, pairs);
+}
+
+// Applies the trigger table to a scratch copy of the row. Every thread
+// reads the same small table (L1 broadcast; kDryMaxScan <= 64 entries).
+__global__ void dry_apply_kernel(const float* __restrict__ x,
+                                 float* __restrict__ y,
+                                 const int* __restrict__ pairs, int n,
+                                 float multiplier) {
+    const int count = pairs[0];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        float v = x[i];
+        for (int p = 0; p < count; ++p)
+            if (pairs[1 + 2 * p] == i) {
+                const float pf = dry_penalty_factor(multiplier,
+                                                     pairs[2 + 2 * p]);
+                v = v > 0.0f ? v / pf : v * pf;
+                break;
+            }
+        y[i] = v;
+    }
+}
+
+// Batched scan: one block per row over the ragged history table.
+__global__ void dry_scan_b_kernel(const long long* __restrict__ ids,
+                                  const int* __restrict__ offs,
+                                  int allowed_length,
+                                  int* __restrict__ pairs) {
+    const int row = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const long long m = (long long)offs[row + 1] - offs[row];
+    dry_build_pairs(ids + offs[row], m, allowed_length,
+                    pairs + (size_t)row * kDryPairStride);
+}
+
+// Batched apply: one pass over rows * n; the row lookup is a single
+// integer division (64-bit safe like every other rows * n index).
+__global__ void dry_apply_b_kernel(const float* __restrict__ x,
+                                   float* __restrict__ y,
+                                   const int* __restrict__ pairs,
+                                   long long total, int n,
+                                   float multiplier) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (long long)gridDim.x * blockDim.x) {
+        const int row = (int)(i / n);
+        const int col = (int)(i - (long long)row * n);
+        const int* pr = pairs + (size_t)row * kDryPairStride;
+        const int count = pr[0];
+        float v = x[i];
+        for (int p = 0; p < count; ++p)
+            if (pr[1 + 2 * p] == col) {
+                const float pf = dry_penalty_factor(multiplier,
+                                                     pr[2 + 2 * p]);
+                v = v > 0.0f ? v / pf : v * pf;
+                break;
+            }
+        y[i] = v;
+    }
+}
+
+// DRY single-row launcher: rewrite to scratch, then the plain
+// full-softmax draw (the min_p=1e-9 pipeline, the same shape as
+// sample_xtc's top_n=0 early-out).
+long long sample_dry_launch(const float* x, int n, const long long* ids,
+                             int m, int allowed_length, float multiplier,
+                             float t, unsigned long long seed,
+                             std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (m < 0)
+        throw std::invalid_argument("history length must be >= 0");
+    if (allowed_length < 1 || allowed_length > kDryMaxScan)
+        throw std::invalid_argument(
+            "allowed_length must be in [1, 64]");
+    if (multiplier < 1.0f)
+        throw std::invalid_argument("multiplier must be >= 1");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    float* y = dry_scratch((size_t)n);
+    int* pairs = dry_pairs(1);
+    dry_scan_kernel<<<1, 32, 0, cs>>>(ids, (long long)m, allowed_length,
+                                       pairs);
+    dry_apply_kernel<<<(int)grid_for(n), kBlock, 0, cs>>>(x, y, pairs, n,
+                                                           multiplier);
+    check_launch("dry rewrite launch");
+    return sample_minp_launch(y, n, 1e-9f, t, seed, stream);
+}
+
 
 // ---------------------------------------------------------------------------
 // batched sampling (v1.4): sample_topp/minp/topk_batched (v1.5 adds
@@ -5125,6 +5308,45 @@ std::vector<long long> sample_xtc_batched_launch(
         std::copy(chunk.begin(), chunk.end(), out.begin() + c);
     }
     return out;
+}
+
+// Batched DRY (v2.3): one scan block + one apply pass per batch over
+// the ragged histories, then the plain full-softmax batched draw (the
+// min_p=1e-9 chunk sequencer, mode 1). Every row's rewrite is
+// bit-identical to the single-row op on that row (same scan, same
+// factor chain).
+std::vector<long long> sample_dry_batched_launch(
+    const float* x, int rows, int n, const long long* ids,
+    const int* offs, int allowed_length, float multiplier, float t,
+    const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (allowed_length < 1 || allowed_length > kDryMaxScan)
+        throw std::invalid_argument(
+            "allowed_length must be in [1, 64]");
+    if (multiplier < 1.0f)
+        throw std::invalid_argument("multiplier must be >= 1");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    cudaStream_t cs = (cudaStream_t)stream;
+    float* y = dry_scratch((size_t)rows * n);
+    int* pairs = dry_pairs(rows);
+    dry_scan_b_kernel<<<rows, 32, 0, cs>>>(ids, offs, allowed_length,
+                                            pairs);
+    const long long total = (long long)rows * n;
+    const int grid = (int)std::min<long long>(
+        grid_for(total), 4 * (long long)kMaxGrid);
+    dry_apply_b_kernel<<<grid, kBlock, 0, cs>>>(x, y, pairs, total, n,
+                                                 multiplier);
+    check_launch("dry batched rewrite launch");
+    return sample_minp_batched_launch(y, rows, n, 1e-9f, t, seeds,
+                                       stream);
 }
 
 // ---------------------------------------------------------------------------

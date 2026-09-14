@@ -179,12 +179,12 @@ Decode attention is **bandwidth-bound**: every token streams the whole
 kv-cache once. What to expect:
 
 - f32 decode runs at effective-bandwidth parity or better vs SDPA at
-  long caches (the README tables show up to 8.82x on an RTX 3060 at
+  long caches (the README tables show up to 8.89x on an RTX 3060 at
   T=16384 - the reference pays head expansion or small-query
   inefficiency there).
 - bf16/fp16 caches halve the bytes. At batch 1 the kernel is
   latency-bound, so the absolute win is modest and grows with batch.
-- The paged indirection costs ~1.09-1.11x over the contiguous op.
+- The paged indirection costs ~1.09-1.12x over the contiguous op.
 - Prefill is deliberately not competitive with flash backends.
 
 See [benchmarks.md](benchmarks.md) for the measurement protocol and

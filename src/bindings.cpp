@@ -211,6 +211,31 @@ void check_batch_ids(const I64Array& ids, const I64Array& offs, int rows,
             throw std::invalid_argument(
                 std::string(what) + " entries must be in [0, vocab)");
 }
+
+// Shared body of the staged batched-sampler bindings (2.3 dedup): the
+// checks every sampler performs, the device upload, the launch (via
+// the lambda), the sync and the wrap. Sampler-specific parameter
+// validation stays at the call site, above the helper call, so error
+// messages keep naming the right argument. Before this helper each
+// body was a near-verbatim copy - the exact class of copy-paste that
+// produced the two 2.2.1 binding defects (one copy missing, one copy
+// drifted to the CPU reference).
+template <typename Launch>
+py::array_t<long long> staged_batched_sample(
+    FArray& logits, int rows, int n, double t, const I64Array& seeds,
+    const char* what, Launch&& launch) {
+    check_batch_host(logits, rows, n);
+    check_batch_temp(t);
+    check_batch_seeds(seeds, rows);
+    if (rows == 0)
+        return wrap_ivec({});
+    DevBuf dx((size_t)rows * n * 4);
+    h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+    const std::vector<long long> tokens = launch(dx.fget(),
+                                                  seeds_vec(seeds));
+    sync_device(what);
+    return wrap_ivec(tokens);
+}
 float* dfm(py::int_ p) { return reinterpret_cast<float*>((uintptr_t)p); }
 const long long* dll(py::int_ p) { return reinterpret_cast<const long long*>((uintptr_t)p); }
 long long* dllm(py::int_ p) { return reinterpret_cast<long long*>((uintptr_t)p); }
@@ -1285,19 +1310,144 @@ PYBIND11_MODULE(_fusedtok, m) {
             throw std::invalid_argument("top_n must be >= 0");
         if (!(probability >= 0.0 && probability <= 1.0))
             throw std::invalid_argument("probability must be in [0, 1]");
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample xtc batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_xtc_batched_launch(
+                    dxp, rows, n, top_n, (float)probability, (float)t, sv);
+            });
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_n"),
+       py::arg("probability"), py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_dry_cpu",
+          [](FArray logits, const I64Array& ids, int allowed_length,
+             double multiplier, double t,
+             unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        for (py::ssize_t j = 0; j < ids.size(); ++j)
+            if (ids.at(j) < 0 || ids.at(j) >= (long long)logits.size())
+                throw std::invalid_argument(
+                    "token_ids values must be in [0, vocab)");
+        const long long* idp = ids.data();
+        const std::vector<long long> iv(idp, idp + ids.size());
+        return ft::sample_dry_cpu(to_vec(logits), iv, allowed_length,
+                                   (float)multiplier, (float)t, seed);
+    }, py::arg("logits"), py::arg("token_ids"),
+       py::arg("allowed_length") = 2, py::arg("multiplier") = 1.75,
+       py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_dry",
+          [](FArray logits, py::array_t<long long, py::array::c_style> ids,
+             int allowed_length, double multiplier, double t,
+             unsigned long long seed) -> long long {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        const int m = (int)ids.size();
+        auto ii = ids.request();
+        const long long* ip = static_cast<const long long*>(ii.ptr);
+        for (int j = 0; j < m; ++j)
+            if (ip[j] < 0 || ip[j] >= n)
+                throw std::invalid_argument(
+                    "token_ids values must be in [0, vocab)");
+        DevBuf dx(n * 4), di((size_t)m * 8);
+        h2d(dx.get(), logits.data(), n * 4);
+        if (m > 0)
+            h2d(di.get(), ip, (size_t)m * 8);
+        const long long token = ft::sample_dry_launch(
+            dx.fget(), n, reinterpret_cast<const long long*>(di.fget()),
+            m, allowed_length, (float)multiplier, (float)t, seed, 0);
+        sync_device("sample dry kernel");
+        return token;
+    }, py::arg("logits"), py::arg("token_ids"),
+       py::arg("allowed_length") = 2, py::arg("multiplier") = 1.75,
+       py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_dry_launch",
+          [](py::int_ x, int n, py::int_ ids, int m, int allowed_length,
+             double multiplier, double t, unsigned long long seed,
+             std::uintptr_t stream) -> long long {
+        return ft::sample_dry_launch(df(x), n, dll(ids), m, allowed_length,
+                                      (float)multiplier, (float)t, seed,
+                                      stream);
+    }, py::arg("logits"), py::arg("n"), py::arg("token_ids"), py::arg("m"),
+       py::arg("allowed_length") = 2, py::arg("multiplier") = 1.75,
+       py::arg("t") = 1.0, py::arg("seed") = 0, py::arg("stream") = 0);
+
+    m.def("sample_dry_batched_cpu",
+          [](FArray logits, int rows, int n, const I64Array& ids,
+             const I64Array& offs, int allowed_length, double multiplier,
+             double t, const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_ids(ids, offs, rows, n);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        const long long* idp = ids.data();
+        const std::vector<long long> iv(idp, idp + ids.size());
+        const long long* ofp = offs.data();
+        const std::vector<long long> ov(ofp, ofp + offs.size());
+        return wrap_ivec(ft::sample_dry_batched_cpu(
+            to_vec(logits), rows, n, iv, ov, allowed_length,
+            (float)multiplier, (float)t, seeds_vec(seeds)));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("allowed_length") = 2,
+       py::arg("multiplier") = 1.75, py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_dry_batched",
+          [](FArray logits, int rows, int n, const I64Array& ids,
+             const I64Array& offs, int allowed_length, double multiplier,
+             double t, const I64Array& seeds) -> py::array_t<long long> {
+        check_batch_host(logits, rows, n);
+        check_batch_ids(ids, offs, rows, n);
         check_batch_temp(t);
         check_batch_seeds(seeds, rows);
         if (rows == 0)
             return wrap_ivec({});
         DevBuf dx((size_t)rows * n * 4);
         h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_xtc_batched_launch(
-            dx.fget(), rows, n, top_n, (float)probability, (float)t,
-            seeds_vec(seeds));
-        sync_device("sample xtc batched kernel");
+        DevBuf di(ids.size() * 8), dout(offs.size() * 4);
+        h2d(di.get(), ids.data(), ids.size() * 8);
+        const long long* ofp = offs.data();
+        std::vector<int> offs32(ofp, ofp + offs.size());
+        h2d(dout.get(), offs32.data(), offs32.size() * 4);
+        const std::vector<long long> tokens = ft::sample_dry_batched_launch(
+            dx.fget(), rows, n,
+            reinterpret_cast<const long long*>(di.fget()),
+            reinterpret_cast<const int*>(dout.fget()), allowed_length,
+            (float)multiplier, (float)t, seeds_vec(seeds));
+        sync_device("sample dry batched kernel");
         return wrap_ivec(tokens);
-    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_n"),
-       py::arg("probability"), py::arg("t") = 1.0, py::arg("seeds"));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("allowed_length") = 2,
+       py::arg("multiplier") = 1.75, py::arg("t") = 1.0, py::arg("seeds"));
+
+    m.def("sample_dry_batched_launch",
+          [](py::int_ x, int rows, int n, const I64Array& ids,
+             const I64Array& offs, int allowed_length, double multiplier,
+             double t, const I64Array& seeds,
+             std::uintptr_t stream) -> py::array_t<long long> {
+        check_batch_rows_n(rows, n);
+        check_batch_ids(ids, offs, rows, n);
+        check_batch_temp(t);
+        check_batch_seeds(seeds, rows);
+        DevBuf di(ids.size() * 8), dout(offs.size() * 4);
+        h2d(di.get(), ids.data(), ids.size() * 8);
+        const long long* ofp = offs.data();
+        std::vector<int> offs32(ofp, ofp + offs.size());
+        h2d(dout.get(), offs32.data(), offs32.size() * 4);
+        return wrap_ivec(ft::sample_dry_batched_launch(
+            df(x), rows, n,
+            reinterpret_cast<const long long*>(di.fget()),
+            reinterpret_cast<const int*>(dout.fget()), allowed_length,
+            (float)multiplier, (float)t, seeds_vec(seeds), stream));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
+       py::arg("offs"), py::arg("allowed_length") = 2,
+       py::arg("multiplier") = 1.75, py::arg("t") = 1.0, py::arg("seeds"),
+       py::arg("stream") = 0);
 
     m.def("sample_xtc_batched_launch",
           [](py::int_ x, int rows, int n, int top_n, double probability,
@@ -1536,16 +1686,13 @@ PYBIND11_MODULE(_fusedtok, m) {
              const I64Array& seeds) -> py::array_t<long long> {
         check_batch_host(logits, rows, n);
         check_batch_unit("p", p);
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_topp_batched_launch(
-            dx.fget(), rows, n, (float)p, (float)t, seeds_vec(seeds));
-        sync_device("sample topp batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample topp batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_topp_batched_launch(
+                    dxp, rows, n, (float)p, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("p"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1555,16 +1702,13 @@ PYBIND11_MODULE(_fusedtok, m) {
         check_batch_host(logits, rows, n);
         if (k <= 0)
             throw std::invalid_argument("k must be >= 1");
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_topk_batched_launch(
-            dx.fget(), rows, n, k, (float)t, seeds_vec(seeds));
-        sync_device("sample topk batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample topk batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_topk_batched_launch(
+                    dxp, rows, n, k, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("k"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1573,16 +1717,13 @@ PYBIND11_MODULE(_fusedtok, m) {
              const I64Array& seeds) -> py::array_t<long long> {
         check_batch_host(logits, rows, n);
         check_batch_unit("min_p", min_p);
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_minp_batched_launch(
-            dx.fget(), rows, n, (float)min_p, (float)t, seeds_vec(seeds));
-        sync_device("sample minp batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample minp batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_minp_batched_launch(
+                    dxp, rows, n, (float)min_p, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("min_p"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1645,16 +1786,13 @@ PYBIND11_MODULE(_fusedtok, m) {
              const I64Array& seeds) -> py::array_t<long long> {
         check_batch_host(logits, rows, n);
         check_batch_unit("top_a", top_a);
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_topa_batched_launch(
-            dx.fget(), rows, n, (float)top_a, (float)t, seeds_vec(seeds));
-        sync_device("sample top-a batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample topa batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_topa_batched_launch(
+                    dxp, rows, n, (float)top_a, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_a"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1692,18 +1830,13 @@ PYBIND11_MODULE(_fusedtok, m) {
         check_batch_host(logits, rows, n);
         if (!(nsigma > 0.0))
             throw std::invalid_argument("nsigma must be > 0");
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens =
-            ft::sample_nsigma_batched_launch(
-                dx.fget(), rows, n, (float)nsigma, (float)t,
-                seeds_vec(seeds));
-        sync_device("sample nsigma batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample nsigma batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_nsigma_batched_launch(
+                    dxp, rows, n, (float)nsigma, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("nsigma"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1741,16 +1874,13 @@ PYBIND11_MODULE(_fusedtok, m) {
         check_batch_host(logits, rows, n);
         if (!(z > 0.0 && z <= 1.0))
             throw std::invalid_argument("z must be in (0, 1]");
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_tfs_batched_launch(
-            dx.fget(), rows, n, (float)z, (float)t, seeds_vec(seeds));
-        sync_device("sample tfs batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample tfs batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_tfs_batched_launch(
+                    dxp, rows, n, (float)z, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("z"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1789,16 +1919,13 @@ PYBIND11_MODULE(_fusedtok, m) {
              const I64Array& seeds) -> py::array_t<long long> {
         check_batch_host(logits, rows, n);
         check_batch_unit("eta", eta);
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens = ft::sample_eta_batched_launch(
-            dx.fget(), rows, n, (float)eta, (float)t, seeds_vec(seeds));
-        sync_device("sample eta batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample eta batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_eta_batched_launch(
+                    dxp, rows, n, (float)eta, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("eta"),
        py::arg("t") = 1.0, py::arg("seeds"));
 
@@ -1834,18 +1961,13 @@ PYBIND11_MODULE(_fusedtok, m) {
              const I64Array& seeds) -> py::array_t<long long> {
         check_batch_host(logits, rows, n);
         check_batch_unit("typical", typical);
-        check_batch_temp(t);
-        check_batch_seeds(seeds, rows);
-        if (rows == 0)
-            return wrap_ivec({});
-        DevBuf dx((size_t)rows * n * 4);
-        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        const std::vector<long long> tokens =
-            ft::sample_typical_batched_launch(
-                dx.fget(), rows, n, (float)typical, (float)t,
-                seeds_vec(seeds));
-        sync_device("sample typical batched kernel");
-        return wrap_ivec(tokens);
+        return staged_batched_sample(
+            logits, rows, n, t, seeds, "sample typical batched kernel",
+            [&](const float* dxp,
+                const std::vector<unsigned long long>& sv) {
+                return ft::sample_typical_batched_launch(
+                    dxp, rows, n, (float)typical, (float)t, sv);
+            });
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("typical"),
        py::arg("t") = 1.0, py::arg("seeds"));
 

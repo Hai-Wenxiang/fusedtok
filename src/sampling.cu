@@ -917,9 +917,16 @@ long long sample_typical_cpu(const std::vector<float>& logits, float typical,
     return (long long)order[hi];              // float rounding fallback
 }
 
-std::vector<long long> sample_eta_batched_cpu(
-    const std::vector<float>& logits, int rows, int n, float eta, float t,
-    const std::vector<unsigned long long>& seeds) {
+// Shared body of the batched CPU references (2.3 dedup): the shared
+// shape/seed/buffer validation, then one per-row call on the row's
+// slice. The per-row reference re-validates its own parameters, so
+// each wrapper only supplies the call. Before this helper every body
+// was a near-verbatim copy - the class of copy-paste that produced the
+// 2.2.1 binding defects.
+template <typename PerRow>
+std::vector<long long> batched_cpu_rows(
+    const std::vector<float>& logits, int rows, int n, float t,
+    const std::vector<unsigned long long>& seeds, PerRow&& per_row) {
     if (rows < 0)
         throw std::invalid_argument("rows must be >= 0");
     if ((int)seeds.size() != rows)
@@ -929,32 +936,29 @@ std::vector<long long> sample_eta_batched_cpu(
             "logits size must be at least rows * n");
     std::vector<long long> out;
     out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_eta_cpu(std::vector<float>(row, row + n),
-                                      eta, t, seeds[r]));
-    }
+    for (int r = 0; r < rows; ++r)
+        out.push_back(per_row(logits.data() + (size_t)r * n, seeds[r]));
     return out;
+}
+
+std::vector<long long> sample_eta_batched_cpu(
+    const std::vector<float>& logits, int rows, int n, float eta,
+    float t, const std::vector<unsigned long long>& seeds) {
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_eta_cpu(std::vector<float>(row, row + n),
+                             eta, t, seed);
+        });
 }
 
 std::vector<long long> sample_typical_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float typical,
     float t, const std::vector<unsigned long long>& seeds) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    if ((long long)logits.size() < (long long)rows * n)
-        throw std::invalid_argument(
-            "logits size must be at least rows * n");
-    std::vector<long long> out;
-    out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_typical_cpu(std::vector<float>(row, row + n),
-                                          typical, t, seeds[r]));
-    }
-    return out;
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_typical_cpu(std::vector<float>(row, row + n),
+                             typical, t, seed);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -964,103 +968,53 @@ std::vector<long long> sample_typical_batched_cpu(
 // ---------------------------------------------------------------------------
 
 std::vector<long long> sample_topp_batched_cpu(
-    const std::vector<float>& logits, int rows, int n, float p, float t,
-    const std::vector<unsigned long long>& seeds) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    if ((long long)logits.size() < (long long)rows * n)
-        throw std::invalid_argument(
-            "logits size must be at least rows * n");
-    std::vector<long long> out;
-    out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_topp_cpu(std::vector<float>(row, row + n), p,
-                                      t, seeds[r]));
-    }
-    return out;
+    const std::vector<float>& logits, int rows, int n, float p,
+    float t, const std::vector<unsigned long long>& seeds) {
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_topp_cpu(std::vector<float>(row, row + n),
+                             p, t, seed);
+        });
 }
 
 std::vector<long long> sample_topk_batched_cpu(
-    const std::vector<float>& logits, int rows, int n, int k, float t,
-    const std::vector<unsigned long long>& seeds) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    if ((long long)logits.size() < (long long)rows * n)
-        throw std::invalid_argument(
-            "logits size must be at least rows * n");
-    std::vector<long long> out;
-    out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_topk_cpu(std::vector<float>(row, row + n), k,
-                                      t, seeds[r]));
-    }
-    return out;
+    const std::vector<float>& logits, int rows, int n, int k,
+    float t, const std::vector<unsigned long long>& seeds) {
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_topk_cpu(std::vector<float>(row, row + n),
+                             k, t, seed);
+        });
 }
 
 std::vector<long long> sample_minp_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float min_p,
     float t, const std::vector<unsigned long long>& seeds) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    if ((long long)logits.size() < (long long)rows * n)
-        throw std::invalid_argument(
-            "logits size must be at least rows * n");
-    std::vector<long long> out;
-    out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_minp_cpu(std::vector<float>(row, row + n),
-                                      min_p, t, seeds[r]));
-    }
-    return out;
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_minp_cpu(std::vector<float>(row, row + n),
+                             min_p, t, seed);
+        });
 }
 
 std::vector<long long> sample_topa_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float top_a,
     float t, const std::vector<unsigned long long>& seeds) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    if ((long long)logits.size() < (long long)rows * n)
-        throw std::invalid_argument(
-            "logits size must be at least rows * n");
-    std::vector<long long> out;
-    out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_topa_cpu(std::vector<float>(row, row + n),
-                                      top_a, t, seeds[r]));
-    }
-    return out;
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_topa_cpu(std::vector<float>(row, row + n),
+                             top_a, t, seed);
+        });
 }
 
 std::vector<long long> sample_nsigma_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float nsigma,
     float t, const std::vector<unsigned long long>& seeds) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    if ((long long)logits.size() < (long long)rows * n)
-        throw std::invalid_argument(
-            "logits size must be at least rows * n");
-    std::vector<long long> out;
-    out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_nsigma_cpu(std::vector<float>(row, row + n),
-                                        nsigma, t, seeds[r]));
-    }
-    return out;
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_nsigma_cpu(std::vector<float>(row, row + n),
+                             nsigma, t, seed);
+        });
 }
 
 // Batched fused decode step (v1.5): the row-wise composition
@@ -1220,21 +1174,11 @@ long long sample_tfs_cpu(const std::vector<float>& logits, float z,
 std::vector<long long> sample_tfs_batched_cpu(
     const std::vector<float>& logits, int rows, int n, float z,
     float t, const std::vector<unsigned long long>& seeds) {
-    if (rows < 0)
-        throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
-    if ((long long)logits.size() < (long long)rows * n)
-        throw std::invalid_argument(
-            "logits size must be at least rows * n");
-    std::vector<long long> out;
-    out.reserve((size_t)rows);
-    for (int r = 0; r < rows; ++r) {
-        const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_tfs_cpu(std::vector<float>(row, row + n),
-                                      z, t, seeds[r]));
-    }
-    return out;
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_tfs_cpu(std::vector<float>(row, row + n),
+                             z, t, seed);
+        });
 }
 
 // XTC sampling (v2.2): with probability p, skip the top top_n tokens.
@@ -1288,10 +1232,111 @@ std::vector<long long> sample_xtc_batched_cpu(
     const std::vector<float>& logits, int rows, int n, int top_n,
     float probability, float t,
     const std::vector<unsigned long long>& seeds) {
+    return batched_cpu_rows(logits, rows, n, t, seeds,
+        [&](const float* row, unsigned long long seed) {
+            return sample_xtc_cpu(std::vector<float>(row, row + n), top_n,
+                                  probability, t, seed);
+        });
+}
+
+// ---------------------------------------------------------------------------
+// DRY sampling (v2.3, "Don't Repeat Yourself"): sequence-aware repeat
+// penalty + temperature + full-softmax draw. See activations.hpp for
+// the contract; the scan below is the single source of truth both CPU
+// references and the GPU kernel mirror.
+// ---------------------------------------------------------------------------
+
+// Shared suffix-scan + penalized copy. Window W = min(history,
+// kDryMaxScan); for each suffix length L in [allowed_length, W) every
+// earlier in-window occurrence of the current L-suffix contributes its
+// following token, keeping the MAX exponent. Application follows the
+// repetition_penalty convention: positive logits divide, negative
+// logits multiply (the magnitude always shrinks).
+std::vector<float> dry_penalize_copy(const float* logits, int n,
+                                     const long long* ids, long long m,
+                                     int allowed_length, float multiplier) {
+    std::vector<float> y(logits, logits + n);
+    const long long W = std::min<long long>(m, (long long)kDryMaxScan);
+    if (W <= 0) return y;
+    const long long base = m - W;   // window start inside the history
+    std::vector<int> exponent(n, 0);
+    for (long long L = allowed_length; L < W; ++L) {
+        for (long long j = 0; j + L < W; ++j) {
+            bool eq = true;
+            for (long long k = 0; k < L; ++k)
+                if (ids[base + j + k] != ids[base + W - L + k]) {
+                    eq = false;
+                    break;
+                }
+            if (!eq) continue;
+            const long long c = ids[base + j + L];
+            const int e = (int)(L - allowed_length) + 1;
+            if (e > exponent[c]) exponent[c] = e;
+        }
+    }
+    for (int i = 0; i < n; ++i)
+        if (exponent[i] > 0) {
+            const float pf = dry_penalty_factor(multiplier, exponent[i]);
+            y[i] = y[i] > 0.0f ? y[i] / pf : y[i] * pf;
+        }
+    return y;
+}
+
+long long sample_dry_cpu(const std::vector<float>& logits,
+                         const std::vector<long long>& token_ids,
+                         int allowed_length, float multiplier, float t,
+                         unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (allowed_length < 1 || allowed_length > kDryMaxScan)
+        throw std::invalid_argument(
+            "allowed_length must be in [1, 64]");
+    if (multiplier < 1.0f)
+        throw std::invalid_argument("multiplier must be >= 1");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    for (long long id : token_ids)
+        if (id < 0 || id >= (long long)logits.size())
+            throw std::invalid_argument(
+                "token_ids values must be in [0, vocab)");
+    const std::vector<float> y = dry_penalize_copy(
+        logits.data(), (int)logits.size(), token_ids.data(),
+        (long long)token_ids.size(), allowed_length, multiplier);
+    return sample_minp_cpu(y, 1e-9f, t, seed);
+}
+
+std::vector<long long> sample_dry_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<long long>& token_ids,
+    const std::vector<long long>& offs, int allowed_length,
+    float multiplier, float t,
+    const std::vector<unsigned long long>& seeds) {
     if (rows < 0)
         throw std::invalid_argument("rows must be >= 0");
-    if ((int)seeds.size() != rows)
-        throw std::invalid_argument("seeds must have one entry per row");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (allowed_length < 1 || allowed_length > kDryMaxScan)
+        throw std::invalid_argument(
+            "allowed_length must be in [1, 64]");
+    if (multiplier < 1.0f)
+        throw std::invalid_argument("multiplier must be >= 1");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if (offs.size() != (size_t)rows + 1 || offs.front() != 0 ||
+        offs.back() != (long long)token_ids.size())
+        throw std::invalid_argument(
+            "token_ids offsets must have rows + 1 entries, start at 0 "
+            "and end at the id count");
+    for (size_t i = 1; i < offs.size(); ++i)
+        if (offs[i] < offs[i - 1])
+            throw std::invalid_argument(
+                "token_ids offsets must be non-decreasing");
+    for (long long id : token_ids)
+        if (id < 0 || id >= (long long)n)
+            throw std::invalid_argument(
+                "token_ids values must be in [0, vocab)");
     if ((long long)logits.size() < (long long)rows * n)
         throw std::invalid_argument(
             "logits size must be at least rows * n");
@@ -1299,8 +1344,11 @@ std::vector<long long> sample_xtc_batched_cpu(
     out.reserve((size_t)rows);
     for (int r = 0; r < rows; ++r) {
         const float* row = logits.data() + (size_t)r * n;
-        out.push_back(sample_xtc_cpu(std::vector<float>(row, row + n),
-                                      top_n, probability, t, seeds[r]));
+        const long long* hist = token_ids.data() + offs[r];
+        const long long len = offs[r + 1] - offs[r];
+        const std::vector<float> y = dry_penalize_copy(
+            row, n, hist, len, allowed_length, multiplier);
+        out.push_back(sample_minp_cpu(y, 1e-9f, t, seeds[r]));
     }
     return out;
 }

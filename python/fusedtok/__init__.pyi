@@ -160,6 +160,15 @@ def sample_xtc_batched(logits: Array, top_n: int, probability: float, *,
                        temperature: float = 1.0,
                        seeds: "Array | None" = None,
                        cuda: bool = False) -> Array: ...
+def sample_dry(logits: Array, token_ids: Array, allowed_length: int = 2,
+               multiplier: float = 1.75, *, temperature: float = 1.0,
+               seed: int = 0, cuda: bool = False) -> int: ...
+def sample_dry_batched(logits: Array, token_ids: Array,
+                       allowed_length: int = 2, multiplier: float = 1.75,
+                       *, temperature: float = 1.0,
+                       seeds: "Array | None" = None,
+                       ids_offsets: "Array | None" = None,
+                       cuda: bool = False) -> Array: ...
 def sample_typical_batched(logits: Array, typical: float, *,
                            temperature: float = 1.0,
                            seeds: Optional[Array] = None,

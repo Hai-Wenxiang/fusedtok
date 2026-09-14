@@ -90,6 +90,27 @@ std::vector<long long> sample_xtc_batched_cpu(
     float probability, float t,
     const std::vector<unsigned long long>& seeds);
 
+// DRY sampling (v2.3, "Don't Repeat Yourself"): sequence-aware repeat
+// penalty + temperature + full-softmax draw. Only the last
+// kDryMaxScan history tokens participate; for every suffix length
+// L in [allowed_length, window) each earlier occurrence of the
+// current L-suffix contributes its following token, and the token
+// keeps the MAX exponent (L - allowed_length + 1). The penalty
+// divides positive logits / multiplies negative ones (the
+// repetition_penalty convention); the draw is the plain softmax
+// inverse-CDF on the penalized row (identical to the
+// sample_xtc(top_n=0) path, deterministic per seed).
+long long sample_dry_cpu(const std::vector<float>& logits,
+                         const std::vector<long long>& token_ids,
+                         int allowed_length, float multiplier, float t,
+                         unsigned long long seed);
+std::vector<long long> sample_dry_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<long long>& token_ids,
+    const std::vector<long long>& offs, int allowed_length,
+    float multiplier, float t,
+    const std::vector<unsigned long long>& seeds);
+
 long long argmax_cpu(const std::vector<float>& x);
 
 // Batched greedy argmax over a [rows, n] batch: one index per row,
