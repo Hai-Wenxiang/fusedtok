@@ -13,7 +13,7 @@ CUDA graph 的行为、以及错误契约。
 | 你传入 | 路径 | 实际发生什么 |
 |---|---|---|
 | numpy 数组（默认） | **CPU 参考实现** | C++ float32 参考实现，完全不碰 GPU |
-| numpy 数组 + `cuda=True` | **暂存式 CUDA** | 输入拷上 GPU、跑 kernel、结果拷回 |
+| numpy 数组 + `cuda=True` | **staged 路径** | 输入拷上 GPU、跑 kernel、结果拷回 |
 | CUDA torch 张量 | **零拷贝 CUDA** | kernel 经 `data_ptr()` 直接读写 torch 的显存缓冲——没有中转拷贝，没有主机同步 |
 
 ```python
@@ -23,7 +23,7 @@ x = np.random.randn(4, 1024).astype(np.float32)
 w = np.random.rand(1024).astype(np.float32) + 0.5
 
 y1 = fusedtok.rmsnorm(x, w)                # CPU 参考实现
-y2 = fusedtok.rmsnorm(x, w, cuda=True)     # 暂存式 CUDA（numpy 进出）
+y2 = fusedtok.rmsnorm(x, w, cuda=True)     # staged 路径（numpy 进出）
 
 xt, wt = torch.from_numpy(x).cuda(), torch.from_numpy(w).cuda()
 yt = fusedtok.rmsnorm(xt, wt)              # 零拷贝：CUDA torch 进出
@@ -38,7 +38,7 @@ yt = fusedtok.rmsnorm(xt, wt)              # 零拷贝：CUDA torch 进出
 
 CPU 参考实现是正确性的基准：它实现的是同一套算法（在需要的地方
 连累加顺序都一致——见[采样契约](sampling.md#同-token-保证)），
-无 GPU 的机器也能跑，测试对拍全靠它。
+无 GPU 的机器也能跑，所有对照测试都依赖它。
 
 ## dtype 规则
 
@@ -51,7 +51,7 @@ CPU 参考实现是正确性的基准：它实现的是同一套算法（在需�
 
 几条值得记住的规则：
 
-- **半精度输入、float32 计算。** 读入时在内存边界升到 float32，
+- **半精度输入、float32 计算。** 数据读入 kernel 时提升为 float32，
   写出时按"最近偶数舍入"（round-to-nearest-even）规则舍回半精度。
   attention 的 softmax 和所有累加器在任何 dtype 下都是 float32，
   数值差异只来自输入本身的舍入。
@@ -70,10 +70,10 @@ CPU 参考实现是正确性的基准：它实现的是同一套算法（在需�
 库都支持 CUDA graph 捕获，照常使用 `torch.cuda.graph` 即可。两条
 实操要点：
 
-1. **捕获前先热身。** 首次调用可能会为该形状分配 workspace
+1. **捕获前先预热。** 首次调用可能会为该形状分配 workspace
    （attention 切分路径、选择管线），或对启动配置做一次微基准
    调优（行 kernel 的线程块大小、qgemm tile）。这些动作设计上
-   只发生在捕获之外，热身一次就把它们解决掉。
+   只发生在捕获之外，预热一次就把它们解决掉。
 2. **进图的 kernel 从设备内存读取每次调用的参数。** 两次 replay
    之间写进张量的新内容，下一次 replay 能看到；原地改写 +
    replay 会重新计算（测试钉住了这一点）。而以 kernel 参数形式
@@ -86,7 +86,7 @@ s = torch.cuda.Stream()
 s.wait_stream(torch.cuda.current_stream())
 with torch.cuda.stream(s):
     for _ in range(3):
-        out = fusedtok.rmsnorm(xt, wt)     # 热身（调优/workspace）
+        out = fusedtok.rmsnorm(xt, wt)     # 预热（调优/workspace）
 torch.cuda.current_stream().wait_stream(s)
 with torch.cuda.graph(g):
     out = fusedtok.rmsnorm(xt, wt)

@@ -103,8 +103,8 @@ The cache-write side of the paged loop: sequence `b`'s fresh rows
   scheduler: this writes data into already-mapped blocks and never
   touches table entries.
 - Host paths require float32 C-contiguous pools - a dtype/layout
-  conversion would view a copy and silently drop the writes, so it is
-  rejected with `TypeError` instead. The torch path supports the full
+  conversion would operate on a temporary copy and silently drop the
+  writes, so it is rejected with `TypeError` instead. The torch path supports the full
   f32/bf16/fp16 storage matrix.
 - One tiny kernel, stream-ordered, graph-capturable (after the usual
   warm-up).
@@ -135,8 +135,8 @@ The cache-write side of the contiguous decode loop (the twin of
 - **In place** (returns `None`); `lens` is required (the write position
   is each sequence's current length by definition).
 - Host paths require float32 C-contiguous caches (a conversion would
-  view a copy and silently drop the writes - rejected with
-  `TypeError`). The torch path supports f32/bf16/fp16 storage.
+  operate on a temporary copy and silently drop the writes - rejected
+  with `TypeError`). The torch path supports f32/bf16/fp16 storage.
 - One tiny kernel, stream-ordered, CUDA-graph capturable.
 - Host-origin `lens` values are validated in `[0, T)`; device-resident
   tensors are trusted (the standard zero-copy boundary).

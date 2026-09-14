@@ -305,8 +305,7 @@ std::vector<float> logit_penalties_batched_cpu(
     if ((long long)logits.size() < (long long)rows * n)
         throw std::invalid_argument(
             "logits size must be at least rows * n");
-    if (offs.size() != (size_t)rows + 1 || offs.size() == 0 ||
-        offs.front() != 0 ||
+    if (offs.size() != (size_t)rows + 1 || offs.front() != 0 ||
         offs.back() != (long long)token_ids.size())
         throw std::invalid_argument(
             "token_ids offsets must have rows + 1 entries, start at 0 "
@@ -1189,8 +1188,6 @@ long long sample_tfs_cpu(const std::vector<float>& logits, float z,
                 }
             }
         }
-        if (cutoff < 1) cutoff = 1;
-        (void)cutoff;  // used implicitly via the nucleus below
 
         // Nucleus is probs[0..cutoff-1]
         float nucleus_mass = 0.0f;

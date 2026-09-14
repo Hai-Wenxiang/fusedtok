@@ -1,3 +1,54 @@
+## [2.2.1] - 2026-09-15
+
+Bug fixes and the batched TFS/XTC kernel round. No API changes: 53
+public names; 729 tests green on RTX 3060 (Windows, CUDA 13.3) and
+RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Fixed
+- **`sample_xtc_batched` had no staged binding** - numpy input with
+  `cuda=True` raised AttributeError since 2.2.0; only the zero-copy
+  torch path reached the GPU. A new parametrized suite now pins the
+  staged contract for ALL nine batched samplers (the coverage gap
+  that let both binding defects ship).
+- **XTC's GPU path sampled the wrong distribution** (2.2.0 defect):
+  the nucleus window started at `kSelEarlyOut` (1024) and the XTC
+  draw always resolves inside its window, so the widening ladder
+  never fired and every draw came from the top ~1024 ranks on
+  vocab > 1024 - unlike the CPU reference, which spans the whole
+  vocabulary. The window now starts at `n` (regression-pinned by a
+  40-seed CPU/GPU parity test that also asserts deep-tail draws
+  happen).
+- **staged `sample_tfs_batched` computed on the CPU** after a dead
+  device upload; it now launches the GPU pipeline.
+- The penalty bitmap kernels range-guard device-resident token ids
+  (defensive, mirroring `penalty_count_kernel`'s documented trust
+  boundary).
+
+### Changed
+- **`sample_tfs_batched` / `sample_xtc_batched` run through the
+  shared chunked pipeline** (one stream sync and one bulk token
+  readback per attempt) instead of a full per-row pipeline. 131072
+  vocab, zero-copy, 5 rounds averaged: 3060 tfs b=32 5957 -> 559 us
+  (10.7x) and b=128 24556 -> 2207 us (11.1x); xtc b=32 104909 ->
+  15559 us (6.7x) and b=128 430002 -> 68637 us (6.3x). 5060 Ti:
+  tfs b=128 7.4x, xtc b=128 8.6x. b=1 unchanged within noise. The
+  XTC cost is now an honest full-vocabulary sort; batching is what
+  keeps large batches usable.
+- Single-row sampler launchers stream-sync instead of device-sync
+  per attempt; workspace clears surface enqueue failures with their
+  own label; staged argmax/topk/topp bindings sync before their
+  synchronous readback; dead code and stale comments removed
+  (audit-driven cleanup round).
+- Both benchmark tables re-measured on the shipping build (3 timed
+  rounds per row per GPU); prose numbers resynced, including the
+  argmax [131072] event-timed mean 0.77x with its 0.67-0.98x
+  across-run spread now documented explicitly.
+- Bilingual documentation readability round: zh terminology unified
+  (staged 路径 / 扩窗 / 阈值 / 预热 / workspace kept in English),
+  transliterations and coinages replaced with plain phrasing, EN
+  awkward sentences fixed, roadmap rows reordered ascending with the
+  2.2 row added.
+
 # Changelog
 
 All notable changes to this project are documented here. The format follows

@@ -42,15 +42,16 @@ rounding.
 - **(honest)** marks rows where fusedtok loses: attention_prefill vs
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
   (0.40-0.58x), flat-distribution sample_topp vs torch's fully
-  parallel sort (0.16-0.25x for the singles; the batched flat rows
+  parallel sort (0.16-0.24x for the singles; the batched flat rows
   fall to 0.05-0.06x - see the batched table), the wide-nucleus
-  sample_minp row (0.34-0.40x - one widening retry plus a 32-64k
+  sample_minp row (0.33-0.39x - one widening retry plus a 32-64k
   sort; the torch boolean-mask composite never sorts) and the
-  sample_nsigma rows (0.08-0.11x - the sigma cutoff keeps the top
+  sample_nsigma rows (0.08-0.13x - the sigma cutoff keeps the top
   ~94% of a spiked row, so near-full-vocabulary sampling through the
-  widening ladder; nsigma is a long-tail filter whose case is output
-  quality, not speed). These are
-  design-scope statements, not measurement noise - the
+  widening ladder; nsigma is a long-tail filter whose case rests on output
+  quality, not speed). These gaps reflect
+  design scope (regimes these ops never aimed to win), not
+  measurement noise - the
   [topic pages](usage.md) explain each one.
 - The **batched-sampler rows** (`b=8`) reference torch's native 2-D
   draw - softmax plus `multinomial` over the whole `[8, vocab]`
@@ -64,7 +65,7 @@ rounding.
   move (e.g. 2 tensors for softmax, 3 for rmsnorm+residual); the
   **TOPS** figure on INT8 rows is dense-MACs-times-two per second.
 - **argmax** rows are event-timed over a host-synchronized call and
-  swing on WDDM (0.74-1.48x across the 2.1.0 rounds); wall-clock probes with the
+  swing on WDDM (0.67-0.98x across the 3060's shipped rounds); wall-clock probes with the
   sync excluded from the timed loop measure 1.12x (3060) / 0.96x
   (5060 Ti). The row documents both.
 - Composite **sampling references** (sort+mask+multinomial and
