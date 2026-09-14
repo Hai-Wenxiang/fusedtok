@@ -17,6 +17,8 @@ and GPU draws may differ.
 - [sample_topa - squared-peak cutoff sampling (v1.8)](#sample_topa---squared-peak-cutoff-sampling-v18)
 - [sample_nsigma - sigma-spread cutoff sampling (v1.8)](#sample_nsigma---sigma-spread-cutoff-sampling-v18)
 - [sample_tfs - tail-free sampling (v2.1)](#sample_tfs---tail-free-sampling-v21)
+- [sample_xtc - Exclude Top Choices sampling (v2.2)](#sample_xtc---exclude-top-choices-sampling-v22)
+- [sample_dry - sequence-level repeat penalty sampling (v2.3)](#sample_dry---sequence-level-repeat-penalty-sampling-v23)
 - [sample_eta - entropy-adaptive cutoff sampling (v1.6)](#sample_eta---entropy-adaptive-cutoff-sampling-v16)
 - [sample_typical - locally typical sampling (v1.6)](#sample_typical---locally-typical-sampling-v16)
 - [logit_penalties - the HF penalty trio in one call (v1.6.1)](#logit_penalties---the-hf-penalty-trio-in-one-call-v161)
@@ -251,6 +253,72 @@ stops bending and becomes effectively flat.
   pipeline (the same sequencer as the other batched samplers): one
   stream sync and one bulk token readback per attempt.
 
+## sample_xtc - Exclude Top Choices sampling (v2.2)
+
+```python
+tok = fusedtok.sample_xtc(logits, top_n=3, probability=0.8, seed=step)
+tok = fusedtok.sample_xtc_batched(batch_logits, 3, 0.8, seeds=seeds)
+```
+
+XTC (Exclude Top Choices) breaks LLM "template" outputs: with
+probability `probability`, the top `top_n` tokens by probability are
+removed from the sampling pool BEFORE the draw, so the model is pushed
+off its most rehearsed continuations.
+
+- The suppression trigger is a deterministic coin per seed (a salted
+  splitmix hash), so a given `(seed, input)` pair always makes the
+  same decision.
+- `top_n` >= 0 and `probability` in [0, 1] (`ValueError` otherwise);
+  `top_n = 0` or `probability = 0` reduce to the plain softmax draw.
+- At least one token always survives: the clamp keeps exactly the
+  smallest candidate when `top_n` >= the window.
+- The draw spans the WHOLE vocabulary - suppression only removes a
+  leading prefix, so the pipeline runs on the full window (the 2.2.1
+  fix; earlier the tail beyond rank 1024 was silently clipped on
+  vocab > 1024). The full-vocabulary sort is the honest cost; the
+  batched op amortizes it through the shared chunked pipeline.
+
+## sample_dry - sequence-level repeat penalty sampling (v2.3)
+
+```python
+tok = fusedtok.sample_dry(logits, history, allowed_length=2,
+                          multiplier=1.75, temperature=0.8, seed=step)
+tok = fusedtok.sample_dry_batched(batch_logits, histories,
+                                  allowed_length=2, multiplier=1.75,
+                                  seeds=seeds)
+```
+
+DRY (Don't Repeat Yourself) is the sequence-level counterpart of the
+token-level `repetition_penalty`: instead of penalizing tokens that
+appeared before, it penalizes the token that would EXTEND a repeated
+sequence. Scan window = the most recent 64 history tokens. For every
+suffix length `L` in `[allowed_length, window)`, each earlier
+in-window occurrence of the current L-suffix contributes the token
+that followed it; a candidate keeps the MAX exponent
+(`L - allowed_length + 1`) across those hits.
+
+- Application follows the `repetition_penalty` convention: positive
+  logits divide by `multiplier ** exponent`, negative logits
+  multiply - the magnitude always shrinks.
+- `multiplier` >= 1.0 (1.0 disables the penalty); `allowed_length`
+  in [1, 64] (`ValueError` otherwise); `temperature` > 0. The
+  defaults (2, 1.75) match the quantity the DRY community settled on.
+- The draw is the plain full-softmax inverse-CDF on the penalized row
+  (the same path as `sample_xtc(top_n=0)`), deterministic per seed
+  with the shared splitmix contract.
+- `token_ids` carries the history: a 1-D int array for the single-row
+  op; ragged per-row sequences / a 2-D array / flat-plus-offsets for
+  the batched op (the `decode_step_batched` layout). Host-origin
+  values are range-checked; device-resident torch ids are trusted
+  (the documented boundary).
+- Implementation note: the GPU path builds a small trigger table
+  (<= 64 entries per row) in one pass and rewrites a scratch copy of
+  the row with the penalties in a second grid-stride pass; the batched
+  form runs one scan block per row over the ragged histories and one
+  fused apply over all rows, then the plain full-softmax batched draw.
+  Each row is the single-row op on that row up to the documented ulp
+  boundary class.
+
 ## sample_eta - entropy-adaptive cutoff sampling (v1.6)
 
 ```python
@@ -456,7 +524,7 @@ inherent to returning tokens at all, so - like the single-row samplers
   benchmark tables in the README measure GPU time, a different
   protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
-  (**1.44x / 1.19x**). The flat worst case keeps the singles' honest
+  (**1.29x / 1.17x**). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05-0.06x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.
@@ -536,7 +604,7 @@ worst time with bit-identical tokens).
 When the nucleus spans most of the vocabulary (uniform-ish logits),
 `sample_topp` must effectively order the whole thing, and torch's
 fully parallel sort stays ahead - the benchmark tables carry the
-honest 0.16-0.24x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
+honest 0.16-0.26x. v1.2 cut this worst case ~8.5x (18.2ms -> 2.2ms at
 n=131072 on a 3060) with three contract-preserving changes:
 
 1. **Adaptive widening jump** - a failed window attempt leaves its

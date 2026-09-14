@@ -513,6 +513,54 @@ def main():
     print(f"  {'argmax_batched vs numpy':<26} {'PASS' if ok else 'FAIL'}")
     ALL_OK &= ok
 
+    # ---- v2.1-v2.3: tail-free, XTC, DRY ----
+    print("v2.1-v2.3 samplers (tfs / xtc / dry)")
+    x23 = rng18.standard_normal(8192).astype(np.float32)
+    x23[7] += 8.0
+    # tfs: keep the prefix where the sorted curve still bends; draws
+    # must land inside a permissive tail-free cutoff computed here
+    e23 = np.exp(x23 - x23.max())
+    srt = np.sort((e23 / e23.sum())[::-1])
+    d2 = np.abs(2.0 * srt[1:-1] - srt[:-2] - srt[2:])
+    cut = int(np.argmax(d2 < (1.0 - 0.95) * d2.max())) + 2 if d2.max() > 0 else 2
+    keep23 = set(np.argsort(-x23, kind="stable")[:max(cut, 2)].tolist())
+    ok = all(int(fusedtok.sample_tfs(x23, 0.95, seed=s)) in keep23
+             for s in range(16))
+    print(f"  {'tfs cutoff membership':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    # xtc: with probability p the top top_n tokens leave the pool, and
+    # at least one candidate always survives
+    top3 = set(np.argsort(-x23, kind="stable")[:3].tolist())
+    body = set(range(8192)) - top3
+    draws = [int(fusedtok.sample_xtc(x23, 3, 1.0, seed=s))
+             for s in range(24)]
+    ok = all(d in body for d in draws)
+    print(f"  {'xtc skips the top 3 at p=1':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    # dry: a token that would extend a repeated suffix loses its
+    # argmax once the penalty outweighs its logit lead
+    d23 = np.full(256, -20.0, dtype=np.float32)
+    d23[10] = 1.0
+    d23[11] = 0.5
+    ok = (all(fusedtok.sample_dry(d23, [10, 11, 10, 11], 2, 1.0,
+                                  temperature=0.01, seed=s) == 10
+              for s in range(8))
+          and all(fusedtok.sample_dry(d23, [10, 11, 10, 11], 2, 3.9,
+                                      temperature=0.01, seed=s) == 11
+                  for s in range(8)))
+    print(f"  {'dry penalty flips the argmax':<26} {'PASS' if ok else 'FAIL'}")
+    ALL_OK &= ok
+    if have_cuda and HAS_TORCH:
+        dev23 = torch.from_numpy(np.tile(x23, (3, 1))).cuda()
+        got = fusedtok.sample_dry_batched(
+            dev23, [[7], [7, 7, 7], []], seeds=np.arange(3, dtype=np.int64))
+        singles = [fusedtok.sample_dry(x23, h, 2, 1.75, seed=s)
+                   for s, h in enumerate([[7], [7, 7, 7], []])]
+        ok = all(abs(int(g) - s) <= 2 or int(g) == s
+                 for g, s in zip(got.cpu().numpy(), singles))
+        print(f"  {'dry_batched matches singles':<26} {'PASS' if ok else 'FAIL'}")
+        ALL_OK &= ok
+
     print(SEP)
     print("ALL PASS" if ALL_OK else "SOME CHECKS FAILED")
     return 0 if ALL_OK else 1

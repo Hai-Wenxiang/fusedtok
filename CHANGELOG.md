@@ -1,3 +1,33 @@
+## [2.3.0] - 2026-09-15
+
+A new sampling algorithm: DRY (Don't Repeat Yourself), plus the
+maintainability dedup round. No breaking changes: 55 public names;
+742 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti
+(Linux, CUDA 13.2).
+
+### Added
+- **`sample_dry(logits, token_ids, allowed_length=2, multiplier=1.75,
+  *, temperature, seed)`** and **`sample_dry_batched`** - DRY (Don't
+  Repeat Yourself) sampling, the sequence-level counterpart of the
+  token-level `repetition_penalty`: it penalizes the token that would
+  EXTEND a repeated sequence. Only the most recent 64 history tokens
+  participate; for every suffix length L in [allowed_length, window)
+  each earlier in-window occurrence of the current L-suffix
+  contributes its following token, and the candidate keeps the MAX
+  exponent (L - allowed_length + 1). Positive logits divide by
+  `multiplier ** exponent`, negative logits multiply (the
+  repetition_penalty convention); the draw is the plain full-softmax
+  inverse-CDF. API count 53 -> 55. (The topic page also gained the
+  missing sample_xtc section - a 2.2.0 documentation omission.)
+
+### Changed
+- Dedup round (2.2.1 audit follow-up): the nine staged batched-sampler
+  bindings share one `staged_batched_sample` helper template and the
+  nine batched CPU references share one `batched_cpu_rows` helper - a
+  new batched sampler is ~10 lines of wiring instead of ~25 copied
+  lines, and the missing/drifted-copy defect class is structurally
+  closed. -227/+154 lines, no behavior change.
+
 ## [2.2.1] - 2026-09-15
 
 Bug fixes and the batched TFS/XTC kernel round. No API changes: 53

@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 
 __all__ = [
     "cuda_available",
@@ -71,6 +71,8 @@ __all__ = [
     "sample_tfs_batched",
     "sample_xtc",
     "sample_xtc_batched",
+    "sample_dry",
+    "sample_dry_batched",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",
@@ -2012,6 +2014,108 @@ def sample_xtc_batched(logits, top_n, probability, *, temperature=1.0,
                    else "sample_xtc_batched_cpu")
     out = np.asarray(call(arr, rows, n, top_n, probability,
                           temperature, s), dtype=np.int64)
+    return _numpy_to_torch_like(out) if _is_torch(logits) else out
+
+
+def sample_dry(logits, token_ids, allowed_length=2, multiplier=1.75,
+               *, temperature=1.0, seed=0, cuda=False):
+    """Fused DRY (Don't Repeat Yourself) sampling (v2.3): a
+    sequence-aware repeat penalty followed by a temperature-scaled
+    full-softmax draw.
+
+    Only the most recent 64 ``token_ids`` participate (the documented
+    scan window). For every suffix length ``L`` in
+    ``[allowed_length, window)``, each earlier occurrence of the
+    current L-suffix contributes the token that followed it; a token
+    keeps the MAX exponent (``L - allowed_length + 1``) across those
+    hits and its logit is divided by ``multiplier ** exponent``
+    (negative logits are multiplied - the repetition_penalty
+    convention, so the magnitude always shrinks). ``multiplier``
+    >= 1.0 (1.0 disables the penalty); ``allowed_length`` in
+    [1, 64]. Deterministic per seed (same splitmix contract as the
+    other samplers). ``token_ids``: 1-D int array, values in
+    [0, vocab); device-resident torch ids are trusted without a sync
+    (the documented _ids_arg boundary).
+    """
+    if allowed_length < 1 or allowed_length > 64:
+        raise ValueError("allowed_length must be in [1, 64]")
+    if not multiplier >= 1.0:
+        raise ValueError("multiplier must be >= 1")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        n = logits.numel()
+        ids_t = _ids_arg(token_ids, n, logits.device, "token_ids")
+        return int(_fusedtok.sample_dry_launch(
+            logits.data_ptr(), n, ids_t.data_ptr(), ids_t.numel(),
+            allowed_length, multiplier, temperature, seed,
+            _cuda_stream()))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    n = arr.shape[0]
+    ids_np = np.ascontiguousarray(_host_int_array(token_ids, "token_ids"),
+                                  dtype=np.int64)
+    if ids_np.ndim != 1:
+        raise ValueError("token_ids must be 1-D")
+    if ids_np.size and (ids_np.min() < 0 or ids_np.max() >= n):
+        raise ValueError(f"token_ids values must be in [0, {n})")
+    call = (_fusedtok.sample_dry if path == "staged"
+            else _fusedtok.sample_dry_cpu)
+    return int(call(arr, ids_np, allowed_length, multiplier, temperature,
+                    seed))
+
+
+def sample_dry_batched(logits, token_ids, allowed_length=2,
+                       multiplier=1.75, *, temperature=1.0, seeds=None,
+                       ids_offsets=None, cuda=False):
+    """Fused DRY sampling for a batch of rows (v2.3).
+
+    ``logits`` is 2-D ``[rows, vocab]``. ``token_ids`` carries the
+    per-row histories exactly like ``decode_step_batched``: a ragged
+    sequence of per-row sequences, a 2-D integer array (every row
+    contributes ALL its columns), or a flat 1-D array plus
+    ``ids_offsets``. Each row is the single-row ``sample_dry``
+    pipeline - penalty scan, temperature scale, full-softmax draw -
+    with its own seed, so per-row results match the single-row API up
+    to the documented ulp boundary class. ``seeds`` one non-negative
+    integer per row (``None`` defaults to ``0..rows-1``).
+    """
+    if allowed_length < 1 or allowed_length > 64:
+        raise ValueError("allowed_length must be in [1, 64]")
+    if not multiplier >= 1.0:
+        raise ValueError("multiplier must be >= 1")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        ids, offs = _batch_ids_arg(token_ids, ids_offsets, rows, n)
+        s = _batch_seeds(seeds, rows, "seeds")
+        toks = _fusedtok.sample_dry_batched_launch(
+            logits.data_ptr(), rows, n, ids, offs, allowed_length,
+            multiplier, temperature, s, _cuda_stream())
+        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    ids, offs = _batch_ids_arg(token_ids, ids_offsets, rows, n)
+    s = _batch_seeds(seeds, rows, "seeds")
+    if rows == 0:
+        out = np.empty(0, dtype=np.int64)
+    else:
+        call = (_fusedtok.sample_dry_batched if path == "staged"
+                else _fusedtok.sample_dry_batched_cpu)
+        out = np.asarray(call(arr, rows, n, ids, offs, allowed_length,
+                              multiplier, temperature, s), dtype=np.int64)
     return _numpy_to_torch_like(out) if _is_torch(logits) else out
 
 

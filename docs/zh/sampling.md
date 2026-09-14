@@ -15,6 +15,8 @@ CPU 与 GPU 抽签可能不一致的精确边界。
 - [sample_topa——平方峰值截断采样（v1.8）](#sample_topa平方峰值截断采样v18)
 - [sample_nsigma——按离散度截断的采样（v1.8）](#sample_nsigma按离散度截断的采样v18)
 - [sample_tfs——尾部自由采样（v2.1）](#sample_tfs尾部自由采样v21)
+- [sample_xtc——排除顶部选择采样（v2.2）](#sample_xtc排除顶部选择采样v22)
+- [sample_dry——序列级重复惩罚采样（v2.3）](#sample_dry序列级重复惩罚采样v23)
 - [sample_eta——熵自适应截断采样（v1.6）](#sample_eta熵自适应截断采样v16)
 - [sample_typical——局部典型采样（v1.6）](#sample_typical局部典型采样v16)
 - [logit_penalties——一次调用套齐 HF 三件惩罚（v1.6.1）](#logit_penalties一次调用完成-hf-三种惩罚v161)
@@ -207,6 +209,62 @@ tok = fusedtok.sample_tfs(logits, z=0.95, temperature=0.8, seed=step)
   需要两遍（第一遍找最大值，第二遍找截断），但排序窗口很小。扩窗
   策略与 sample_typical 相同——诚实的 x8 阶梯。批量版与其他批量采样器共用同一条分块管线（sequencer 模式 6）：每轮尝试一次流同步、一次整体回读。
 
+## sample_xtc——排除顶部选择采样（v2.2）
+
+```python
+tok = fusedtok.sample_xtc(logits, top_n=3, probability=0.8, seed=step)
+tok = fusedtok.sample_xtc_batched(batch_logits, 3, 0.8, seeds=seeds)
+```
+
+XTC（Exclude Top Choices，排除顶部选择）专治大模型千篇一律的"模板"输出：以
+`probability` 的概率，在抽签之前把概率最高的前 `top_n` 个 token 整体移出采样池，
+把模型从最熟练的续写上推开。
+
+- 是否触发压制由每个种子确定（一个加盐 splitmix 哈希），同一个
+  `(seed, 输入)` 组合永远做出同一个决定。
+- `top_n` >= 0、`probability` 属于 [0, 1]（越界抛 `ValueError`）；
+  `top_n = 0` 或 `probability = 0` 退化为普通 softmax 抽签。
+- 至少保留一个 token：当 `top_n` >= 窗口宽度时，钳制会恰好留下最小
+  候选。
+- 抽签分布横跨整个词表——压制只移除一个前缀，所以管线直接以全词表
+  窗口运行（2.2.1 修复；此前词表 > 1024 时 1024 名之后的尾部会被静默
+  截掉）。全词表排序是这一语义的诚实代价；批量版通过共享分块管线摊薄
+  它。
+
+## sample_dry——序列级重复惩罚采样（v2.3）
+
+```python
+tok = fusedtok.sample_dry(logits, history, allowed_length=2,
+                          multiplier=1.75, temperature=0.8, seed=step)
+tok = fusedtok.sample_dry_batched(batch_logits, histories,
+                                  allowed_length=2, multiplier=1.75,
+                                  seeds=seeds)
+```
+
+DRY（Don't Repeat Yourself）是 token 级 `repetition_penalty` 的序列级
+版本：它不再惩罚"出现过的 token"，而是惩罚"会延续一段重复序列的
+token"。扫描窗口 = 最近 64 个历史 token。对每个后缀长度
+`L ∈ [allowed_length, 窗口)`，当前 L 后缀在窗口内每一次更早的出现都会
+贡献它的后继 token；候选 token 保留其中的最大指数
+（`L - allowed_length + 1`）。
+
+- 应用约定与 `repetition_penalty` 一致：正 logit 除以
+  `multiplier ** 指数`，负 logit 相乘——幅度只会缩小。
+- `multiplier` >= 1.0（1.0 等于关闭惩罚）；`allowed_length` 属于
+  [1, 64]（越界抛 `ValueError`）；`temperature` > 0。默认值
+  (2, 1.75) 与 DRY 社区惯用量级一致。
+- 抽签是惩罚行上的普通全词表 softmax 逆变换（与
+  `sample_xtc(top_n=0)` 同一条路径），逐种子确定，与其他采样器共用
+  同一个 splitmix 契约。
+- `token_ids` 携带历史：单行传一维整数数组；批量传逐行序列 /
+  二维数组 / 扁平数组加 offsets（即 `decode_step_batched` 的布局）。
+  主机侧取值会做范围校验；设备端 torch 张量按文档记载的信任边界
+  处理。
+- 实现注：GPU 路径先用一遍扫描生成每行至多 64 项的触发表，再用一遍
+  grid-stride 把惩罚写进行数据的 scratch 副本；批量版对不等长历史
+  每行一个扫描 block、对所有行做一次融合 apply，然后走普通全词表
+  批量抽签。每行与单行算子在该行上按文档记载的 ulp 边界一致。
+
 ## sample_eta——熵自适应截断采样（v1.6）
 
 ```python
@@ -376,7 +434,7 @@ CUDA graph 捕获。
   274 µs、minp 1399 -> 237 µs；README 中的事件计时基准表量的是
   GPU 时间，协议不同）。尖峰 logits 下与 torch 原生批量
   multinomial 处于同一档位，`sample_topk_batched` 明确胜出
-  （1.44x / 1.19x）；平坦最坏情况则比单行版再低一档
+  （1.29x / 1.17x）；平坦最坏情况则比单行版再低一档
   （0.05-0.06x），差距同样如实给出。
 - `decode_step` 的批量版见下一节（v1.5）。
 
@@ -440,7 +498,7 @@ softmax 总量靠逐 block 的浮点原子加累加，而 GPU 调度这些 block
 
 当核（nucleus）盖住几乎整个词表（接近均匀的 logits）时，
 `sample_topp` 实际上要给全词表排序，torch 的全并行排序仍然更快
-——基准表里明确标着 0.16-0.24x 的差距。v1.2 用三个不破坏契约的改动把
+——基准表里明确标着 0.16-0.26x 的差距。v1.2 用三个不破坏契约的改动把
 该最坏情况的耗时压到约 1/8.5（快约 8.5 倍；3060 上 n=131072
 实测 18.2ms -> 2.2ms）：
 
