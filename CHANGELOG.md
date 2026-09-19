@@ -1,3 +1,46 @@
+## [2.4.1] - 2026-09-19
+
+Audit-driven bug-fix and accuracy round. No API changes: 55 public
+names; 772 tests green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060
+Ti (Linux, CUDA 13.2).
+
+### Fixed
+- **the tensor-core prefill dispatch accepted dims 48/80/96/112** -
+  any multiple of 16 in [32, 128] - but the kernel switch only
+  instantiates {32, 64, 128}; the others fell into the default arm
+  and launched the D=128 template over narrower rows: wrong base
+  pointers, out-of-bounds global reads AND writes, and
+  shared-memory overrun past the runtime allocation. The gate now
+  checks the exact instantiated set (matching the documented
+  contract); regression-pinned by a 4-dim x 2-dtype parity matrix.
+- **staged `sample_dry_batched` uploaded the ragged histories on the
+  legacy default stream** while the kernels run on the caller's
+  stream - torch's non-blocking streams do not order against the
+  legacy stream, so the scan could read garbage offsets. The upload
+  now rides the caller's stream inside the C++ launcher (the
+  decode_step pattern), for both binding variants.
+- the DRY batched rewrite scratch is chunked to kBMaxBatch rows
+  (a whole-batch scratch retained ~600 MB at 1000 rows x 152k
+  vocab, contradicting the family's documented workspace bound).
+- the `.pyi` stub `__all__` was two names behind the runtime (the
+  sample_dry pair); test_api now compares the stub against the
+  runtime so the drift cannot recur.
+
+### Changed
+- Documentation accuracy round (32 findings): the stale "no tensor
+  cores by design" prefill paragraphs scoped to the f32 path; both
+  tables re-measured and every benchmark-derived prose number
+  resynced (the mispaired INT8 TOPS parentheticals, the garbled
+  batched-trio values, the kv_append paragraph, the paged and
+  attention headlines, the honest-loss ranges); quickstart
+  showcases the tensor-core prefill; demo.py's bf16 check upgraded
+  from D=16 (which silently tested the fallback) to D=32; the 3060
+  environment note rewritten around the confirmed
+  load-duration-dependent slowdown.
+- the eight staged single-row sampler bindings share a
+  `staged_sample` helper template (the single-row twin of 2.3.0's
+  batched dedup); -46 lines, no behavior change.
+
 ## [2.4.0] - 2026-09-19
 
 The roadmap's headline item: tensor-core prefill. No API changes: 55

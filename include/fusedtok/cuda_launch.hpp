@@ -245,8 +245,10 @@ long long sample_dry_launch(const float* x, int n, const long long* ids,
 // Batched DRY over ragged per-row histories (flat ids + rows+1
 // offsets, decode_step_batched's layout, host-validated values).
 std::vector<long long> sample_dry_batched_launch(
-    const float* x, int rows, int n, const long long* ids,
-    const int* offs, int allowed_length, float multiplier, float t,
+    const float* x, int rows, int n,
+    const std::vector<long long>& ids,
+    const std::vector<long long>& offs, int allowed_length,
+    float multiplier, float t,
     const std::vector<unsigned long long>& seeds,
     std::uintptr_t stream = 0);
 

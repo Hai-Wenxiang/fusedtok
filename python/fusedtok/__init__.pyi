@@ -70,6 +70,8 @@ __all__ = [
     "sample_tfs_batched",
     "sample_xtc",
     "sample_xtc_batched",
+    "sample_dry",
+    "sample_dry_batched",
     "sample_topp_batched",
     "sample_topk_batched",
     "sample_minp_batched",

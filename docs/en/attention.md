@@ -140,8 +140,8 @@ The cache-write side of the contiguous decode loop (the twin of
 - One tiny kernel, stream-ordered, CUDA-graph capturable.
 - Host-origin `lens` values are validated in `[0, T)`; device-resident
   tensors are trusted (the standard zero-copy boundary).
-- Performance (benchmark tables): 13.7 µs vs 46.6 µs for the torch
-  advanced-indexing scatter on a 3060 (3.40x), 9.3 vs 21.2 µs on a
+- Performance (benchmark tables): 15.5 µs vs 55.8 µs for the torch
+  advanced-indexing scatter on a 3060 (3.59x), 9.2 vs 21.1 µs on a
   5060 Ti (2.28x) - a tiny launch-bound op whose ratio tracks the
   reference's own WDDM swing; the row prices the
   fixed cost per decode step.
@@ -175,7 +175,7 @@ Honest scope, two tiers since v2.4:
   accumulation, output rounded to the storage dtype). At S=1024 D=128
   causal this is 5.1x the previous CUDA-core half path on a 3060
   (6019 -> 1171 us, 5-round means; the 5060 Ti lands at ~630 us) and
-  0.42-0.59x SDPA's bf16 flash kernel on the same inputs - up from
+  0.41-0.58x SDPA's bf16 flash kernel on the same inputs - up from
   0.11x before the tensor-core path. The honest SDPA gap is carried
   in the benchmark tables (`attn prefill bf16` row).
 - **float32 storage, and half storage at other dims, keeps the v0.5
@@ -191,13 +191,16 @@ Decode attention is **bandwidth-bound**: every token streams the whole
 kv-cache once. What to expect:
 
 - f32 decode runs at effective-bandwidth parity or better vs SDPA at
-  long caches (the README tables show up to 8.69x on an RTX 3060 at
+  long caches (the README tables show up to 8.86x on an RTX 3060 at
   T=16384 - the reference pays head expansion or small-query
   inefficiency there).
 - bf16/fp16 caches halve the bytes. At batch 1 the kernel is
   latency-bound, so the absolute win is modest and grows with batch.
-- The paged indirection costs ~1.09-1.12x over the contiguous op.
-- Prefill is deliberately not competitive with flash backends.
+- The paged indirection costs ~1.09-1.15x over the contiguous op
+  (1.15x on a 3060, 1.09x on a 5060 Ti, this round).
+- The f32 prefill path deliberately stays off tensor cores (and thus
+not competitive with flash backends); the half-precision path is
+within 0.41-0.58x of SDPA's bf16 flash since v2.4.
 
 See [benchmarks.md](benchmarks.md) for the measurement protocol and
 how to reproduce the tables.

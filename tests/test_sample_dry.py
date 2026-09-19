@@ -276,6 +276,38 @@ class TestCuda:
         assert isinstance(out_np, np.ndarray)
         assert isinstance(first, torch.Tensor)
 
+    def test_batched_on_side_stream_and_large_batch(self):
+        # 2.4.1 regression pins: (a) the history upload rides the
+        # CALLER's stream - running under a non-default torch stream
+        # must produce the same tokens (the 2.4.0 binding uploaded on
+        # the legacy default stream, racing the scan); (b) a batch
+        # larger than the kBMaxBatch chunk still matches the singles
+        # (the rewrite scratch is now chunk-bounded)
+        rng = np.random.default_rng(505)
+        b, n = 40, 2048
+        x = rng.standard_normal((b, n)).astype(np.float32)
+        x[0, 5] += 8.0
+        hists = [[3, 1, 4, 1, 5] if r % 2 else [9, 9, 9, 9]
+                 for r in range(b)]
+        dev = torch.from_numpy(x).cuda()
+        seeds = np.arange(b, dtype=np.int64)
+        want = [fusedtok.sample_dry(x[r], hists[r], 2, 1.75, seed=r)
+                for r in range(b)]
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            got = fusedtok.sample_dry_batched(dev, hists, 2, 1.75,
+                                              seeds=seeds)
+        torch.cuda.current_stream().wait_stream(side)
+        for r in (0, 1, 31, 32, 39):
+            self_or_rank = int(got[r]) == want[r]
+            if not self_or_rank:
+                order = np.argsort(-x[r], kind="stable")
+                rank = {int(t): i for i, t in enumerate(order)}
+                self_or_rank = abs(rank[int(got[r])] -
+                                   rank[want[r]]) <= 2
+            assert self_or_rank, r
+
     def test_error_contract_cuda(self):
         x = torch.ones(8, device="cuda")
         with pytest.raises(ValueError):

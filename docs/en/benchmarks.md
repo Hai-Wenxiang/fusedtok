@@ -41,7 +41,7 @@ rounding.
   bigger - launch overhead fades as shapes grow).
 - **(honest)** marks rows where fusedtok loses: attention_prefill vs
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
-  (0.40-0.58x), flat-distribution sample_topp vs torch's fully
+  (0.37-0.61x), flat-distribution sample_topp vs torch's fully
   parallel sort (0.16-0.21x for the singles; the batched flat rows
   fall to 0.05-0.06x - see the batched table), the wide-nucleus
   sample_minp row (0.30-0.34x - one widening retry plus a 32-64k
@@ -64,13 +64,16 @@ rounding.
 - The **bandwidth column** (GB/s) counts only the bytes the op must
   move (e.g. 2 tensors for softmax, 3 for rmsnorm+residual); the
   **TOPS** figure on INT8 rows is dense-MACs-times-two per second.
-- **Environment note (2.4.0 round)**: the 3060 host measured ~1.6x
-  slower on launch-latency-bound rows than the 2.3.0 round (the torch
-  references slowed identically - sample_topp b=8's ratio moved only
-  1.43x -> 1.47x; bandwidth-bound rows are unaffected). A reboot-class
-  environment reset was not possible mid-session, so this round's
-  3060 absolutes are internally consistent but not comparable to
-  2.3.0's; the ratios are.
+- **Environment note (3060 host, 2.4.x rounds)**: this host shows a
+  load-duration-dependent slowdown on launch-latency-bound rows -
+  short bursts measure at the historical level, sustained runs drift
+  1.6-1.9x slower, and the torch references slow identically (the
+  ratios move within a few points; bandwidth-bound rows are
+  unaffected). The 2.4.1 re-measurement confirmed the pattern; a
+  reboot-class reset was not possible mid-session. The 3060
+  absolutes are internally consistent per round but not comparable
+  across machine states; the ratios are the stable signal. The
+  non-pc INT8 rows and argmax feel it most.
 - **argmax** rows are event-timed over a host-synchronized call and
   swing on WDDM (0.90-0.92x across the 3060's shipped rounds); wall-clock probes with the
   sync excluded from the timed loop measure 1.12x (3060) / 0.96x

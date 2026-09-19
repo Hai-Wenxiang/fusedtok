@@ -220,6 +220,26 @@ void check_batch_ids(const I64Array& ids, const I64Array& offs, int rows,
 // body was a near-verbatim copy - the exact class of copy-paste that
 // produced the two 2.2.1 binding defects (one copy missing, one copy
 // drifted to the CPU reference).
+// Shared body of the staged single-row sampler bindings (2.4.1 dedup,
+// the single-row twin of staged_batched_sample): the 1-D/size checks,
+// the device upload, the launch (via the lambda), the sync and the
+// token readback. Sampler-specific parameter validation stays at the
+// call site so error messages keep naming the right argument.
+template <typename Launch>
+long long staged_sample(FArray& logits, const char* what,
+                        Launch&& launch) {
+    if (logits.ndim() != 1)
+        throw std::invalid_argument("logits must be 1-D");
+    const int n = (int)logits.size();
+    if (n == 0)
+        throw std::invalid_argument("sample of empty logits");
+    DevBuf dx(n * 4);
+    h2d(dx.get(), logits.data(), n * 4);
+    const long long token = launch(dx.fget(), n);
+    sync_device(what);
+    return token;
+}
+
 template <typename Launch>
 py::array_t<long long> staged_batched_sample(
     FArray& logits, int rows, int n, double t, const I64Array& seeds,
@@ -1067,24 +1087,16 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_topk", [](FArray logits, int k, double t,
                             unsigned long long seed) -> long long {
-        // staged: copy logits up, run, read the token back
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (k <= 0)
             throw std::invalid_argument("k must be >= 1");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_topk_launch(dx.fget(), n, k,
-                                                       (float)t, seed);
-        sync_device("sample topk kernel");
-        return token;
+        return staged_sample(
+            logits, "sample topk kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_topk_launch(dxp, n, k, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("k"), py::arg("t") = 1.0, py::arg("seed") = 0);
-
     m.def("sample_topk_launch", [](py::int_ x, int n, int k, double t,
                                    unsigned long long seed,
                                    std::uintptr_t stream) -> long long {
@@ -1110,26 +1122,17 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_minp", [](FArray logits, double min_p, double t,
                             unsigned long long seed) -> long long {
-        // staged: copy logits up, run, read the token back
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (!(min_p > 0.0 && min_p <= 1.0))
             throw std::invalid_argument("min_p must be in (0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_minp_launch(dx.fget(), n,
-                                                       (float)min_p,
-                                                       (float)t, seed);
-        sync_device("sample minp kernel");
-        return token;
+        return staged_sample(
+            logits, "sample minp kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_minp_launch(dxp, n, (float)min_p, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("min_p"), py::arg("t") = 1.0,
        py::arg("seed") = 0);
-
     m.def("sample_minp_launch", [](py::int_ x, int n, double min_p,
                                    double t, unsigned long long seed,
                                    std::uintptr_t stream) -> long long {
@@ -1156,26 +1159,17 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_topa", [](FArray logits, double top_a, double t,
                             unsigned long long seed) -> long long {
-        // staged: copy logits up, run, read the token back
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (!(top_a > 0.0 && top_a <= 1.0))
             throw std::invalid_argument("top_a must be in (0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_topa_launch(dx.fget(), n,
-                                                       (float)top_a,
-                                                       (float)t, seed);
-        sync_device("sample top-a kernel");
-        return token;
+        return staged_sample(
+            logits, "sample topa kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_topa_launch(dxp, n, (float)top_a, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("top_a"), py::arg("t") = 1.0,
        py::arg("seed") = 0);
-
     m.def("sample_topa_launch", [](py::int_ x, int n, double top_a,
                                    double t, unsigned long long seed,
                                    std::uintptr_t stream) -> long long {
@@ -1202,26 +1196,17 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_nsigma", [](FArray logits, double nsigma, double t,
                               unsigned long long seed) -> long long {
-        // staged: copy logits up, run, read the token back
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (!(nsigma > 0.0))
             throw std::invalid_argument("nsigma must be > 0");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_nsigma_launch(dx.fget(), n,
-                                                         (float)nsigma,
-                                                         (float)t, seed);
-        sync_device("sample nsigma kernel");
-        return token;
+        return staged_sample(
+            logits, "sample nsigma kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_nsigma_launch(dxp, n, (float)nsigma, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("nsigma"), py::arg("t") = 1.0,
        py::arg("seed") = 0);
-
     m.def("sample_nsigma_launch", [](py::int_ x, int n, double nsigma,
                                      double t, unsigned long long seed,
                                      std::uintptr_t stream) -> long long {
@@ -1409,16 +1394,14 @@ PYBIND11_MODULE(_fusedtok, m) {
             return wrap_ivec({});
         DevBuf dx((size_t)rows * n * 4);
         h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
-        DevBuf di(ids.size() * 8), dout(offs.size() * 4);
-        h2d(di.get(), ids.data(), ids.size() * 8);
+        const long long* idp = ids.data();
         const long long* ofp = offs.data();
-        std::vector<int> offs32(ofp, ofp + offs.size());
-        h2d(dout.get(), offs32.data(), offs32.size() * 4);
         const std::vector<long long> tokens = ft::sample_dry_batched_launch(
             dx.fget(), rows, n,
-            reinterpret_cast<const long long*>(di.fget()),
-            reinterpret_cast<const int*>(dout.fget()), allowed_length,
-            (float)multiplier, (float)t, seeds_vec(seeds));
+            std::vector<long long>(idp, idp + ids.size()),
+            std::vector<long long>(ofp, ofp + offs.size()),
+            allowed_length, (float)multiplier, (float)t,
+            seeds_vec(seeds));
         sync_device("sample dry batched kernel");
         return wrap_ivec(tokens);
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
@@ -1434,16 +1417,14 @@ PYBIND11_MODULE(_fusedtok, m) {
         check_batch_ids(ids, offs, rows, n);
         check_batch_temp(t);
         check_batch_seeds(seeds, rows);
-        DevBuf di(ids.size() * 8), dout(offs.size() * 4);
-        h2d(di.get(), ids.data(), ids.size() * 8);
+        const long long* idp = ids.data();
         const long long* ofp = offs.data();
-        std::vector<int> offs32(ofp, ofp + offs.size());
-        h2d(dout.get(), offs32.data(), offs32.size() * 4);
         return wrap_ivec(ft::sample_dry_batched_launch(
             df(x), rows, n,
-            reinterpret_cast<const long long*>(di.fget()),
-            reinterpret_cast<const int*>(dout.fget()), allowed_length,
-            (float)multiplier, (float)t, seeds_vec(seeds), stream));
+            std::vector<long long>(idp, idp + ids.size()),
+            std::vector<long long>(ofp, ofp + offs.size()),
+            allowed_length, (float)multiplier, (float)t,
+            seeds_vec(seeds), stream));
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("ids"),
        py::arg("offs"), py::arg("allowed_length") = 2,
        py::arg("multiplier") = 1.75, py::arg("t") = 1.0, py::arg("seeds"),
@@ -1477,24 +1458,17 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_tfs", [](FArray logits, double z, double t,
                             unsigned long long seed) -> long long {
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (!(z > 0.0 && z <= 1.0))
             throw std::invalid_argument("z must be in (0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_tfs_launch(dx.fget(), n,
-                                                       (float)z, (float)t, seed);
-        sync_device("sample tfs kernel");
-        return token;
+        return staged_sample(
+            logits, "sample tfs kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_tfs_launch(dxp, n, (float)z, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("z"), py::arg("t") = 1.0,
        py::arg("seed") = 0);
-
     m.def("sample_tfs_launch", [](py::int_ x, int n, double z,
                                    double t, unsigned long long seed,
                                    std::uintptr_t stream) -> long long {
@@ -1520,26 +1494,17 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_eta", [](FArray logits, double eta, double t,
                            unsigned long long seed) -> long long {
-        // staged: copy logits up, run, read the token back
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (!(eta > 0.0 && eta <= 1.0))
             throw std::invalid_argument("eta must be in (0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_eta_launch(dx.fget(), n,
-                                                      (float)eta,
-                                                      (float)t, seed);
-        sync_device("sample eta kernel");
-        return token;
+        return staged_sample(
+            logits, "sample eta kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_eta_launch(dxp, n, (float)eta, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("eta"), py::arg("t") = 1.0,
        py::arg("seed") = 0);
-
     m.def("sample_eta_launch", [](py::int_ x, int n, double eta,
                                   double t, unsigned long long seed,
                                   std::uintptr_t stream) -> long long {
@@ -1566,26 +1531,17 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_typical", [](FArray logits, double typical, double t,
                                unsigned long long seed) -> long long {
-        // staged: copy logits up, run, read the token back
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (!(typical > 0.0 && typical <= 1.0))
             throw std::invalid_argument("typical must be in (0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_typical_launch(dx.fget(), n,
-                                                          (float)typical,
-                                                          (float)t, seed);
-        sync_device("sample typical kernel");
-        return token;
+        return staged_sample(
+            logits, "sample typical kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_typical_launch(dxp, n, (float)typical, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("typical"), py::arg("t") = 1.0,
        py::arg("seed") = 0);
-
     m.def("sample_typical_launch", [](py::int_ x, int n, double typical,
                                       double t, unsigned long long seed,
                                       std::uintptr_t stream) -> long long {
@@ -1603,21 +1559,15 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_topp", [](FArray logits, double p, double t,
                             unsigned long long seed) -> long long {
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (!(p > 0.0 && p <= 1.0))
             throw std::invalid_argument("p must be in (0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_topp_launch(dx.fget(), n,
-                                                       (float)p, (float)t, seed);
-        sync_device("sample kernel");
-        return token;
+        return staged_sample(
+            logits, "sample topp kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_topp_launch(dxp, n, (float)p, (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("p"), py::arg("t") = 1.0, py::arg("seed") = 0);
 
     // Zero-copy torch path: device pointer in, token out (the one-int
