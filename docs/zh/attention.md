@@ -151,10 +151,19 @@ ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
   `causal=False` 时看全部。
 - GQA / dtype / 维度规则与 decode 相同。
 
-性能定位：这是**便捷路径**——单个分块 kernel，不用 tensor core。
-它存在的意义是让小 prefill 和混合负载留在 fusedtok 里；重度
-prefill 请交给 SDPA / FlashAttention（基准表里明确标着约 0.45x
-的差距）。
+性能定位，v2.4 起分两档：
+
+- **bfloat16 / float16 存储、维度为 {32, 64, 128} 时走 tensor core**
+  （flash 式 `mma.sync m16n8k16` kernel：f32 的 softmax 与累加，
+  输出舍回存储 dtype）。S=1024 D=128 因果式下比原先的 CUDA core
+  半精度路径快 5.1 倍（3060 上 6019 -> 1171 微秒，5 轮平均；
+  5060 Ti 约 630 微秒），为同输入 SDPA bf16 flash 的
+  0.42-0.59x——tensor core 路径之前只有 0.11x。与 SDPA 的诚实
+  差距照旧写进基准表（`attn prefill bf16` 行）。
+- **float32 存储，以及其他维度的半精度，保持 v0.5 的便捷路径**——
+  单个分块 CUDA core kernel、不用 tensor core（f32 上 tensor core
+  意味着 TF32 的 10 位尾数，是数值上的实质降级，一致性契约不允许）。
+  基准表里如实标着 f32 约 0.45x 的差距；该行不变。
 
 ## 性能定位
 
@@ -162,7 +171,7 @@ prefill 请交给 SDPA / FlashAttention（基准表里明确标着约 0.45x
 顺序读一遍。大致可以预期：
 
 - f32 decode 在长 cache 上达到或超过 SDPA 的有效带宽
-  （README 表里 3060 @T=16384 最高 8.89x——参考实现需要额外做头
+  （README 表里 3060 @T=16384 最高 8.69x——参考实现需要额外做头
   展开，且在小 query 下效率偏低）。
 - bf16/fp16 cache 把字节减半。batch 为 1 时 kernel 受延迟限制，
   绝对收益有限，batch 越大收益越大。

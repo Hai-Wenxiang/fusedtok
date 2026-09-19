@@ -527,6 +527,19 @@ def main():
                qp, kkp, vvp, is_causal=True),
            max(10, iters // 8))
 
+    # v2.4: the tensor-core half-precision prefill vs SDPA's bf16
+    # flash kernel on the same inputs (the mma.sync path's headline)
+    qb = qp.to(torch.bfloat16)
+    kb = kp.to(torch.bfloat16)
+    vb = vp.to(torch.bfloat16)
+    kkb = kkp.to(torch.bfloat16)
+    vvb = vvp.to(torch.bfloat16)
+    record("attn prefill bf16", f"S={s}",
+           lambda: fusedtok.attention_prefill(qb, kb, vb, causal=True),
+           lambda: torch.nn.functional.scaled_dot_product_attention(
+               qb, kkb, vvb, is_causal=True),
+           max(10, iters // 8))
+
     # --- kv-cache append (v1.3): the contiguous cache-write side of the
     # decode loop vs the advanced-indexing scatter a hand-written loop
     # would use (index_copy_ cannot express "sequence b writes row

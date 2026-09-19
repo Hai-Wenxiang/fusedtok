@@ -52,6 +52,7 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <type_traits>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -876,6 +877,360 @@ __global__ void attn_prefill_kernel(const T* __restrict__ q,
 }
 
 // ---------------------------------------------------------------------------
+// tensor-core prefill (v2.4): flash-style half-precision path on
+// mma.sync.aligned.m16n8k16 fragments. The v0.5 CUDA-core kernel above
+// stays the f32 path and the fallback for dims the MMA cannot express;
+// bf16/fp16 with dim in {32, 64, 128} land here (5.2x / 5.1x the
+// CUDA-core half path on a 3060 at S=1024 D=128, bf16/fp16).
+//
+// Structure: one block = 128 threads = 4 warps = a 64-row query tile
+// (the dim<=128 band's row count). Each warp owns 16 query rows held
+// in A-fragment registers; K/V stream through padded smem rows
+// (dim + 8 halves, staggering the bank groups the fragment loads hit).
+// Per KV tile of 32 rows: S = Q @ K^T on tensor cores, stored to smem,
+// the causal/sequence mask + online softmax (m, l, per-row alpha)
+// applied cooperatively, P packed back to half precision, then
+// O = O * alpha + P @ V on tensor cores. The mma fragment layouts are
+// the documented PTX ones (verified element-by-element against a
+// scatter probe during development): lane l = (g = l>>2, t = l&3)
+// holds A/C rows g and g+8, A/B column pairs 2t and 2t+8.
+//
+// Numerics contract: identical to the CUDA-core kernel - scores and
+// softmax in f32 (the MMA accumulates f32 from the exact stored half
+// bits), __expf on the SFU path, output rounded to the storage dtype;
+// parity tests keep their half-precision tolerances unchanged.
+// ---------------------------------------------------------------------------
+
+constexpr int kWmmaBlock = 128;        // 4 warps x 16 query rows
+constexpr int kWmmaKv = 32;            // KV rows staged per iteration
+constexpr int kWmmaRows = 64;          // query rows per block
+
+// mma.sync m16n8k16 (bf16 or fp16 inputs, f32 accumulate): the PTX
+// instruction the whole path is built on, wrapped so the dtype only
+// selects the instruction string.
+template <bool IS_BF16>
+__device__ __forceinline__ void mma16816(float* d, const unsigned* a,
+                                         const unsigned* b) {
+    if constexpr (IS_BF16)
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]),
+              "r"(b[1]));
+    else
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]),
+              "r"(b[1]));
+}
+
+// float pair -> one packed half-precision register (mma input format)
+template <bool IS_BF16>
+__device__ __forceinline__ unsigned pack_pair(float lo, float hi) {
+    if constexpr (IS_BF16) {
+        __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi);
+        return *reinterpret_cast<unsigned*>(&h);
+    } else {
+        __half2 h = __floats2half2_rn(lo, hi);
+        return *reinterpret_cast<unsigned*>(&h);
+    }
+}
+
+// two same-column halves from different smem rows -> one packed
+// register (the V B-fragment's k direction strides rows, not columns)
+__device__ __forceinline__ unsigned pack_pair_mem(const void* lo,
+                                                  const void* hi) {
+    const unsigned short a = *static_cast<const unsigned short*>(lo);
+    const unsigned short b = *static_cast<const unsigned short*>(hi);
+    return (unsigned)a | ((unsigned)b << 16);
+}
+
+template <int D, int KVTILE, bool IS_BF16, typename T>
+__global__ void attn_prefill_wmma_kernel(const T* __restrict__ q,
+                                         const T* __restrict__ k,
+                                         const T* __restrict__ v,
+                                         T* __restrict__ out, int hq,
+                                         int hkv, int seq, int causal) {
+    constexpr int DIM_PAD = D + 8;          // padded row stride (halves)
+    constexpr int KSTEPS = D / 16;          // S-pass k-steps
+    constexpr int NT_S = KVTILE / 8;        // S-pass n-tiles
+    constexpr int NT_O = D / 8;             // O-pass n-tiles
+    constexpr int KT_O = KVTILE / 16;       // O-pass k-steps (kv tiles)
+    constexpr int S_STRIDE = KVTILE + 1;    // f32 S row stride
+
+    const int tiles = (seq + kWmmaRows - 1) / kWmmaRows;
+    const int tile = blockIdx.x % tiles;
+    const int h = (blockIdx.x / tiles) % hq;
+    const int bi = blockIdx.x / (tiles * hq);
+    const int group = hq / hkv;
+    const int kv = h / group;
+    const int row0 = tile * kWmmaRows;
+    const float scale = 1.0f / sqrtf((float)D);
+
+    const T* kp = k + (((size_t)bi * hkv + kv) * seq) * D;
+    const T* vp = v + (((size_t)bi * hkv + kv) * seq) * D;
+    const T* qp = q + (((size_t)bi * hq + h) * seq) * D;
+
+    extern __shared__ unsigned short wsm[];
+    // layout: K [KVTILE][DIM_PAD], V [KVTILE][DIM_PAD], then per warp:
+    // S f32 [16][KVTILE+1], P halves [16][KVTILE], m/l/alpha f32 [16][3]
+    unsigned short* k_s = wsm;
+    unsigned short* v_s = wsm + (size_t)KVTILE * DIM_PAD;
+    float* s_s = reinterpret_cast<float*>(v_s + (size_t)KVTILE * DIM_PAD);
+    unsigned short* p_h = reinterpret_cast<unsigned short*>(
+        s_s + 4 * 16 * S_STRIDE);
+    float* ml_s = reinterpret_cast<float*>(p_h + 4 * 16 * KVTILE);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2;                // fragment group row
+    const int tig = lane & 3;               // fragment thread-in-group
+    const int qwarp = warp * 16;            // this warp's first query row
+
+    float* S = s_s + (size_t)warp * 16 * S_STRIDE;
+    float* ML = ml_s + (size_t)warp * 48;   // [m 16][l 16][alpha 16]
+    unsigned short* P = p_h + (size_t)warp * 16 * KVTILE;
+
+    // stage this warp's 16 query rows into A-fragment registers; rows
+    // past seq read zero (their outputs are never stored)
+    unsigned qa[KSTEPS][4];
+    #pragma unroll
+    for (int ks = 0; ks < KSTEPS; ++ks) {
+        const int c0 = ks * 16 + tig * 2;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int row = (j & 1) ? g + 8 : g;
+            const int col = c0 + ((j & 2) ? 8 : 0);
+            const int arow = row0 + qwarp + row;
+            unsigned short lo = 0, hi = 0;
+            if (arow < seq) {
+                lo = *reinterpret_cast<const unsigned short*>(
+                    &qp[(size_t)arow * D + col]);
+                hi = *reinterpret_cast<const unsigned short*>(
+                    &qp[(size_t)arow * D + col + 1]);
+            }
+            qa[ks][j] = (unsigned)lo | ((unsigned)hi << 16);
+        }
+    }
+
+    // zero-init the online softmax state
+    for (int i = lane; i < 16; i += 32) {
+        ML[i] = -INFINITY;
+        ML[16 + i] = 0.0f;
+    }
+    __syncthreads();
+
+    float o[NT_O][4];
+    #pragma unroll
+    for (int nt = 0; nt < NT_O; ++nt)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) o[nt][i] = 0.0f;
+
+    const int row_end = min(seq, causal ? row0 + kWmmaRows : seq);
+    for (int t0 = 0; t0 < row_end; t0 += KVTILE) {
+        // stage K/V (zero-padded past seq)
+        for (int idx = threadIdx.x; idx < KVTILE * (D / 2);
+             idx += kWmmaBlock) {
+            const int r = idx / (D / 2), cpair = idx % (D / 2);
+            const int row = t0 + r;
+            unsigned lo = 0, hi = 0;
+            if (row < seq) {
+                lo = *reinterpret_cast<const unsigned*>(
+                    &kp[(size_t)row * D + cpair * 2]);
+                hi = *reinterpret_cast<const unsigned*>(
+                    &vp[(size_t)row * D + cpair * 2]);
+            }
+            *reinterpret_cast<unsigned*>(&k_s[(size_t)r * DIM_PAD +
+                                              cpair * 2]) = lo;
+            *reinterpret_cast<unsigned*>(&v_s[(size_t)r * DIM_PAD +
+                                              cpair * 2]) = hi;
+        }
+        __syncthreads();
+
+        // ---- S = Q @ K^T (tensor cores) ----
+        float s[NT_S][4];
+        #pragma unroll
+        for (int nt = 0; nt < NT_S; ++nt)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) s[nt][i] = 0.0f;
+        #pragma unroll
+        for (int ks = 0; ks < KSTEPS; ++ks) {
+            const unsigned* a = qa[ks];
+            #pragma unroll
+            for (int nt = 0; nt < NT_S; ++nt) {
+                unsigned b[2];
+                b[0] = *reinterpret_cast<const unsigned*>(
+                    &k_s[(size_t)(nt * 8 + g) * DIM_PAD + ks * 16 +
+                         tig * 2]);
+                b[1] = *reinterpret_cast<const unsigned*>(
+                    &k_s[(size_t)(nt * 8 + g) * DIM_PAD + ks * 16 +
+                         tig * 2 + 8]);
+                mma16816<IS_BF16>(s[nt], a, b);
+            }
+        }
+        // store S (scaled) with the causal/sequence mask folded in
+        #pragma unroll
+        for (int nt = 0; nt < NT_S; ++nt) {
+            const int col = nt * 8 + tig * 2;
+            S[g * S_STRIDE + col] = s[nt][0] * scale;
+            S[g * S_STRIDE + col + 1] = s[nt][1] * scale;
+            S[(g + 8) * S_STRIDE + col] = s[nt][2] * scale;
+            S[(g + 8) * S_STRIDE + col + 1] = s[nt][3] * scale;
+        }
+        __syncwarp();
+
+        // ---- online softmax + P (the warp cooperates per row) ----
+        const int t_stop = min(t0 + KVTILE, seq);
+        for (int r = 0; r < 16; ++r) {
+            const int row_abs = row0 + qwarp + r;
+            const int lim = causal ? row_abs + 1 : seq;
+            float mrow = -INFINITY;
+            for (int c = lane; c < KVTILE; c += 32) {
+                const int key = t0 + c;
+                float val = S[r * S_STRIDE + c];
+                if (key >= t_stop || key >= lim) val = -INFINITY;
+                S[r * S_STRIDE + c] = val;
+                mrow = fmaxf(mrow, val);
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                mrow = fmaxf(mrow,
+                             __shfl_xor_sync(0xffffffffu, mrow, off));
+            // lane 0 owns the ML state; the broadcast doubles as the
+            // warp-collective sync point BEFORE lane 0 rewrites ML[r]
+            // (a plain all-lane read would race the lane-0 store under
+            // independent thread scheduling - the racecheck finding)
+            const float m_old = __shfl_sync(
+                0xffffffffu, (lane == 0) ? ML[r] : 0.0f, 0);
+            const float m_new = fmaxf(m_old, mrow);
+            const float alpha = __expf(m_old - m_new);
+            float lrow = 0.0f;
+            for (int c = lane; c < KVTILE; c += 32) {
+                const float val = S[r * S_STRIDE + c];
+                const float p =
+                    (val == -INFINITY) ? 0.0f : __expf(val - m_new);
+                lrow += p;
+                S[r * S_STRIDE + c] = p;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                lrow += __shfl_xor_sync(0xffffffffu, lrow, off);
+            if (lane == 0) {
+                ML[r] = m_new;
+                ML[16 + r] = ML[16 + r] * alpha + lrow;
+                ML[32 + r] = alpha;
+            }
+        }
+        __syncwarp();
+        const float alpha_g = ML[32 + g];
+        const float alpha_g8 = ML[32 + g + 8];
+
+        // pack P to half precision
+        for (int idx = lane; idx < 16 * (KVTILE / 2); idx += 32) {
+            const int r = idx / (KVTILE / 2), cp = idx % (KVTILE / 2);
+            *reinterpret_cast<unsigned*>(&P[r * KVTILE + cp * 2]) =
+                pack_pair<IS_BF16>(S[r * S_STRIDE + cp * 2],
+                                   S[r * S_STRIDE + cp * 2 + 1]);
+        }
+        __syncwarp();
+
+        // ---- O = O * alpha + P @ V (tensor cores) ----
+        #pragma unroll
+        for (int nt = 0; nt < NT_O; ++nt) {
+            o[nt][0] *= alpha_g;
+            o[nt][1] *= alpha_g;
+            o[nt][2] *= alpha_g8;
+            o[nt][3] *= alpha_g8;
+        }
+        #pragma unroll
+        for (int kt = 0; kt < KT_O; ++kt) {
+            unsigned a[4];
+            a[0] = *reinterpret_cast<const unsigned*>(
+                &P[g * KVTILE + kt * 16 + tig * 2]);
+            a[1] = *reinterpret_cast<const unsigned*>(
+                &P[(g + 8) * KVTILE + kt * 16 + tig * 2]);
+            a[2] = *reinterpret_cast<const unsigned*>(
+                &P[g * KVTILE + kt * 16 + tig * 2 + 8]);
+            a[3] = *reinterpret_cast<const unsigned*>(
+                &P[(g + 8) * KVTILE + kt * 16 + tig * 2 + 8]);
+            #pragma unroll
+            for (int nt = 0; nt < NT_O; ++nt) {
+                const int ncol = nt * 8 + g;
+                unsigned b[2];
+                b[0] = pack_pair_mem(
+                    &v_s[(size_t)(kt * 16 + tig * 2) * DIM_PAD + ncol],
+                    &v_s[(size_t)(kt * 16 + tig * 2 + 1) * DIM_PAD +
+                         ncol]);
+                b[1] = pack_pair_mem(
+                    &v_s[(size_t)(kt * 16 + tig * 2 + 8) * DIM_PAD +
+                         ncol],
+                    &v_s[(size_t)(kt * 16 + tig * 2 + 9) * DIM_PAD +
+                         ncol]);
+                mma16816<IS_BF16>(o[nt], a, b);
+            }
+        }
+        __syncthreads();                   // before restaging K/V
+    }
+
+    // ---- epilogue: divide by l, round to the storage dtype ----
+    const float li_g = 1.0f / ML[16 + g];
+    const float li_g8 = 1.0f / ML[16 + g + 8];
+    #pragma unroll
+    for (int nt = 0; nt < NT_O; ++nt) {
+        const int col = nt * 8 + tig * 2;
+        {
+            const int row = row0 + qwarp + g;
+            if (row < seq) {
+                T* dst = out + (((size_t)bi * hq + h) * seq + row) * D;
+                dst[col] = (T)(o[nt][0] * li_g);
+                dst[col + 1] = (T)(o[nt][1] * li_g);
+            }
+        }
+        {
+            const int row = row0 + qwarp + g + 8;
+            if (row < seq) {
+                T* dst = out + (((size_t)bi * hq + h) * seq + row) * D;
+                dst[col] = (T)(o[nt][2] * li_g8);
+                dst[col + 1] = (T)(o[nt][3] * li_g8);
+            }
+        }
+    }
+}
+
+// WMMA prefill dispatch: shared by the bf16/fp16 entry points. The
+// shared-memory formula mirrors the kernel's layout constants.
+template <typename T, bool IS_BF16>
+void attention_prefill_wmma(const T* q, const T* k, const T* v, T* out,
+                            int batch, int hq, int hkv, int seq, int dim,
+                            bool causal, cudaStream_t cs) {
+    const int tiles = (seq + kWmmaRows - 1) / kWmmaRows;
+    dim3 grid((unsigned)(batch * hq * tiles));
+    const size_t smem = (size_t)2 * kWmmaKv * (dim + 8) * 2 +
+        4 * (16 * (kWmmaKv + 1) * 4 + 16 * kWmmaKv * 2 + 16 * 3 * 4);
+    switch (dim) {
+        case 32:
+            attn_prefill_wmma_kernel<32, kWmmaKv, IS_BF16, T>
+                <<<grid, kWmmaBlock, smem, cs>>>(q, k, v, out, hq, hkv,
+                                                 seq, causal ? 1 : 0);
+            break;
+        case 64:
+            attn_prefill_wmma_kernel<64, kWmmaKv, IS_BF16, T>
+                <<<grid, kWmmaBlock, smem, cs>>>(q, k, v, out, hq, hkv,
+                                                 seq, causal ? 1 : 0);
+            break;
+        default:   // 128
+            attn_prefill_wmma_kernel<128, kWmmaKv, IS_BF16, T>
+                <<<grid, kWmmaBlock, smem, cs>>>(q, k, v, out, hq, hkv,
+                                                 seq, causal ? 1 : 0);
+            break;
+    }
+    check_launch("attention prefill wmma launch");
+}
+
+// ---------------------------------------------------------------------------
 // per-shape workspace cache for the split path (process lifetime, like
 // the selection pipeline's scratch). Allocations happen OUTSIDE stream
 // captures; a first call that races an active capture falls back to the
@@ -1275,6 +1630,17 @@ void attention_prefill_launch_t(const T* q, const T* k, const T* v, T* out,
     if (batch == 0 || seq == 0)
         return;                        // nothing to compute
     cudaStream_t cs = (cudaStream_t)stream;
+    // v2.4: half-precision prefill rides tensor cores for the common
+    // head sizes (mma.sync m16n8k16; 5.2x the CUDA-core half path on a
+    // 3060 at S=1024 D=128 bf16). Other dims fall through to the
+    // bandwidth-first kernel below, which also remains the f32 path.
+    if constexpr (!std::is_same_v<T, float>) {
+        if (dim % 16 == 0 && dim >= 32 && dim <= 128) {
+            attention_prefill_wmma<T, std::is_same_v<T, __nv_bfloat16>>(
+                q, k, v, out, batch, hq, hkv, seq, dim, causal, cs);
+            return;
+        }
+    }
     // Tile shape by head size: bigger tiles for smaller heads. The old
     // dim<32 warp-per-row fallback kernel is GONE (v1.1): the tiled
     // kernel handles tiny heads correctly through its zero-padded

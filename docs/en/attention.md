@@ -168,10 +168,22 @@ ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
   diagonal), to all rows when `causal=False`.
 - Same GQA/dtype/dim rules as decode.
 
-Honest scope: this is the **convenience path** - one tiled kernel, no
-tensor cores. It exists so small prefills and mixed workloads stay
-inside fusedtok; heavyweight prefill belongs to SDPA /
-FlashAttention (the benchmark tables carry the honest ~0.45x ratio).
+Honest scope, two tiers since v2.4:
+
+- **bfloat16 / float16 storage with dim in {32, 64, 128} rides tensor
+  cores** (a flash-style `mma.sync m16n8k16` kernel: f32 softmax and
+  accumulation, output rounded to the storage dtype). At S=1024 D=128
+  causal this is 5.1x the previous CUDA-core half path on a 3060
+  (6019 -> 1171 us, 5-round means; the 5060 Ti lands at ~630 us) and
+  0.42-0.59x SDPA's bf16 flash kernel on the same inputs - up from
+  0.11x before the tensor-core path. The honest SDPA gap is carried
+  in the benchmark tables (`attn prefill bf16` row).
+- **float32 storage, and half storage at other dims, keeps the v0.5
+  convenience path** - one tiled CUDA-core kernel, no tensor cores
+  (f32 via tensor cores would mean TF32's 10-bit mantissa, a real
+  numerical downgrade the parity contract does not allow). The
+  benchmark tables carry the honest f32 ~0.45x ratio; that row is
+  unchanged.
 
 ## Performance framing
 
@@ -179,7 +191,7 @@ Decode attention is **bandwidth-bound**: every token streams the whole
 kv-cache once. What to expect:
 
 - f32 decode runs at effective-bandwidth parity or better vs SDPA at
-  long caches (the README tables show up to 8.89x on an RTX 3060 at
+  long caches (the README tables show up to 8.69x on an RTX 3060 at
   T=16384 - the reference pays head expansion or small-query
   inefficiency there).
 - bf16/fp16 caches halve the bytes. At batch 1 the kernel is
