@@ -42,11 +42,11 @@ rounding.
 - **(honest)** marks rows where fusedtok loses: attention_prefill vs
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
   (0.40-0.58x), flat-distribution sample_topp vs torch's fully
-  parallel sort (0.16-0.26x for the singles; the batched flat rows
+  parallel sort (0.16-0.21x for the singles; the batched flat rows
   fall to 0.05-0.06x - see the batched table), the wide-nucleus
-  sample_minp row (0.33-0.37x - one widening retry plus a 32-64k
+  sample_minp row (0.30-0.34x - one widening retry plus a 32-64k
   sort; the torch boolean-mask composite never sorts) and the
-  sample_nsigma rows (0.08-0.10x - the sigma cutoff keeps the top
+  sample_nsigma rows (0.08x - the sigma cutoff keeps the top
   ~94% of a spiked row, so near-full-vocabulary sampling through the
   widening ladder; nsigma is a long-tail filter whose case rests on output
   quality, not speed). These gaps reflect
@@ -64,8 +64,15 @@ rounding.
 - The **bandwidth column** (GB/s) counts only the bytes the op must
   move (e.g. 2 tensors for softmax, 3 for rmsnorm+residual); the
   **TOPS** figure on INT8 rows is dense-MACs-times-two per second.
+- **Environment note (2.4.0 round)**: the 3060 host measured ~1.6x
+  slower on launch-latency-bound rows than the 2.3.0 round (the torch
+  references slowed identically - sample_topp b=8's ratio moved only
+  1.43x -> 1.47x; bandwidth-bound rows are unaffected). A reboot-class
+  environment reset was not possible mid-session, so this round's
+  3060 absolutes are internally consistent but not comparable to
+  2.3.0's; the ratios are.
 - **argmax** rows are event-timed over a host-synchronized call and
-  swing on WDDM (0.61-1.32x across the 3060's shipped rounds); wall-clock probes with the
+  swing on WDDM (0.90-0.92x across the 3060's shipped rounds); wall-clock probes with the
   sync excluded from the timed loop measure 1.12x (3060) / 0.96x
   (5060 Ti). The row documents both.
 - Composite **sampling references** (sort+mask+multinomial and

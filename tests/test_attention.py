@@ -661,6 +661,55 @@ class TestHalfStorage:
             ref(q.float().cpu().numpy(), k.float().cpu().numpy(),
                 v.float().cpu().numpy(), False), rtol=rtol, atol=atol)
 
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
+    @pytest.mark.parametrize("d", [32, 64, 128])
+    @pytest.mark.parametrize("s", [65, 96, 200])
+    def test_prefill_wmma_dim_matrix(self, dt, rtol, atol, s, d):
+        # v2.4: these shapes ride the tensor-core path (mma.sync
+        # m16n8k16). The dims cover every D instantiation and the seq
+        # values leave a non-multiple-of-64 tail so the zero-padded
+        # staging and the causal/sequence masks are exercised on both
+        # sides of a KV-tile boundary.
+        b, hq, hkv = 2, 4, 2
+        q = torch.randn(b, hq, s, d, device="cuda").to(dt)
+        k = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+        v = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+        group = hq // hkv
+        for causal in (True, False):
+            out = fusedtok.attention_prefill(q, k, v, causal=causal)
+            assert out.dtype is dt
+            for h in range(hq):
+                kvh = h // group
+                scores = (q[0, h].float().cpu().numpy() @
+                          k[0, kvh].float().cpu().numpy().T /
+                          math.sqrt(d)).astype(np.float64)
+                vref = v[0, kvh].float().cpu().numpy().astype(np.float64)
+                for i in (0, 1, s // 2, s - 1):
+                    lim = i + 1 if causal else s
+                    pr = np.exp(scores[i, :lim] - scores[i, :lim].max())
+                    pr /= pr.sum()
+                    want = pr @ vref[:lim]
+                    np.testing.assert_allclose(
+                        out[0, h, i].float().cpu().numpy(), want,
+                        rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
+    def test_prefill_wmma_and_fallback_agree(self, dt, rtol, atol):
+        # dim 36 (not a multiple of 16) rides the CUDA-core path; the
+        # neighboring tensor-core dim 64 must agree with it within the
+        # half-precision tolerance on the same (rounded) inputs
+        s, b, hq, hkv = 70, 1, 4, 2
+        for d in (36, 64):
+            q = torch.randn(b, hq, s, d, device="cuda").to(dt)
+            k = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+            v = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+            out = fusedtok.attention_prefill(q, k, v, causal=True)
+            ref = ref_prefill(q.float().cpu().numpy(),
+                              k.float().cpu().numpy(),
+                              v.float().cpu().numpy(), causal=True)
+            np.testing.assert_allclose(out.float().cpu().numpy(), ref,
+                                       rtol=rtol, atol=atol)
+
     @pytest.mark.parametrize("dt", HALF_DTYPE_OBJECTS)
     def test_split_and_single_paths_match(self, dt):
         # the same shape across the split threshold: both kernel paths
@@ -721,4 +770,4 @@ class TestHalfStorage:
         ref = fusedtok.attention_decode(q, k, v)
         np.testing.assert_allclose(y.float().cpu().numpy(),
                                    ref.float().cpu().numpy(),
-                                   rtol=2e-2, atol=2e-2)
+                                   rtol=2e-2, atol=2e-2)

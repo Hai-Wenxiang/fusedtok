@@ -1,3 +1,45 @@
+## [2.4.0] - 2026-09-19
+
+The roadmap's headline item: tensor-core prefill. No API changes: 55
+public names; 762 tests green on RTX 3060 (Windows, CUDA 13.3) and
+RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Added
+- **Tensor-core prefill for bf16/fp16** - `attention_prefill` on
+  bfloat16 / float16 storage with head dim in {32, 64, 128} now runs
+  a flash-style `mma.sync m16n8k16` kernel: 4 warps own a 64-row
+  query tile through A-fragment registers, K/V stream through padded
+  shared memory, and both the QK^T and PV products run on tensor
+  cores with f32 softmax/accumulation (the output rounds to the
+  storage dtype - the half-precision parity contract is unchanged).
+  S=1024 D=128 causal, 5-round means: RTX 3060 bf16 6019 -> 1171 us
+  (5.1x), fp16 5824 -> 1169 us (5.0x); RTX 5060 Ti bf16 ~630 us.
+  Against SDPA's bf16 flash kernel on the same inputs the ratio moved
+  from 0.11x to 0.42x (5060 Ti) / 0.59x (3060) - the honest gap
+  stays documented in the tables. The
+  benchmark tables gain an `attn prefill bf16` row. float32 storage
+  keeps the CUDA-core path deliberately: tensor cores on f32 mean
+  TF32's 10-bit mantissa, a real numerical downgrade the parity
+  contract does not allow (documented in the topic page).
+
+### Evaluated, not shipped
+- DRY scan parallelization (warp-cooperative suffix matching with a
+  ballot per (L, j) pair): measured 27% SLOWER at the full 64-token
+  window on a 3060. Realistic 131k-vocab histories mismatch on the
+  first element, so the serial comparison's early exit beats the
+  ballot convergence every pair would pay. Reverted; the single-warp
+  scan with its documented worst-case bound stays.
+- The roadmap's "INT8 TMA" line is withdrawn as written: TMA needs
+  Hopper (sm_90+); this library targets sm_80-sm_120, where the
+  realistic INT8 work is scheduling polish, not TMA.
+
+### Changed
+- Both benchmark tables re-measured on the shipping build; all
+  benchmark-derived prose resynced. The 3060 host ran ~1.6x slower on
+  launch-latency-bound rows than the 2.3.0 round (torch references
+  equally; ratios within noise, bandwidth rows unaffected - the
+  honest note lives in the benchmarks page).
+
 ## [2.3.0] - 2026-09-15
 
 A new sampling algorithm: DRY (Don't Repeat Yourself), plus the
