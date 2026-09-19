@@ -1221,7 +1221,7 @@ void attention_prefill_wmma(const T* q, const T* k, const T* v, T* out,
                 <<<grid, kWmmaBlock, smem, cs>>>(q, k, v, out, hq, hkv,
                                                  seq, causal ? 1 : 0);
             break;
-        default:   // 128
+        case 128:
             attn_prefill_wmma_kernel<128, kWmmaKv, IS_BF16, T>
                 <<<grid, kWmmaBlock, smem, cs>>>(q, k, v, out, hq, hkv,
                                                  seq, causal ? 1 : 0);
@@ -1635,7 +1635,11 @@ void attention_prefill_launch_t(const T* q, const T* k, const T* v, T* out,
     // 3060 at S=1024 D=128 bf16). Other dims fall through to the
     // bandwidth-first kernel below, which also remains the f32 path.
     if constexpr (!std::is_same_v<T, float>) {
-        if (dim % 16 == 0 && dim >= 32 && dim <= 128) {
+        // the exact instantiated set - NOT dim % 16 == 0: the helper's
+        // switch maps anything else to the D=128 template with runtime
+        // row widths it cannot honor (2.4.1 fix; dims 48/80/96/112
+        // previously reached it and read/wrote out of bounds)
+        if (dim == 32 || dim == 64 || dim == 128) {
             attention_prefill_wmma<T, std::is_same_v<T, __nv_bfloat16>>(
                 q, k, v, out, batch, hq, hkv, seq, dim, causal, cs);
             return;

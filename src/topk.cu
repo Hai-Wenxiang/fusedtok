@@ -3338,6 +3338,19 @@ int* dry_pairs(size_t rows) {
 
 constexpr size_t kDryPairStride = 1 + 2 * (size_t)kDryMaxScan;
 
+// minimal RAII device buffer for the per-call history uploads (the
+// bindings-side DevBuf is not visible from this TU)
+struct DryDevBuf {
+    void* p = nullptr;
+    explicit DryDevBuf(size_t bytes) {
+        if (bytes && cudaMalloc(&p, bytes) != cudaSuccess)
+            throw std::runtime_error("dry history buffer alloc failed");
+    }
+    ~DryDevBuf() { if (p) cudaFree(p); }
+    DryDevBuf(const DryDevBuf&) = delete;
+    DryDevBuf& operator=(const DryDevBuf&) = delete;
+};
+
 // Shared table builder (one thread): mirrors dry_penalize_copy's scan.
 __device__ void dry_build_pairs(const long long* __restrict__ hist,
                                 long long m, int allowed_length,
@@ -5316,8 +5329,10 @@ std::vector<long long> sample_xtc_batched_launch(
 // bit-identical to the single-row op on that row (same scan, same
 // factor chain).
 std::vector<long long> sample_dry_batched_launch(
-    const float* x, int rows, int n, const long long* ids,
-    const int* offs, int allowed_length, float multiplier, float t,
+    const float* x, int rows, int n,
+    const std::vector<long long>& ids,
+    const std::vector<long long>& offs, int allowed_length,
+    float multiplier, float t,
     const std::vector<unsigned long long>& seeds, std::uintptr_t stream) {
     if (rows < 0)
         throw std::invalid_argument("rows must be >= 0");
@@ -5335,18 +5350,54 @@ std::vector<long long> sample_dry_batched_launch(
     if ((int)seeds.size() != rows)
         throw std::invalid_argument("seeds must have one entry per row");
     cudaStream_t cs = (cudaStream_t)stream;
-    float* y = dry_scratch((size_t)rows * n);
-    int* pairs = dry_pairs(rows);
-    dry_scan_b_kernel<<<rows, 32, 0, cs>>>(ids, offs, allowed_length,
-                                            pairs);
-    const long long total = (long long)rows * n;
-    const int grid = (int)std::min<long long>(
-        grid_for(total), 4 * (long long)kMaxGrid);
-    dry_apply_b_kernel<<<grid, kBlock, 0, cs>>>(x, y, pairs, total, n,
-                                                 multiplier);
-    check_launch("dry batched rewrite launch");
-    return sample_minp_batched_launch(y, rows, n, 1e-9f, t, seeds,
-                                       stream);
+    // the histories ride one stream-ordered upload on the CALLER's
+    // stream (2.4.1 fix: the binding used to upload via the legacy
+    // default stream, which does not order against torch's
+    // non-blocking streams - the scan could read garbage offsets)
+    DryDevBuf di(ids.size() * 8);
+    if (!ids.empty())
+        if (cudaMemcpyAsync(di.p, ids.data(), ids.size() * 8,
+                            cudaMemcpyHostToDevice, cs) != cudaSuccess)
+            throw std::runtime_error("dry history upload failed");
+    std::vector<int> offs32(offs.begin(), offs.end());
+    DryDevBuf doff(offs32.size() * 4);
+    if (!offs32.empty())
+        if (cudaMemcpyAsync(doff.p, offs32.data(),
+                            offs32.size() * 4, cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("dry offsets upload failed");
+    const long long* d_ids =
+        reinterpret_cast<const long long*>(di.p);
+    const int* d_offs = reinterpret_cast<const int*>(doff.p);
+    // rows are processed in kBMaxBatch chunks so the persistent
+    // dry_scratch/dry_pairs buffers stay bounded by 32 rows (2.4.1:
+    // a whole-batch scratch retained ~600 MB at 1000 rows x 152k
+    // vocab; the family's documented workspace bound is chunk-level)
+    std::vector<long long> out((size_t)rows);
+    for (int c = 0; c < rows; c += kBMaxBatch) {
+        const int b = std::min(kBMaxBatch, rows - c);
+        float* y = dry_scratch((size_t)b * n);
+        int* pairs = dry_pairs(b);
+        // GLOBAL ids base with the chunk's GLOBAL offset window: the
+        // kernel derives each row's slice as ids + offs[row], so no
+        // extra base shift here (double-offsetting would read the
+        // wrong histories)
+        dry_scan_b_kernel<<<b, 32, 0, cs>>>(d_ids, d_offs + c,
+                                            allowed_length, pairs);
+        const long long total = (long long)b * n;
+        const int grid = (int)std::min<long long>(
+            grid_for(total), 4 * (long long)kMaxGrid);
+        dry_apply_b_kernel<<<grid, kBlock, 0, cs>>>(
+            x + (size_t)c * n, y, pairs, total, n, multiplier);
+        check_launch("dry batched rewrite launch");
+        auto chunk = sample_minp_batched_launch(
+            y, b, n, 1e-9f, t,
+            std::vector<unsigned long long>(
+                seeds.begin() + c, seeds.begin() + c + b),
+            stream);
+        std::copy(chunk.begin(), chunk.end(), out.begin() + c);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

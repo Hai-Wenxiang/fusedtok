@@ -125,8 +125,8 @@ fusedtok.kv_append(k_cache, v_cache, k_new, v_new, lens)
 - 一个微型 kernel、流序、可 CUDA graph 捕获。
 - 主机侧来源的 `lens` 取值在 `[0, T)` 内校验；设备上的张量直接信任
   （标准零拷贝信任边界）。
-- 性能（基准表）：3060 上 13.7 µs vs torch 高级索引 46.6 µs
-  （3.40x）、5060 Ti 上 9.3 µs vs 21.2 µs（2.28x）——算子本身很小、
+- 性能（基准表）：3060 上 15.5 µs vs torch 高级索引 55.8 µs
+  （3.59x）、5060 Ti 上 9.2 µs vs 21.1 µs（2.28x）——算子本身很小、
   受启动开销限制，倍数随参考侧高级索引自身的 WDDM 波动，量的
   是每步解码的固定成本。
 
@@ -158,7 +158,7 @@ ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
   输出舍回存储 dtype）。S=1024 D=128 因果式下比原先的 CUDA core
   半精度路径快 5.1 倍（3060 上 6019 -> 1171 微秒，5 轮平均；
   5060 Ti 约 630 微秒），为同输入 SDPA bf16 flash 的
-  0.42-0.59x——tensor core 路径之前只有 0.11x。与 SDPA 的诚实
+  0.41-0.58x——tensor core 路径之前只有 0.11x。与 SDPA 的诚实
   差距照旧写进基准表（`attn prefill bf16` 行）。
 - **float32 存储，以及其他维度的半精度，保持 v0.5 的便捷路径**——
   单个分块 CUDA core kernel、不用 tensor core（f32 上 tensor core
@@ -171,11 +171,12 @@ ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
 顺序读一遍。大致可以预期：
 
 - f32 decode 在长 cache 上达到或超过 SDPA 的有效带宽
-  （README 表里 3060 @T=16384 最高 8.69x——参考实现需要额外做头
+  （README 表里 3060 @T=16384 最高 8.86x——参考实现需要额外做头
   展开，且在小 query 下效率偏低）。
 - bf16/fp16 cache 把字节减半。batch 为 1 时 kernel 受延迟限制，
   绝对收益有限，batch 越大收益越大。
-- 分页间接寻址比连续版多付约 1.09-1.12 倍。
-- prefill 刻意不与 flash 后端竞争。
+- 分页间接寻址比连续版多付约 1.09-1.15 倍（本轮 3060 为 1.15、5060 Ti 为 1.09）。
+- f32 prefill 刻意不上 tensor core（因而不与 flash 后端竞争）；半精度路径
+自 v2.4 起达到 SDPA bf16 flash 的 0.41-0.58x。
 
 测试协议与复现方法见[基准测试](benchmarks.md)。

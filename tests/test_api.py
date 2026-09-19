@@ -137,3 +137,21 @@ def test_error_contract_value_errors(op):
             fn(logits.reshape(1, 16), [[0]], 0.0)   # penalty must be > 0
         else:
             fn(logits, 0.0)                    # temperature must be > 0
+
+
+def test_stub_all_matches_runtime():
+    import re
+    """The .pyi __all__ must mirror the runtime __all__ exactly - the
+    2.4.1 audit found the stub two names behind (sample_dry pair
+    shipped in 2.3.0) because this file only grepped for defs."""
+    import fusedtok
+    import fusedtok.__init__ as _impl  # noqa: F401  (path setup)
+    import importlib.util
+    import pathlib
+    stub = pathlib.Path(__file__).resolve().parent.parent /         "python" / "fusedtok" / "__init__.pyi"
+    text = stub.read_text(encoding="utf-8")
+    m = re.search(r"__all__ = \[(.*?)\]", text, re.S)
+    assert m, "stub __all__ not found"
+    names = re.findall(r'"([a-zA-Z_0-9]+)"', m.group(1))
+    assert names == list(fusedtok.__all__), (
+        set(names) ^ set(fusedtok.__all__))

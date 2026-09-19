@@ -694,6 +694,25 @@ class TestHalfStorage:
                         rtol=rtol, atol=atol)
 
     @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
+    @pytest.mark.parametrize("d", [48, 80, 96, 112])
+    def test_prefill_non_instantiated_wmma_dims(self, dt, rtol, atol, d):
+        # 2.4.1 regression pin: dims that are multiples of 16 in
+        # [32, 128] but NOT in {32, 64, 128} must fall back to the
+        # CUDA-core kernel - the 2.4.0 gate let them reach the wmma
+        # switch's default arm, which instantiated the D=128 template
+        # over narrower rows (out-of-bounds reads AND writes)
+        b, hq, hkv, s = 1, 4, 2, 70
+        q = torch.randn(b, hq, s, d, device="cuda").to(dt)
+        k = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+        v = torch.randn(b, hkv, s, d, device="cuda").to(dt)
+        out = fusedtok.attention_prefill(q, k, v, causal=True)
+        ref = ref_prefill(q.float().cpu().numpy(),
+                          k.float().cpu().numpy(),
+                          v.float().cpu().numpy(), causal=True)
+        np.testing.assert_allclose(out.float().cpu().numpy(), ref,
+                                   rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dt,rtol,atol", HALF_DTYPES)
     def test_prefill_wmma_and_fallback_agree(self, dt, rtol, atol):
         # dim 36 (not a multiple of 16) rides the CUDA-core path; the
         # neighboring tensor-core dim 64 must agree with it within the

@@ -70,6 +70,13 @@ v_cache = torch.randn(1, 8, 16384, 128, device="cuda")
 lens = torch.tensor([16384], dtype=torch.int32, device="cuda")
 out = fusedtok.attention_decode(q, k_cache, v_cache, lens)
 
+# whole-sequence prefill in one call; since v2.4 the bf16/fp16 path
+# rides tensor cores (dims 32/64/128) - 5.1x the CUDA-core half path
+q_all = torch.randn(1, 32, 1024, 128, device="cuda").to(torch.bfloat16)
+k_all = torch.randn(1, 8, 1024, 128, device="cuda").to(torch.bfloat16)
+v_all = torch.randn(1, 8, 1024, 128, device="cuda").to(torch.bfloat16)
+ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
+
 # the whole decode-step sampling chain in one call, one readback
 logits = torch.randn(131072, device="cuda")
 token = fusedtok.decode_step(logits, [], penalty=1.1,

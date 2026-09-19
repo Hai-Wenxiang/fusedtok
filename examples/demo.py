@@ -446,13 +446,15 @@ def main():
 
     print(SEP)
     print("attention prefill: fresh-sequence causal attention (S query rows)")
-    q = rng.standard_normal((1, 8, 12, 16)).astype(np.float32)
-    k = rng.standard_normal((1, 2, 12, 16)).astype(np.float32)
-    v = rng.standard_normal((1, 2, 12, 16)).astype(np.float32)
-    ref = np.zeros((1, 8, 12, 16), dtype=np.float64)
+    # D=32 keeps the bf16 check below on the tensor-core path (the
+    # v2.4 kernel's instantiated dim set is {32, 64, 128})
+    q = rng.standard_normal((1, 8, 12, 32)).astype(np.float32)
+    k = rng.standard_normal((1, 2, 12, 32)).astype(np.float32)
+    v = rng.standard_normal((1, 2, 12, 32)).astype(np.float32)
+    ref = np.zeros((1, 8, 12, 32), dtype=np.float64)
     for h in range(8):
         kvh = h // 4
-        scores = q[0, h].astype(np.float64) @ k[0, kvh].astype(np.float64).T / 4.0
+        scores = q[0, h].astype(np.float64) @ k[0, kvh].astype(np.float64).T / np.sqrt(32.0)
         for i in range(12):
             p = np.exp(scores[i, :i + 1] - scores[i, :i + 1].max())
             ref[0, h, i] = (p / p.sum()) @ v[0, kvh, :i + 1].astype(np.float64)
@@ -474,7 +476,7 @@ def main():
         ref_bi = np.zeros_like(ref)
         for h in range(8):
             kvh = h // 4
-            scores = q[0, h].astype(np.float64) @ k[0, kvh].astype(np.float64).T / 4.0
+            scores = q[0, h].astype(np.float64) @ \n                k[0, kvh].astype(np.float64).T / np.sqrt(32.0)
             p = np.exp(scores - scores.max(axis=-1, keepdims=True))
             p /= p.sum(axis=-1, keepdims=True)
             ref_bi[0, h] = p @ v[0, kvh].astype(np.float64)
