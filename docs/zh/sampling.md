@@ -2,8 +2,8 @@
 
 选择类算子（top-k、top-p、argmax）和融合采样器（`sample_topp`、
 `sample_topk`、`sample_minp`、`sample_topa`、`sample_nsigma`、
-`sample_eta`、`sample_typical`、
-`decode_step`，以及各自的 `_batched` 批量变体）共用一条管线和一份确定性契约，`logit_penalties` 则把 HF
+`sample_tfs`、`sample_eta`、`sample_typical`、`sample_xtc`、
+`sample_dry`、`decode_step`，以及各自的 `_batched` 批量变体）共用一条管线和一份确定性契约，`logit_penalties` 则把 HF
 的三件惩罚合并成一次调用。这一页把两者讲清，包括
 CPU 与 GPU 抽签可能不一致的精确边界。
 
@@ -464,7 +464,7 @@ tokens = fusedtok.decode_step_batched(
   logits 比逐行循环 `decode_step` 快 5.2 倍（3060：1676 ->
   321 µs；5060 Ti：646 -> 145 µs），与 torch 原生"惩罚 +
   softmax + 批量 multinomial"组合慢约两成（3060 墙钟探针；5060 Ti
-  表中为 147 vs 100 µs）；中尾 logits 快
+  表中为 146 vs 99 µs）；中尾 logits 快
   3.1 倍（3060：17.3 -> 5.5 ms）。
 
 ## 同 token 保证

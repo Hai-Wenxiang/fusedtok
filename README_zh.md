@@ -35,7 +35,7 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 | ✅ | top-k / top-p（核采样） | 到达票据 radix 轮加早退压缩，缓存 CUDA graph、整管线回放。并列时取最靠前下标。131k 词表 k=50 在两张卡上从持平到领先，且全 k 范围如此。 |
 | ✅ | argmax / temperature | 贪心解码辅助 |
 | ✅ | sample_topp | 融合 top-p（nucleus）采样：softmax -> 截取 top-p 集合 -> 按种子抽签，用全局质量做阈值 |
-| ✅ | sample_topk | 融合 top-k 采样：softmax -> 保留 k 个 -> 在幸存者内重新归一化 -> 按种子抽签（131k 上 1.9-2.1x vs topk+multinomial 组合式） |
+| ✅ | sample_topk | 融合 top-k 采样：softmax -> 保留 k 个 -> 在幸存者内重新归一化 -> 按种子抽签（131k 上 2.7x / 2.0x vs topk+multinomial 组合式） |
 | ✅ | sample_minp | 融合 min-p 采样（v1.3）：保留所有 p >= min_p × p_max 的 token -> 重新归一化 -> 按种子抽签——值阈值截断，无需全局质量归约，核宽度天然自适应 |
 | ✅ | sample_eta / sample_eta_batched | 融合 eta 截断采样（v1.6，Hewitt 2022）：保留所有 p >= eta × min(1, exp(-H)) 的 token——阈值由分布自身的熵推导而来，核宽度天然自适应 |
 | ✅ | sample_typical / sample_typical_batched | 融合局部典型采样（v1.6，Meister 2022）：按"意外度与熵的接近程度"排序，保留质量达到 `typical` 的最小集合——值排序窗口上的一条连续带 |
@@ -58,7 +58,7 @@ eager 模式下每个中间结果都要在显存里来回读写。`fusedtok` 把
 | ✅ | kv_append | 连续解码循环的 cache 写入侧（v1.3）：每序列一个新 token 的 k/v 行原地 scatter 到 cache 第 `lens[b]` 行（一个微型 kernel，f32/bf16/fp16） |
 | ✅ | attention_decode_paged | 1.2 主打特性：同样的解码注意力跑在 **vLLM 式块池 kv-cache** `[Nb, Hkv, P, D]` 上，经每序列块表间接寻址——cache 内存零碎片；任意合法表均可，f32/bf16/fp16 存储，约为连续版 1.09-1.15x 开销（相对预展开头参考为 SDPA 的 8.46x / 4.28x） |
 | ✅ | kv_append_paged | 分页循环的 cache 写入侧：每序列一个新 token 的 k/v 行原地 scatter 到池中 `lens[b]` 位置（一个微型 kernel，f32/bf16/fp16） |
-| ✅ | attention_prefill | 新序列 S 行注意力（因果 / 双向），f32/bf16/fp16 存储；v2.4 起半精度路径走 tensor core（mma.sync flash kernel，维度 32/64/128）——较原半精度路径快 5.1 倍，为 SDPA bf16 flash 的 0.42-0.59x（此前仅 0.11x）；f32 保持便捷路径（约为 SDPA 的 0.45x） |
+| ✅ | attention_prefill | 新序列 S 行注意力（因果 / 双向），f32/bf16/fp16 存储；v2.4 起半精度路径走 tensor core（mma.sync flash kernel，维度 32/64/128）——较原半精度路径快 5.1 倍，为 SDPA bf16 flash 的 0.41-0.58x（此前仅 0.11x）；f32 保持便捷路径（约为 SDPA 的 0.45x） |
 | ✅ | axpy | `a*x + b` —— v0.x 的入门演示算子，为 API 兼容保留 |
 
 ## 安装
@@ -355,7 +355,7 @@ attention_decode_paged（v1.2）为免碎片的 vLLM 式块池布局只付约
 attention_prefill 的 f32 路径是定位便捷的 kernel，性能约为 SDPA
 flash 后端的 0.45x（设计上不用 tensor core——TF32 的 10 位尾数是一致性
 契约不允许的数值降级）；v2.4 起 bf16/fp16 路径走 tensor core，达到
-SDPA bf16 flash 的 0.42-0.59x（见下方表格行）。
+SDPA bf16 flash 的 0.41-0.58x（见下方表格行）。
 kv_append（v1.3）单次启动把一个新 token 的 k/v 行写入连续 cache
 （比手写高级索引快数倍，具体倍数随参考侧高级索引的耗时波动；算子
 本身很小、受启动开销限制——量的是每步解码的固定成本）。
@@ -363,7 +363,7 @@ INT8 解码 GEMV 只搬运 fp16 投影一半的字节并跑满内存带宽（2 �
 流水线化 IMMA GEMM（v1.0 重写：cp.async 双缓冲 slab、运行时 tile 调优
 64x64 / 128x128）在 3060 上约 31-39 TOPS（受宿主持续负载状态影响，见基准页注记）、5060 Ti 上约 67 TOPS —— 是
 v0.4 kernel 的 2-4 倍 —— 但 cuBLASLt（torch._int_mm）在逐张量行上仍保持
-约 1.7-2.7 倍领先（W8A8 行的差距只有约 1.6-1.8 倍）：它的 tile 流水线更深、
+约 2.1-2.7 倍领先（W8A8 行的差距只有约 1.6-1.8 倍）：它的 tile 流水线更深、
 epilogue 按架构精调。目前 qgemm 的定位是
 精确 / 可图捕获 / 零拷贝的 INT8 路径，而非最快的路径 —— 数字不掺水，
 CUTLASS 级调度留作后续工作。逐通道变体（qgemm_perchannel，真实 INT8
@@ -409,7 +409,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - v0.5（已发布）：attention —— GQA 解码注意力（连续 kv-cache、长 cache 自动 flash-decoding 切分、每序列长度）+ 分块 prefill 路径（性能约为 SDPA flash 的 0.45x，定位便捷路径）；每 GPU 单图 benchmark；Windows wheel 进入 PyPI 发布管线
 - 1.0（已发布）：流水线化 tensor-core INT8 GEMM（cp.async 双缓冲、运行时 tile 调优；3060 上 17 -> 39 TOPS）与逐通道权重 scale（W8A8）、融合 top-k 采样（vs topk+multinomial 组合式 2.1x）、top-k 中段 k 补平、文本卫生门禁、wheel 矩阵扩容（Linux cp310-313 / Windows cp311-313）、API 冻结
 - 1.1（已发布）：半精度 attention —— `attention_decode` / `attention_prefill` 接受 bfloat16 与 float16 cache（float32 计算，解码路径字节减半）；并行 exp 预计算使平坦分布采样最坏情况耗时减半且 token 逐位不变
-- 1.2（已发布）：分页 kv-cache attention —— `attention_decode_paged` 跑在 vLLM 式块池 `[Nb, Hkv, P, D]` + 每序列块表上（连续版约 1.09-1.12x 开销，任意合法表均可）与 `kv_append_paged`（原地 cache 写入侧）；平坦分布采样最坏情况压到约 1/8.5（自适应扩窗跳变 + 全词表快路径 + 批量取数串行遍历，token 逐位不变）；argmax 减负（每次调用少一次提交少一次分配）
+- 1.2（已发布）：分页 kv-cache attention —— `attention_decode_paged` 跑在 vLLM 式块池 `[Nb, Hkv, P, D]` + 每序列块表上（连续版约 1.09-1.15x 开销，任意合法表均可）与 `kv_append_paged`（原地 cache 写入侧）；平坦分布采样最坏情况压到约 1/8.5（自适应扩窗跳变 + 全词表快路径 + 批量取数串行遍历，token 逐位不变）；argmax 减负（每次调用少一次提交少一次分配）
 - 1.2.1（已发布）：审计驱动的加固 —— 修复选择管线 workspace 在超过 131072 词表（Qwen 级）时的越界；lens/块表/token id 改为主机侧校验 + 设备张量信任边界（带 `lens` 的 CUDA graph 捕获从此可用）；零拷贝路径补齐空输入与 dtype/连续性防护；基准带宽数字修正（四行此前虚高 1.5 倍）；编译零警告（MSVC /W3 + GCC -Wall -Wextra）；文档重组为主题页并全面重写中文表述
 - 1.3（已发布）：`sample_minp`（min-p 采样——相对 p_max 的值阈值核，无需全局质量归约，核宽度天然自适应）与 `kv_append`（连续 cache 的写入侧）；采样串行遍历获得检查点二分（walk 1 记录前缀和、walk 2 二分续走——平坦最坏再压到约 1/1.6，token 逐位不变）；零拷贝助手拒绝 CPU 操作数（主机侧 CPU 指针进 kernel 会破坏 CUDA 上下文）
 - 1.3.1（已发布）：审计驱动加固 —— 补齐 staged 路径的 lens/块表值校验（此前坏值会变成静默 GPU 越界写）与整数输入防护；修复两个潜伏的采样遍历 bug（stride≥2 检查点续走重复计数、自适应扩窗时质量读错 workspace 槽位——中尾分布提速约 28% 且 token 逐位不变）；softmax 调优器封顶修复 sanitizer 门禁；kernel/启动代码清理合一；基准表全量重生成（新增 minp 峰值与 kv_append 行）与文档大修（陈旧数字、中文呆板残留、词汇表补条）
@@ -424,16 +424,17 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - 1.8（已发布）：两条新截断规则加批量贪心——`sample_topa`（top-a：保留所有 `p_i >= top_a × p_max²` 的 token，min-p 的前缀机制，截断值直接从既有总量推出——exp 单位下就是 `top_a / total`，扩窗下界复用 min-p 的充分公式；`top_a = 1.0` 在两个最大值并列的分布下会同时保留两者）、`sample_nsigma`（保留所有缩放后 logit 不低于 `均值 − nsigma × 标准差` 的 token——整行前两阶矩一次新 pass 算出，逐 block 升 double 后原子累加，方差那一步"大数相减"不会再放大原子累加的到达顺序误差）、`argmax_batched`（整批 `[行数, 词表]` 贪心一次 launch，无读回、可 CUDA graph 捕获）；熵系采样器的质量 pass 融合为单 kernel（eta/typical/nsigma 每次尝试的全词表 pass 从三次降为两次，token 逐位不变）（公开名称 44 -> 49）
 - 1.8.1（已发布）：审计驱动加固——`argmax_batched` 绑定层改为精确校验 `[行数, 词表]` 形状（此前只要缓冲区大小够就会被静默重切）、CUDA graph 预热注意事项在三层文档写明、三处依赖种子的逐位断言放宽为文档记载的相邻排名契约；外加双语文档大修（数字全部对齐已发布 JSON、中文按自然语序重写、1.8 算子进入快速上手与 demo）
 - 1.8.2（已发布）：文档准确性 + 门禁轮——修复 1.8.1 损坏的表格 speedup 单元格，并在 CI 新增 markdown 卫生门禁（每行基准数据须与所属 GPU 的已发布 JSON 逐格一致、拒绝损坏加粗、行覆盖率下限），剩余批量 CPU 参考改为先校验 rows 再校验 seeds，双语数字清扫补齐所有错过 1.8.1 重测的页面
-- 2.0（已发布）：**要求 Python >= 3.11**（3.10 已 EOL，从构建和发布矩阵中移除——正是触发大版本号步进的正式破坏性变更）；INT8 GEMM 更大 tile 和 tensor-core prefill 经过评估后推迟至 2.1 路线图（共享内存上限的算术推导见 CHANGELOG）
+- 2.0（已发布）：**要求 Python >= 3.11**（3.10 已 EOL，从构建和发布矩阵中移除——正是触发大版本号步进的正式破坏性变更）；INT8 GEMM 更大 tile 和 tensor-core prefill 经过评估后推迟（prefill 最终于 2.4 落地；共享内存上限的算术推导见 CHANGELOG）
 - 2.0.1（已发布）：文档准确性 + 表格重测——25 项双语审计修复过期散文数字、cp310-cp313 安装声明、kv_append 矛盾数值和滞后一版的"如实"损失区间
 - 2.0.2（已发布）：文档准确性轮——18 处过期散文数字对齐已发布的 2.0.1 表格（int8 TOPS、小形状 Blackwell、采样器散文、kv_append、attention 头条、分页间接开销、"如实"损失区间），补入缺失的 2.0.1 路线图行，demo.py 格式清理
 - 2.1（已发布）：`sample_tfs`——尾部自由采样（Filazzola & Trottet 2023）：保留排序 CDF 二阶导数（归一化）≥ 1-z 的前缀——数据依赖的平坦尾部截断。诚实的 x8 扩窗阶梯。单行 + 批量（公开名称 49 -> 51）
 - 2.2（已发布）：`sample_xtc`——Exclude Top Choices 创意采样：以概率 p 把概率最高的前 top_n 个 token 移出采样池再抽——打破大模型千篇一律的"模板"输出，且保证至少保留一个候选。单行 + 批量（公开名称 51 -> 53）
 - 2.2.1（已发布）：修复 + 批量 kernel 轮——补上批量 XTC 缺失的 staged 绑定与批量 TFS 损坏的 staged 绑定、XTC 全词表窗口修复（2.2.0 的 GPU 采样会截掉尾部）、惩罚位图越界守卫，TFS/XTC 批量改走共享分块管线（b=128 最高 11.1x）；基准表重测；双语文档自然度轮
 - 2.3（已发布）：`sample_dry`——DRY（Don't Repeat Yourself）采样：序列级重复惩罚——惩罚的是"会延续重复序列的 token"（64 token 扫描窗口、逐 token 取最大指数、multiplier ** 指数做除法），随后一次全词表 softmax 抽签。单行 + 不等长历史批量（公开名称 53 -> 55）；绑定层/CPU 参考去重轮从结构上关闭了复制粘贴缺陷类
-- 2.4（已发布）：bf16/fp16 的 tensor-core prefill（mma.sync m16n8k16，维度 32/64/128）——3060 上 S=1024 D=128 较 CUDA core 半精度路径快 5.1 倍、与 SDPA flash 掰手腕；f32 保持文档记载的数值路径；基准表新增 bf16 prefill 行
+- 2.4（已发布）：bf16/fp16 的 tensor-core prefill（mma.sync m16n8k16，维度 32/64/128）——3060 上 S=1024 D=128 较 CUDA core 半精度路径快 5.1 倍、为 SDPA flash 的 0.42-0.59x；f32 保持文档记载的数值路径；基准表新增 bf16 prefill 行
 - 2.4.1（已发布）：审计驱动修复——tensor-core prefill 的维度门收紧到实际实例化集合（48/80/96/112 此前会越界启动 D=128 模板）、DRY 批量历史上传统一到调用方流、改写 scratch 按文档约定分块；文档准确性轮（32 项）；staged 单行绑定去重
 - 2.4.2（已发布）：可维护性轮——所有批量采样器（含 xtc/dry）统一走共享 dispatcher，__all__ 成对整理，审计遗留代码打磨；文档打磨
+- 2.4.3（已发布）：第三轮审计——修复 dry 批量 torch-CPU 回归并钉死、demo.py 进 CI 编译门禁、散文重同步（17 项）
 - 后续候选（未排期）：CUTLASS 级 INT8 GEMM 调度（当前 qgemm 定位是精确/可图捕获/零拷贝路径，而非最快路径；TMA 本身是 Hopper 专属，sm_80-sm_120 上无从谈起）；16-bit radix key（动确定性契约）
 ## 社区
 

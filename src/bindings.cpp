@@ -212,14 +212,6 @@ void check_batch_ids(const I64Array& ids, const I64Array& offs, int rows,
                 std::string(what) + " entries must be in [0, vocab)");
 }
 
-// Shared body of the staged batched-sampler bindings (2.3 dedup): the
-// checks every sampler performs, the device upload, the launch (via
-// the lambda), the sync and the wrap. Sampler-specific parameter
-// validation stays at the call site, above the helper call, so error
-// messages keep naming the right argument. Before this helper each
-// body was a near-verbatim copy - the exact class of copy-paste that
-// produced the two 2.2.1 binding defects (one copy missing, one copy
-// drifted to the CPU reference).
 // Shared body of the staged single-row sampler bindings (2.4.1 dedup,
 // the single-row twin of staged_batched_sample): the 1-D/size checks,
 // the device upload, the launch (via the lambda), the sync and the
@@ -239,6 +231,15 @@ long long staged_sample(FArray& logits, const char* what,
     sync_device(what);
     return token;
 }
+
+// Shared body of the staged batched-sampler bindings (2.3 dedup): the
+// checks every sampler performs, the device upload, the launch (via
+// the lambda), the sync and the wrap. Sampler-specific parameter
+// validation stays at the call site, above the helper call, so error
+// messages keep naming the right argument. Before this helper each
+// body was a near-verbatim copy - the exact class of copy-paste that
+// produced the two 2.2.1 binding defects (one copy missing, one copy
+// drifted to the CPU reference).
 
 template <typename Launch>
 py::array_t<long long> staged_batched_sample(
@@ -1838,10 +1839,7 @@ PYBIND11_MODULE(_fusedtok, m) {
           [](py::int_ x, int rows, int n, double z, double t,
              const I64Array& seeds,
              std::uintptr_t stream) -> py::array_t<long long> {
-        if (rows < 0)
-            throw std::invalid_argument("rows must be >= 0");
-        if (n <= 0)
-            throw std::invalid_argument("sample of empty logits");
+        check_batch_rows_n(rows, n);
         if (!(z > 0.0 && z <= 1.0))
             throw std::invalid_argument("z must be in (0, 1]");
         check_batch_temp(t);

@@ -42,11 +42,11 @@ rounding.
 - **(honest)** marks rows where fusedtok loses: attention_prefill vs
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
   (0.37-0.61x), flat-distribution sample_topp vs torch's fully
-  parallel sort (0.16-0.21x for the singles; the batched flat rows
+  parallel sort (0.16-0.22x for the singles; the batched flat rows
   fall to 0.05x - see the batched table), the wide-nucleus
-  sample_minp row (0.30-0.34x - one widening retry plus a 32-64k
+  sample_minp row (0.25-0.33x - one widening retry plus a 32-64k
   sort; the torch boolean-mask composite never sorts) and the
-  sample_nsigma rows (0.08x - the sigma cutoff keeps the top
+  sample_nsigma rows (0.07-0.14x - the sigma cutoff keeps the top
   ~94% of a spiked row, so near-full-vocabulary sampling through the
   widening ladder; nsigma is a long-tail filter whose case rests on output
   quality, not speed). These gaps reflect
@@ -79,7 +79,7 @@ rounding.
   across machine states; the ratios are the stable signal. The
   non-pc INT8 rows and argmax feel it most.
 - **argmax** rows are event-timed over a host-synchronized call and
-  swing on WDDM (0.90-0.92x across the 3060's shipped rounds); wall-clock probes with the
+  swing on WDDM (0.34-1.02x across the 3060's shipped rounds); wall-clock probes with the
   sync excluded from the timed loop measure 1.12x (3060) / 0.96x
   (5060 Ti). The row documents both.
 - Composite **sampling references** (sort+mask+multinomial and

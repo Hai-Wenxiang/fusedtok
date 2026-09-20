@@ -122,3 +122,36 @@ def test_staged_empty_batch(name, batched, single, args):
     got = batched(x, *args, cuda=True)
     assert isinstance(got, np.ndarray), name
     assert got.shape == (0,), name
+
+
+@needs_gpu
+@pytest.mark.parametrize("name,batched,single,args", SAMPLERS,
+                         ids=[s[0] for s in SAMPLERS])
+def test_torch_cpu_tensor_host_path(name, batched, single, args):
+    """A torch CPU tensor is a supported host input for every batched
+    sampler - the 2.4.2 dispatcher delegation briefly rejected it for
+    dry with a misleading zero-copy TypeError (2.4.3 fix)."""
+    import torch
+    rng = np.random.default_rng(403)
+    x = _batch(rng, 4, 2048)
+    seeds = np.arange(4, dtype=np.int64)
+    xt = torch.from_numpy(x)                     # CPU torch tensor
+    got = batched(xt, *args, seeds=seeds)
+    want = [int(single(x[r], *args, seed=int(seeds[r])))
+            for r in range(4)]
+    got_l = got.tolist() if hasattr(got, "tolist") else list(got)
+    assert got_l == want, name
+
+
+@needs_gpu
+def test_dry_batched_torch_cpu_tensor():
+    import torch
+    rng = np.random.default_rng(404)
+    x = rng.standard_normal((4, 2048)).astype(np.float32)
+    hists = [[5, 9, 5, 9], [], [7] * 8, [1, 2, 3]]
+    seeds = np.arange(4, dtype=np.int64)
+    got = fusedtok.sample_dry_batched(torch.from_numpy(x), hists, 2,
+                                      1.75, seeds=seeds)
+    want = [fusedtok.sample_dry(x[r], hists[r], 2, 1.75,
+                                seed=int(seeds[r])) for r in range(4)]
+    assert got.tolist() == want

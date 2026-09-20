@@ -1,3 +1,35 @@
+## [2.4.3] - 2026-09-21
+
+Third audit round: one regression fix, one documentation-blocking
+fix, and prose resync. No API changes: 55 public names; 783 tests
+green on RTX 3060 (Windows, CUDA 13.3) and RTX 5060 Ti (Linux,
+CUDA 13.2).
+
+### Fixed
+- **`sample_dry_batched` rejected torch CPU tensors** (a 2.4.2
+  regression from the dispatcher delegation): the wrapper branched on
+  torch-ness instead of the execution path, so a supported host input
+  hit the zero-copy-only dtype check with a misleading TypeError. It
+  now branches on the path like every other wrapper; pinned by
+  torch-CPU parity cases for all nine batched samplers plus DRY.
+- **`examples/demo.py` did not parse** (a broken line continuation
+  shipped in 2.4.1 - the runnable-tour claim was false for one
+  release). It compiles again, runs ALL PASS, and a CI test now
+  compiles it so the gate cannot slip again.
+- the last hand-rolled staged binding (`sample_xtc`) now uses the
+  shared `staged_sample` helper; the `sample_tfs_batched_launch`
+  binding uses `check_batch_rows_n` like its siblings; an orphaned
+  helper comment moved onto its function.
+
+### Changed
+- documentation resync from the third audit (17 findings): the cuBLASLt
+  lead unified at 2.1-2.7x, ops-table claims updated (top-k 2.7x/2.0x,
+  prefill bf16 0.41-0.58x), paged indirection 1.15x on the 3060, the
+  remaining honest-loss ranges in the benchmarks pages, the zh intro
+  sampler list mirrored, the TFS |d2| semantics aligned between
+  languages, quickstart points at the honest SDPA gap, and the 2.0
+  roadmap rows note prefill shipped in 2.4.
+
 ## [2.4.2] - 2026-09-21
 
 Maintainability and documentation-polish round. No API changes, no

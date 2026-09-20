@@ -85,7 +85,7 @@ Paged-specific rules:
 - CUDA-graph capture needs one warm-up call outside the capture.
 
 The measured cost of the indirection (3060, b=1, GQA 32/8, D=128,
-T=16384, P=16) is **1.11x** the contiguous op (1.09x on the 5060 Ti;
+T=16384, P=16) is **1.15x** the contiguous op (1.09x on the 5060 Ti;
 same protocol as the benchmark tables), with bit-identical output on
 matching slice schedules.
 

@@ -66,7 +66,8 @@ lens = torch.tensor([16384], dtype=torch.int32, device="cuda")
 out = fusedtok.attention_decode(q, k_cache, v_cache, lens)
 
 # 整个序列的 prefill 一次调用；v2.4 起 bf16/fp16 路径走 tensor core
-# （维度 32/64/128）——较 CUDA core 半精度路径快 5.1 倍
+# （维度 32/64/128）——较 CUDA core 半精度路径快 5.1 倍；与 SDPA 的
+# 诚实差距（0.41-0.58x）见 attention.md
 q_all = torch.randn(1, 32, 1024, 128, device="cuda").to(torch.bfloat16)
 k_all = torch.randn(1, 8, 1024, 128, device="cuda").to(torch.bfloat16)
 v_all = torch.randn(1, 8, 1024, 128, device="cuda").to(torch.bfloat16)
