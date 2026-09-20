@@ -43,7 +43,7 @@ rounding.
   SDPA's flash backend (~0.45x), the INT8 GEMMs vs cuBLASLt
   (0.37-0.61x), flat-distribution sample_topp vs torch's fully
   parallel sort (0.16-0.21x for the singles; the batched flat rows
-  fall to 0.05-0.06x - see the batched table), the wide-nucleus
+  fall to 0.05x - see the batched table), the wide-nucleus
   sample_minp row (0.30-0.34x - one widening retry plus a 32-64k
   sort; the torch boolean-mask composite never sorts) and the
   sample_nsigma rows (0.08x - the sigma cutoff keeps the top
@@ -64,6 +64,10 @@ rounding.
 - The **bandwidth column** (GB/s) counts only the bytes the op must
   move (e.g. 2 tensors for softmax, 3 for rmsnorm+residual); the
   **TOPS** figure on INT8 rows is dense-MACs-times-two per second.
+- The non-per-channel 4096³ INT8 row is the most host-state
+  sensitive of all: it measured 2x slower on the 3060 in the 2.4.x
+  rounds than in 2.3.0 (the per-channel rows held steady) - treat
+  that row's absolute with the environment note below in mind.
 - **Environment note (3060 host, 2.4.x rounds)**: this host shows a
   load-duration-dependent slowdown on launch-latency-bound rows -
   short bursts measure at the historical level, sustained runs drift

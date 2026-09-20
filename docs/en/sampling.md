@@ -525,7 +525,7 @@ inherent to returning tokens at all, so - like the single-row samplers
   protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
   (**1.57x / 1.17x**). The flat worst case keeps the singles' honest
-  caveat, one tier lower (0.05-0.06x).
+  caveat, one tier lower (0.05x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.
 

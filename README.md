@@ -213,7 +213,7 @@ Every kernel ships with a CPU reference implementation and element-wise parity t
 ## API stability
 
 1.0 froze the public surface at 34 names; new operators arrive in
-minor releases (55 as of v2.3), and every name in `fusedtok.__all__`
+minor releases (55 as of v2.3; unchanged by 2.4.x), and every name in `fusedtok.__all__`
 keeps its signature across the 1.x series.
 Type stubs (`__init__.pyi`, PEP 561 `py.typed`) ship with the package.
 Breaking changes require a new major version and a deprecation window.
@@ -320,7 +320,7 @@ Batched samplers (v1.4) and batched decode steps (v1.5) on the same
 | sample_topp_batched (flat worst case) | [8×131072] | 1744 µs | 83 µs | 0.05x (honest) |
 
 On smaller shapes the Blackwell card shows bigger wins (softmax 1.73x,
-RMSNorm 3.11x at 256 rows, attention decode 3.77x at T=4096 running
+RMSNorm 3.11x at 256 rows, attention decode 3.79x at T=4096 running
 ~187 GB/s) - the launch-overhead share shrinks as shapes grow; full
 sweep in the JSON.
 
@@ -370,7 +370,7 @@ minp 1399 -> 237 µs; 5060 Ti: 3.9x / 4.3x). On peaked logits the
 batched calls sit at torch's native batched-multinomial level
 (the batched min-p, top-k and top-a calls win on this
 benchmark: 0.93x/0.93x, 1.57x/1.17x and 0.96x/0.85x on the two GPUs), and the flat worst case
-keeps the singles' honest caveat one tier lower (0.05-0.06x). v1.5
+keeps the singles' honest caveat one tier lower (0.05x). v1.5
 extends batching to the whole decode step: `decode_step_batched` runs
 per-row repetition penalties through per-row vocab bitmaps inside the
 same pipeline - on wall-time probes at B=8 it is 5.2x over looping
@@ -610,6 +610,7 @@ nvcc, and CI builds and runs the CPU test suite on every push.
 - 2.3 (released): `sample_dry` - DRY (Don't Repeat Yourself) sampling: the sequence-level repeat penalty - penalizes the token that would extend a repeated sequence (64-token scan window, per-token max exponent, multiplier ** exponent division), then one full-softmax draw. Single-row + batched over ragged histories (53 -> 55 public names); binding/CPU-reference dedup round closes the copy-paste defect class
 - 2.4 (released): tensor-core prefill for bf16/fp16 (mma.sync m16n8k16, dims 32/64/128): 5.1x the CUDA-core half path on a 3060 at S=1024 D=128, competitive with SDPA flash; f32 keeps its documented numerical path; tables gain the bf16 prefill row
 - 2.4.1 (released): audit-driven fixes - the tensor-core prefill dim gate tightened to the instantiated set (48/80/96/112 previously launched the D=128 template out of bounds), the DRY batched history upload moved onto the caller's stream, the rewrite scratch chunked to the documented bound; documentation accuracy round (32 findings); staged single-row binding dedup
+- 2.4.2 (released): maintainability round - every batched sampler delegates through the one shared dispatcher (xtc/dry included), __all__ pairing cleanup, code polish from the audit backlog; documentation polish
 - future candidates (unscheduled): a CUTLASS-class INT8 GEMM schedule
   (the current qgemm is the exact/graph-capturable/zero-copy path,
   not the fastest one; TMA itself is Hopper-only and off the table on

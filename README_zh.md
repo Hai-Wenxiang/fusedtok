@@ -304,7 +304,7 @@ multinomial；decode 行另加 gather 惩罚；逐轮数值在 JSON）：
 | sample_topp_batched（平坦最坏） | [8×131072] | 1744 µs | 83 µs | 0.05x（落败） |
 
 小形状下 Blackwell 的优势更大（softmax 1.73x、RMSNorm 3.11x @256 行、
-attention decode 3.77x @T=4096 跑出约 187 GB/s）——形状越大启动开销占比
+attention decode 3.79x @T=4096 跑出约 187 GB/s）——形状越大启动开销占比
 越低；完整扫描见 JSON。
 
 ![fusedtok 对比 PyTorch 参考（RTX 5060 Ti）](https://raw.githubusercontent.com/Hai-Wenxiang/fusedtok/main/docs/benchmarks/benchmark_rtx5060ti.png)
@@ -351,7 +351,7 @@ v1.4 的批量采样器把整个 `[行数, 词表]` 批一次调用送完：每�
 attention_decode 在解码场景优势大（单次启动把 GQA cache 一遍流完，
 而 SDPA 要额外做头展开且在小查询下效率偏低）；
 attention_decode_paged（v1.2）为免碎片的 vLLM 式块池布局只付约
-~1.09-1.13x 的块表间接开销，切片调度一致时输出与连续版逐位相同；
+~1.09-1.15x 的块表间接开销，切片调度一致时输出与连续版逐位相同；
 attention_prefill 的 f32 路径是定位便捷的 kernel，性能约为 SDPA
 flash 后端的 0.45x（设计上不用 tensor core——TF32 的 10 位尾数是一致性
 契约不允许的数值降级）；v2.4 起 bf16/fp16 路径走 tensor core，达到
@@ -433,6 +433,7 @@ python benchmarks/bench.py            # GPU 基准测试 + 出图
 - 2.3（已发布）：`sample_dry`——DRY（Don't Repeat Yourself）采样：序列级重复惩罚——惩罚的是"会延续重复序列的 token"（64 token 扫描窗口、逐 token 取最大指数、multiplier ** 指数做除法），随后一次全词表 softmax 抽签。单行 + 不等长历史批量（公开名称 53 -> 55）；绑定层/CPU 参考去重轮从结构上关闭了复制粘贴缺陷类
 - 2.4（已发布）：bf16/fp16 的 tensor-core prefill（mma.sync m16n8k16，维度 32/64/128）——3060 上 S=1024 D=128 较 CUDA core 半精度路径快 5.1 倍、与 SDPA flash 掰手腕；f32 保持文档记载的数值路径；基准表新增 bf16 prefill 行
 - 2.4.1（已发布）：审计驱动修复——tensor-core prefill 的维度门收紧到实际实例化集合（48/80/96/112 此前会越界启动 D=128 模板）、DRY 批量历史上传统一到调用方流、改写 scratch 按文档约定分块；文档准确性轮（32 项）；staged 单行绑定去重
+- 2.4.2（已发布）：可维护性轮——所有批量采样器（含 xtc/dry）统一走共享 dispatcher，__all__ 成对整理，审计遗留代码打磨；文档打磨
 - 后续候选（未排期）：CUTLASS 级 INT8 GEMM 调度（当前 qgemm 定位是精确/可图捕获/零拷贝路径，而非最快路径；TMA 本身是 Hopper 专属，sm_80-sm_120 上无从谈起）；16-bit radix key（动确定性契约）
 ## 社区
 

@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 __all__ = [
     "cuda_available",
@@ -59,10 +59,15 @@ __all__ = [
     "topk",
     "topp",
     "sample_topp",
+    "sample_topp_batched",
     "sample_topk",
+    "sample_topk_batched",
     "sample_minp",
+    "sample_minp_batched",
     "sample_topa",
+    "sample_topa_batched",
     "sample_nsigma",
+    "sample_nsigma_batched",
     "sample_eta",
     "sample_eta_batched",
     "sample_typical",
@@ -73,11 +78,6 @@ __all__ = [
     "sample_xtc_batched",
     "sample_dry",
     "sample_dry_batched",
-    "sample_topp_batched",
-    "sample_topk_batched",
-    "sample_minp_batched",
-    "sample_topa_batched",
-    "sample_nsigma_batched",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -1873,7 +1873,7 @@ def sample_eta_batched(logits, eta, *, temperature=1.0, seeds=None,
         raise ValueError("eta must be in (0, 1]")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_eta", logits, eta,
+    return _sample_batched("sample_eta", logits, (eta,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 
@@ -1893,7 +1893,7 @@ def sample_typical_batched(logits, typical, *, temperature=1.0, seeds=None,
         raise ValueError("typical must be in (0, 1]")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_typical", logits, typical,
+    return _sample_batched("sample_typical", logits, (typical,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 
@@ -1951,7 +1951,7 @@ def sample_tfs_batched(logits, z, *, temperature=1.0, seeds=None,
         raise ValueError("z must be in (0, 1]")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_tfs", logits, z,
+    return _sample_batched("sample_tfs", logits, (z,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 
@@ -1993,28 +1993,9 @@ def sample_xtc_batched(logits, top_n, probability, *, temperature=1.0,
         raise ValueError("probability must be in [0, 1]")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    path = _device_path(logits, cuda)
-    if path == "torch-cuda":
-        _check_torch_f32(logits, "logits")
-        if logits.ndim != 2:
-            raise ValueError("logits must be 2-D [rows, vocab]")
-        rows, n = logits.shape
-        s = _batch_seeds(seeds, rows, "seeds")
-        toks = getattr(_fusedtok, "sample_xtc_batched_launch")(
-            logits.data_ptr(), rows, n, top_n, probability,
-            temperature, s, _cuda_stream())
-        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
-    arr = _as_numpy(logits, "logits")
-    if arr.ndim != 2:
-        raise ValueError("logits must be 2-D [rows, vocab]")
-    rows, n = arr.shape
-    s = _batch_seeds(seeds, rows, "seeds")
-    call = getattr(_fusedtok,
-                   "sample_xtc_batched" if path == "staged"
-                   else "sample_xtc_batched_cpu")
-    out = np.asarray(call(arr, rows, n, top_n, probability,
-                          temperature, s), dtype=np.int64)
-    return _numpy_to_torch_like(out) if _is_torch(logits) else out
+    return _sample_batched("sample_xtc", logits, (top_n, probability),
+                           temperature=temperature, seeds=seeds,
+                           cuda=cuda)
 
 
 def sample_dry(logits, token_ids, allowed_length=2, multiplier=1.75,
@@ -2091,44 +2072,40 @@ def sample_dry_batched(logits, token_ids, allowed_length=2,
         raise ValueError("multiplier must be >= 1")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    path = _device_path(logits, cuda)
-    if path == "torch-cuda":
+    # the histories normalize to host arrays either way (the C++
+    # launcher uploads them on the caller's stream), so they ride the
+    # shared dispatcher as plain extra arguments on every path
+    if _is_torch(logits):
         _check_torch_f32(logits, "logits")
         if logits.ndim != 2:
             raise ValueError("logits must be 2-D [rows, vocab]")
         rows, n = logits.shape
-        ids, offs = _batch_ids_arg(token_ids, ids_offsets, rows, n)
-        s = _batch_seeds(seeds, rows, "seeds")
-        toks = _fusedtok.sample_dry_batched_launch(
-            logits.data_ptr(), rows, n, ids, offs, allowed_length,
-            multiplier, temperature, s, _cuda_stream())
-        return torch.from_numpy(np.asarray(toks, dtype=np.int64))
-    arr = _as_numpy(logits, "logits")
-    if arr.ndim != 2:
-        raise ValueError("logits must be 2-D [rows, vocab]")
-    rows, n = arr.shape
-    ids, offs = _batch_ids_arg(token_ids, ids_offsets, rows, n)
-    s = _batch_seeds(seeds, rows, "seeds")
-    if rows == 0:
-        out = np.empty(0, dtype=np.int64)
     else:
-        call = (_fusedtok.sample_dry_batched if path == "staged"
-                else _fusedtok.sample_dry_batched_cpu)
-        out = np.asarray(call(arr, rows, n, ids, offs, allowed_length,
-                              multiplier, temperature, s), dtype=np.int64)
-    return _numpy_to_torch_like(out) if _is_torch(logits) else out
+        arr = _as_numpy(logits, "logits")
+        if arr.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = arr.shape
+    ids, offs = _batch_ids_arg(token_ids, ids_offsets, rows, n)
+    return _sample_batched("sample_dry", logits,
+                           (ids, offs, allowed_length, multiplier),
+                           temperature=temperature, seeds=seeds,
+                           cuda=cuda)
 
 
-def _sample_batched(kind, logits, arg, *, temperature, seeds, cuda):
+def _sample_batched(kind, logits, args, *, temperature, seeds, cuda):
     """Shared dispatcher behind the batched samplers (introduced in
-    v1.4, generalized as the sampler family grew - the 1.4.0 wrappers
-    were near-verbatim copies of this body).
+    v1.4, generalized as the sampler family grew; since v2.4.2 every
+    batched sampler - including the multi-arg xtc and the ragged dry -
+    delegates here).
     ``kind`` selects the binding family
-    ``_fusedtok.sample_<kind>_batched[_cpu|_launch]``; parameter
-    validation stays in the public wrappers so their error messages
-    name the right argument. Returns int64 tokens: a CPU torch tensor
-    for torch input, a numpy array otherwise (the widening loop's
-    host readback is inherent - never a device tensor)."""
+    ``_fusedtok.sample_<kind>_batched[_cpu|_launch]``; ``args`` is the
+    per-op argument tuple spliced after ``(logits, rows, n)`` on every
+    path. Parameter validation stays in the public wrappers so their
+    error messages name the right argument. Returns int64 tokens: a
+    CPU torch tensor for torch input, a numpy array otherwise (the
+    widening loop's host readback is inherent - never a device
+    tensor)."""
+    extra = tuple(args)
     path = _device_path(logits, cuda)
     if path == "torch-cuda":
         _check_torch_f32(logits, "logits")
@@ -2137,7 +2114,7 @@ def _sample_batched(kind, logits, arg, *, temperature, seeds, cuda):
         rows, n = logits.shape
         s = _batch_seeds(seeds, rows, "seeds")
         toks = getattr(_fusedtok, kind + "_batched_launch")(
-            logits.data_ptr(), rows, n, arg, temperature, s,
+            logits.data_ptr(), rows, n, *extra, temperature, s,
             _cuda_stream())
         return torch.from_numpy(np.asarray(toks, dtype=np.int64))
     arr = _as_numpy(logits, "logits")
@@ -2152,7 +2129,7 @@ def _sample_batched(kind, logits, arg, *, temperature, seeds, cuda):
             _fusedtok,
             kind + "_batched" if path == "staged"
             else kind + "_batched_cpu")
-        out = np.asarray(call(arr, rows, n, arg, temperature, s),
+        out = np.asarray(call(arr, rows, n, *extra, temperature, s),
                          dtype=np.int64)
     return _numpy_to_torch_like(out) if _is_torch(logits) else out
 
@@ -2176,7 +2153,7 @@ def sample_topa_batched(logits, top_a, *, temperature=1.0, seeds=None,
         raise ValueError("top_a must be in (0, 1]")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_topa", logits, top_a,
+    return _sample_batched("sample_topa", logits, (top_a,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 
@@ -2200,7 +2177,7 @@ def sample_nsigma_batched(logits, nsigma, *, temperature=1.0, seeds=None,
         raise ValueError("nsigma must be > 0")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_nsigma", logits, nsigma,
+    return _sample_batched("sample_nsigma", logits, (nsigma,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 
@@ -2226,7 +2203,7 @@ def sample_topp_batched(logits, p, *, temperature=1.0, seeds=None,
         raise ValueError("p must be in (0, 1]")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_topp", logits, p,
+    return _sample_batched("sample_topp", logits, (p,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 
@@ -2250,7 +2227,7 @@ def sample_topk_batched(logits, k, *, temperature=1.0, seeds=None,
         raise ValueError("k must be >= 1")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_topk", logits, k,
+    return _sample_batched("sample_topk", logits, (k,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 
@@ -2274,7 +2251,7 @@ def sample_minp_batched(logits, min_p, *, temperature=1.0, seeds=None,
         raise ValueError("min_p must be in (0, 1]")
     if not temperature > 0.0:
         raise ValueError("temperature must be > 0")
-    return _sample_batched("sample_minp", logits, min_p,
+    return _sample_batched("sample_minp", logits, (min_p,),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
 

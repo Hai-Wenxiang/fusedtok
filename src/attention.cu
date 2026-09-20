@@ -1083,6 +1083,8 @@ __global__ void attn_prefill_wmma_kernel(const T* __restrict__ q,
         __syncwarp();
 
         // ---- online softmax + P (the warp cooperates per row) ----
+        // rows past seq produce NaN state here (alpha = expf(-inf-inf))
+        // but are never stored - the epilogue guards on row < seq
         const int t_stop = min(t0 + KVTILE, seq);
         for (int r = 0; r < 16; ++r) {
             const int row_abs = row0 + qwarp + r;
@@ -1208,8 +1210,16 @@ void attention_prefill_wmma(const T* q, const T* k, const T* v, T* out,
                             bool causal, cudaStream_t cs) {
     const int tiles = (seq + kWmmaRows - 1) / kWmmaRows;
     dim3 grid((unsigned)(batch * hq * tiles));
+    // derived from the kernel's layout constants (NOT magic numbers):
+    // K/V staged tiles, then per warp: S [16][KVTILE+1] f32,
+    // P [16][KVTILE] halves, m/l/alpha [16][3] f32
+    constexpr int kWWarps = kWmmaBlock / 32;          // 4
+    constexpr int kWRowsPerWarp = kWmmaRows / kWWarps;  // 16
     const size_t smem = (size_t)2 * kWmmaKv * (dim + 8) * 2 +
-        4 * (16 * (kWmmaKv + 1) * 4 + 16 * kWmmaKv * 2 + 16 * 3 * 4);
+        (size_t)kWWarps *
+        ((size_t)kWRowsPerWarp * (kWmmaKv + 1) * 4 +
+         (size_t)kWRowsPerWarp * kWmmaKv * 2 +
+         (size_t)kWRowsPerWarp * 3 * 4);
     switch (dim) {
         case 32:
             attn_prefill_wmma_kernel<32, kWmmaKv, IS_BF16, T>

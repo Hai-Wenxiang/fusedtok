@@ -58,25 +58,25 @@ __all__ = [
     "topk",
     "topp",
     "sample_topp",
-    "sample_topk",
-    "sample_minp",
-    "sample_topa",
-    "sample_nsigma",
-    "sample_eta",
-    "sample_eta_batched",
-    "sample_typical",
-    "sample_typical_batched",
-    "sample_tfs",
-    "sample_tfs_batched",
-    "sample_xtc",
-    "sample_xtc_batched",
-    "sample_dry",
-    "sample_dry_batched",
     "sample_topp_batched",
+    "sample_topk",
     "sample_topk_batched",
+    "sample_minp",
     "sample_minp_batched",
+    "sample_topa",
     "sample_topa_batched",
+    "sample_nsigma",
     "sample_nsigma_batched",
+    "sample_eta"
+    "sample_eta_batched"
+    "sample_typical"
+    "sample_typical_batched"
+    "sample_tfs"
+    "sample_tfs_batched"
+    "sample_xtc"
+    "sample_xtc_batched"
+    "sample_dry"
+    "sample_dry_batched"
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",

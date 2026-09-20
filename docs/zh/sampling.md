@@ -435,7 +435,7 @@ CUDA graph 捕获。
   GPU 时间，协议不同）。尖峰 logits 下与 torch 原生批量
   multinomial 处于同一档位，`sample_topk_batched` 明确胜出
   （1.57x / 1.17x）；平坦最坏情况则比单行版再低一档
-  （0.05-0.06x），差距同样如实给出。
+  （0.05x），差距同样如实给出。
 - `decode_step` 的批量版见下一节（v1.5）。
 
 ## 批量解码步——含重复惩罚（v1.5）
