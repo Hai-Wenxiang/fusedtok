@@ -3299,9 +3299,15 @@ long long sample_xtc_launch(const float* x, int n, int top_n, float probability,
 // multiplies) and the plain min_p=1e-9 pipeline draws from it.
 // ---------------------------------------------------------------------------
 
+// per-row trigger-table stride: [count, (token, exponent) pairs]
+constexpr size_t kDryPairStride = 1 + 2 * (size_t)kDryMaxScan;
+
 // DRY scratch caches: the penalized copy plus the per-row trigger
 // tables, one growing pair of buffers - the selection-workspace
-// convention (never freed, bounded by the largest call).
+// convention (never freed, bounded by the largest call). The same
+// concurrency contract applies: process-global scratch, so concurrent
+// DRY launches on DISTINCT streams (or host threads) race it -
+// serialize them, or give each stream its own process.
 float* dry_scratch(size_t floats) {
     static float* buf = nullptr;
     static size_t capacity = 0;
@@ -3324,7 +3330,7 @@ int* dry_pairs(size_t rows) {
     static size_t capacity = 0;
     static std::mutex mu;
     std::lock_guard<std::mutex> lock(mu);
-    const size_t words = rows * (1 + 2 * (size_t)kDryMaxScan);
+    const size_t words = rows * kDryPairStride;
     if (words > capacity) {
         int* nb = nullptr;
         if (cudaMalloc(&nb, words * sizeof(int)) != cudaSuccess)
@@ -3336,7 +3342,6 @@ int* dry_pairs(size_t rows) {
     return buf;
 }
 
-constexpr size_t kDryPairStride = 1 + 2 * (size_t)kDryMaxScan;
 
 // minimal RAII device buffer for the per-call history uploads (the
 // bindings-side DevBuf is not visible from this TU)

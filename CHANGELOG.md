@@ -1,3 +1,29 @@
+## [2.4.2] - 2026-09-21
+
+Maintainability and documentation-polish round. No API changes, no
+kernel changes: 55 public names; 772 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Changed
+- every batched sampler - including the multi-argument XTC and the
+  ragged DRY - now delegates through the one shared `_sample_batched`
+  dispatcher (the 2.2.1-audit closure of the last known wrapper
+  duplication); a new batched sampler is a validation block plus one
+  delegation call
+- `__all__` lists each sampler with its batched twin adjacent (the
+  v1.4-era grouping had five batched variants orphaned at the end);
+  the .pyi stub mirrors the same order
+- code polish from the 2.4.1 audit: the DRY pair-table stride
+  constant hoisted above its first use (an inline duplicate of the
+  formula could drift), the dry scratch caches document their
+  cross-stream concurrency contract, the WMMA shared-memory sizing
+  derives from the kernel's layout constants instead of magic
+  numbers, and the benign dead-row NaN path is commented
+- documentation polish: the remaining stale prose numbers resynced
+  (attention decode 3.79x, flat-worst 0.05x, the zh roadmap's paged
+  overhead row), and the non-per-channel 4096 INT8 row's host-state
+  sensitivity called out explicitly next to the environment note
+
 ## [2.4.1] - 2026-09-19
 
 Audit-driven bug-fix and accuracy round. No API changes: 55 public
