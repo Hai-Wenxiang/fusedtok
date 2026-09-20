@@ -37,7 +37,7 @@ the v0.x skeleton - functional, but not a performance feature.
 | ✅ | top-k / top-p (nucleus) | arrival-ticket radix + early-exit compaction, replayed from a cached CUDA graph; deterministic ties (parity-to-winning across the whole k range on both test GPUs) |
 | ✅ | argmax / temperature | greedy decoding helpers |
 | ✅ | sample_topp | fused nucleus sampling: softmax -> top-p -> seeded draw, global-mass threshold |
-| ✅ | sample_topk | fused top-k sampling: softmax -> top-k -> renormalize within the window -> seeded draw (1.9-2.1x vs the topk+multinomial composite @131k) |
+| ✅ | sample_topk | fused top-k sampling: softmax -> top-k -> renormalize within the window -> seeded draw (2.7x / 2.0x vs the topk+multinomial composite @131k) |
 | ✅ | sample_minp | fused min-p sampling (v1.3): keep every token with p >= min_p * p_max -> renormalize -> seeded draw - a value threshold, so no global-mass reduction; adaptive nucleus by construction |
 | ✅ | sample_eta / sample_eta_batched | fused eta-cutoff sampling (v1.6, Hewitt 2022): keep every token with p >= eta * min(1, exp(-H)) - the threshold derives from the distribution's own entropy; adaptive by construction |
 | ✅ | sample_typical / sample_typical_batched | fused locally typical sampling (v1.6, Meister 2022): keep the smallest set whose mass reaches `typical`, ordered by surprise-vs-entropy closeness - a contiguous band of the value-sorted window |
@@ -60,7 +60,7 @@ the v0.x skeleton - functional, but not a performance feature.
 | ✅ | kv_append | the cache-write side of the contiguous decode loop (v1.3): one fresh token's k/v rows per sequence scattered in place into the cache at row `lens[b]` (one tiny kernel, f32/bf16/fp16) |
 | ✅ | attention_decode_paged | the v1.2 headline: the same decode attention over a **vLLM-style block-pool kv-cache** `[Nb, Hkv, P, D]` walked through a per-sequence block table - fragmentation-free cache memory; any valid table honored, f32/bf16/fp16 storage, ~1.09-1.15x the contiguous op (8.46x / 4.28x vs SDPA on the pre-expanded-heads reference) |
 | ✅ | kv_append_paged | the cache-write side of the paged loop: one fresh token's k/v rows per sequence scattered in place into the pool at position `lens[b]` (one tiny kernel, f32/bf16/fp16) |
-| ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional), float32 / bf16 / fp16 storage; since v2.4 the half-precision path rides tensor cores (mma.sync flash kernel, dims 32/64/128) - 5.1x the previous half path, 0.42-0.59x SDPA's bf16 flash (up from 0.11x); f32 keeps the convenience path (honest ~0.45x) |
+| ✅ | attention_prefill | fresh-sequence attention over S query rows (causal / bidirectional), float32 / bf16 / fp16 storage; since v2.4 the half-precision path rides tensor cores (mma.sync flash kernel, dims 32/64/128) - 5.1x the previous half path, 0.41-0.58x SDPA's bf16 flash (up from 0.11x); f32 keeps the convenience path (honest ~0.45x) |
 | ✅ | axpy | `a*x + b` - the v0.x hello-world demo op, kept for API compatibility |
 
 ## Install
@@ -387,7 +387,7 @@ attention_prefill's f32 path is the honest convenience kernel at
 ~0.45x of SDPA's flash backend (no tensor cores by design - TF32's
 10-bit mantissa is a numerical downgrade the parity contract forbids);
 since v2.4 the bf16/fp16 path rides tensor cores and lands within
-0.42-0.59x of SDPA's bf16 flash (see the table rows below). kv_append (v1.3) writes one token's k/v rows
+0.41-0.58x of SDPA's bf16 flash (see the table rows below). kv_append (v1.3) writes one token's k/v rows
 into the contiguous cache in a single launch (a multi-x win over the
 advanced-indexing scatter whose exact factor tracks that reference's
 WDDM swing; a tiny launch-bound op - parity-level cost per decode
@@ -398,7 +398,7 @@ IMMA GEMM (v1.0 rework: cp.async double-buffered slabs, runtime-tuned
 host state of the 2.4.x rounds measured 31; see the benchmarks page
 note) and ~67 TOPS on a
 5060 Ti - 2x-4x the v0.4 kernel - but cuBLASLt (`torch._int_mm`) still
-holds a ~1.7-2.7x lead on the per-tensor rows (its tiles pipeline
+holds a ~2.1-2.7x lead on the per-tensor rows (its tiles pipeline
 deeper and its epilogue is tuned per-arch); the W8A8 rows' gap is only
 ~1.6-1.8x. For now qgemm is the exact / graph-capturable /
 zero-copy INT8 path, not the fastest one; honest numbers, a
@@ -584,7 +584,7 @@ nvcc, and CI builds and runs the CPU test suite on every push.
 - 2.0 (released): **Python >= 3.11 required** (3.10 EOL dropped from
   the build and publish matrices — the formal breaking change that
   steps the major version); INT8 GEMM larger-tile and tensor-core
-  prefill evaluated and deferred to the 2.1 roadmap (see the
+  prefill evaluated and deferred (it eventually shipped in 2.4; see the
   changelog for the shared-memory ceiling arithmetic)
 - 2.0.1 (released): documentation accuracy + tables re-measured on
   the shipping build; the 25-finding bilingual audit fixed stale prose
@@ -608,9 +608,10 @@ nvcc, and CI builds and runs the CPU test suite on every push.
   batched moved onto the chunked pipeline (up to 11.1x at b=128);
   tables re-measured; bilingual documentation readability round
 - 2.3 (released): `sample_dry` - DRY (Don't Repeat Yourself) sampling: the sequence-level repeat penalty - penalizes the token that would extend a repeated sequence (64-token scan window, per-token max exponent, multiplier ** exponent division), then one full-softmax draw. Single-row + batched over ragged histories (53 -> 55 public names); binding/CPU-reference dedup round closes the copy-paste defect class
-- 2.4 (released): tensor-core prefill for bf16/fp16 (mma.sync m16n8k16, dims 32/64/128): 5.1x the CUDA-core half path on a 3060 at S=1024 D=128, competitive with SDPA flash; f32 keeps its documented numerical path; tables gain the bf16 prefill row
+- 2.4 (released): tensor-core prefill for bf16/fp16 (mma.sync m16n8k16, dims 32/64/128): 5.1x the CUDA-core half path on a 3060 at S=1024 D=128, within 0.42-0.59x of SDPA flash; f32 keeps its documented numerical path; tables gain the bf16 prefill row
 - 2.4.1 (released): audit-driven fixes - the tensor-core prefill dim gate tightened to the instantiated set (48/80/96/112 previously launched the D=128 template out of bounds), the DRY batched history upload moved onto the caller's stream, the rewrite scratch chunked to the documented bound; documentation accuracy round (32 findings); staged single-row binding dedup
 - 2.4.2 (released): maintainability round - every batched sampler delegates through the one shared dispatcher (xtc/dry included), __all__ pairing cleanup, code polish from the audit backlog; documentation polish
+- 2.4.3 (released): third audit round - the dry batched torch-CPU regression fixed and pinned, demo.py parse-gated in CI, prose resync (17 findings)
 - future candidates (unscheduled): a CUTLASS-class INT8 GEMM schedule
   (the current qgemm is the exact/graph-capturable/zero-copy path,
   not the fastest one; TMA itself is Hopper-only and off the table on

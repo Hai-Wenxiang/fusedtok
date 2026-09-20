@@ -71,7 +71,8 @@ lens = torch.tensor([16384], dtype=torch.int32, device="cuda")
 out = fusedtok.attention_decode(q, k_cache, v_cache, lens)
 
 # whole-sequence prefill in one call; since v2.4 the bf16/fp16 path
-# rides tensor cores (dims 32/64/128) - 5.1x the CUDA-core half path
+# rides tensor cores (dims 32/64/128) - 5.1x the CUDA-core half path;
+# the honest 0.41-0.58x SDPA gap is documented in attention.md
 q_all = torch.randn(1, 32, 1024, 128, device="cuda").to(torch.bfloat16)
 k_all = torch.randn(1, 8, 1024, 128, device="cuda").to(torch.bfloat16)
 v_all = torch.randn(1, 8, 1024, 128, device="cuda").to(torch.bfloat16)

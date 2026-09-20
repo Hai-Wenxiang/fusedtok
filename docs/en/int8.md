@@ -90,8 +90,8 @@ bug.
   sustained-load host state of the 2.4.x rounds measured 31; see the
   benchmarks page note) and ~67
   TOPS on an RTX 5060 Ti (2x-4x the original v0.4 kernel), but
-  cuBLASLt (`torch._int_mm`) retains roughly a 2.1-2.5x lead on the
-  per-tensor rows (about 1.7-1.8x on the W8A8 rows) with
+  cuBLASLt (`torch._int_mm`) retains roughly a 2.1-2.7x lead on the
+  per-tensor rows (about 1.6-1.8x on the W8A8 rows) with
   deeper-pipelined tiles and per-arch epilogues. fusedtok's INT8 path
   is the **exact / graph-capturable / zero-copy** one, not the
   fastest one; a CUTLASS-class schedule stays on the roadmap.

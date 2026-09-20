@@ -476,7 +476,9 @@ def main():
         ref_bi = np.zeros_like(ref)
         for h in range(8):
             kvh = h // 4
-            scores = q[0, h].astype(np.float64) @ \n                k[0, kvh].astype(np.float64).T / np.sqrt(32.0)
+            scores = (q[0, h].astype(np.float64)
+                      @ k[0, kvh].astype(np.float64).T
+                      / np.sqrt(32.0))
             p = np.exp(scores - scores.max(axis=-1, keepdims=True))
             p /= p.sum(axis=-1, keepdims=True)
             ref_bi[0, h] = p @ v[0, kvh].astype(np.float64)

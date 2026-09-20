@@ -229,8 +229,8 @@ tok = fusedtok.sample_tfs(logits, z=0.95, temperature=0.8, seed=step)
 
 Tail-free sampling (Filazzola & Trottet 2023) truncates by the
 CUMULATIVE probability curve's second derivative: it keeps the prefix
-where the sorted probability curve still "curves" (the second
-derivative, normalized to [0,1], stays above `1 - z`). Unlike min-p or
+where the sorted probability curve still "curves" (the absolute
+second derivative, normalized to [0,1], stays above `1 - z`). Unlike min-p or
 top-a which use a fixed value threshold, the TFS cutoff is
 data-dependent — it marks where the sorted probability distribution
 stops bending and becomes effectively flat.

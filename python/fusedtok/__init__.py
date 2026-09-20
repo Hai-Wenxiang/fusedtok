@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "2.4.2"
+__version__ = "2.4.3"
 
 __all__ = [
     "cuda_available",
@@ -2075,7 +2075,11 @@ def sample_dry_batched(logits, token_ids, allowed_length=2,
     # the histories normalize to host arrays either way (the C++
     # launcher uploads them on the caller's stream), so they ride the
     # shared dispatcher as plain extra arguments on every path
-    if _is_torch(logits):
+    # branch on the EXECUTION path, not on torch-ness: a torch CPU
+    # tensor is a supported host input (the dispatcher converts it),
+    # and _check_torch_f32 would reject it with a misleading
+    # zero-copy-only TypeError (the 2.4.2 regression this fixes)
+    if _device_path(logits, cuda) == "torch-cuda":
         _check_torch_f32(logits, "logits")
         if logits.ndim != 2:
             raise ValueError("logits must be 2-D [rows, vocab]")
