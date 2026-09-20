@@ -1,3 +1,26 @@
+## [2.4.4] - 2026-09-21
+
+Small correction round from the post-release verification audit. No
+API changes: 55 public names; 783 tests green on RTX 3060 (Windows,
+CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Fixed
+- **the `sample_xtc` delegation described in [2.4.3] was missing from
+  that release** (the edit was lost to a failed verification script
+  while its changelog claim shipped): the last hand-rolled staged
+  binding now actually uses the shared `staged_sample` helper. Note
+  the error-precedence flip this brings in line with the eight
+  delegated siblings: parameter errors are now reported before the
+  1-D shape check.
+- the W8A8 cuBLASLt-lead range now covers its own table (1.6-2.2x;
+  the 5060 Ti pc [512] row sits at 2.13x, outside the previous
+  1.6-1.8x).
+
+### Verified, no change
+- the argmax across-run spread (0.34-1.02x) re-derived against the
+  shipped JSON's per-round values, including the b=8 rounds the first
+  verification pass missed.
+
 ## [2.4.3] - 2026-09-21
 
 Third audit round: one regression fix, one documentation-blocking

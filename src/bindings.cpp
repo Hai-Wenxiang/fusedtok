@@ -240,7 +240,6 @@ long long staged_sample(FArray& logits, const char* what,
 // body was a near-verbatim copy - the exact class of copy-paste that
 // produced the two 2.2.1 binding defects (one copy missing, one copy
 // drifted to the CPU reference).
-
 template <typename Launch>
 py::array_t<long long> staged_batched_sample(
     FArray& logits, int rows, int n, double t, const I64Array& seeds,
@@ -1234,26 +1233,21 @@ PYBIND11_MODULE(_fusedtok, m) {
 
     m.def("sample_xtc", [](FArray logits, int top_n, double probability,
                             double t, unsigned long long seed) -> long long {
-        if (logits.ndim() != 1)
-            throw std::invalid_argument("logits must be 1-D");
         if (top_n < 0)
             throw std::invalid_argument("top_n must be >= 0");
         if (!(probability >= 0.0 && probability <= 1.0))
             throw std::invalid_argument("probability must be in [0, 1]");
         if (!(t > 0.0))
             throw std::invalid_argument("temperature must be > 0");
-        const int n = (int)logits.size();
-        if (n == 0)
-            throw std::invalid_argument("sample of empty logits");
-        DevBuf dx(n * 4);
-        h2d(dx.get(), logits.data(), n * 4);
-        const long long token = ft::sample_xtc_launch(
-            dx.fget(), n, top_n, (float)probability, (float)t, seed);
-        sync_device("sample xtc kernel");
-        return token;
+        return staged_sample(
+            logits, "sample xtc kernel",
+            [&](const float* dxp, int n) {
+                return ft::sample_xtc_launch(dxp, n, top_n,
+                                             (float)probability,
+                                             (float)t, seed);
+            });
     }, py::arg("logits"), py::arg("top_n"), py::arg("probability"),
        py::arg("t") = 1.0, py::arg("seed") = 0);
-
     m.def("sample_xtc_launch", [](py::int_ x, int n, int top_n,
                                    double probability, double t,
                                    unsigned long long seed,

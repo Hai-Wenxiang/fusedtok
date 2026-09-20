@@ -81,7 +81,7 @@ y = fusedtok.qgemm_perchannel(a_q, a_scale, b_q, b_scales)
   67 TOPS（是 v0.4 kernel 的 2-4 倍），但 cuBLASLt
   （`torch._int_mm`）凭借更深的 tile 流水线和按架构精调的
   epilogue，在逐张量行上速度仍为 fusedtok 的约 2.1-2.7 倍
-  （W8A8 行约 1.6-1.8 倍）。fusedtok 的 INT8 路径定位是
+  （W8A8 行约 1.6-2.2 倍）。fusedtok 的 INT8 路径定位是
   **精确 / 可图捕获 / 零拷贝**，不是最快；CUTLASS 级调度在
   路线图上。
 - `qgemm_perchannel` 的 scale 乘法融合进同一个 epilogue，kernel

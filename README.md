@@ -400,7 +400,7 @@ note) and ~67 TOPS on a
 5060 Ti - 2x-4x the v0.4 kernel - but cuBLASLt (`torch._int_mm`) still
 holds a ~2.1-2.7x lead on the per-tensor rows (its tiles pipeline
 deeper and its epilogue is tuned per-arch); the W8A8 rows' gap is only
-~1.6-1.8x. For now qgemm is the exact / graph-capturable /
+~1.6-2.2x. For now qgemm is the exact / graph-capturable /
 zero-copy INT8 path, not the fastest one; honest numbers, a
 CUTLASS-class schedule stays future work. The per-channel variant
 (`qgemm_perchannel`, the W8A8 layout INT8 inference actually uses)
@@ -612,6 +612,7 @@ nvcc, and CI builds and runs the CPU test suite on every push.
 - 2.4.1 (released): audit-driven fixes - the tensor-core prefill dim gate tightened to the instantiated set (48/80/96/112 previously launched the D=128 template out of bounds), the DRY batched history upload moved onto the caller's stream, the rewrite scratch chunked to the documented bound; documentation accuracy round (32 findings); staged single-row binding dedup
 - 2.4.2 (released): maintainability round - every batched sampler delegates through the one shared dispatcher (xtc/dry included), __all__ pairing cleanup, code polish from the audit backlog; documentation polish
 - 2.4.3 (released): third audit round - the dry batched torch-CPU regression fixed and pinned, demo.py parse-gated in CI, prose resync (17 findings)
+- 2.4.4 (released): the sample_xtc staged-binding delegation that [2.4.3] described but did not ship; the W8A8 lead range corrected to cover its own table (1.6-2.2x)
 - future candidates (unscheduled): a CUTLASS-class INT8 GEMM schedule
   (the current qgemm is the exact/graph-capturable/zero-copy path,
   not the fastest one; TMA itself is Hopper-only and off the table on
