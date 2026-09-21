@@ -19,6 +19,7 @@ and GPU draws may differ.
 - [sample_tfs - tail-free sampling (v2.1)](#sample_tfs---tail-free-sampling-v21)
 - [sample_xtc - Exclude Top Choices sampling (v2.2)](#sample_xtc---exclude-top-choices-sampling-v22)
 - [sample_dry - sequence-level repeat penalty sampling (v2.3)](#sample_dry---sequence-level-repeat-penalty-sampling-v23)
+- [sample_mirostat - entropy-targeting sampling with state (v2.5)](#sample_mirostat---entropy-targeting-sampling-with-state-v25)
 - [sample_eta - entropy-adaptive cutoff sampling (v1.6)](#sample_eta---entropy-adaptive-cutoff-sampling-v16)
 - [sample_typical - locally typical sampling (v1.6)](#sample_typical---locally-typical-sampling-v16)
 - [logit_penalties - the HF penalty trio in one call (v1.6.1)](#logit_penalties---the-hf-penalty-trio-in-one-call-v161)
@@ -319,6 +320,43 @@ that followed it; a candidate keeps the MAX exponent
   Each row is the single-row op on that row up to the documented ulp
   boundary class.
 
+## sample_mirostat - entropy-targeting sampling with state (v2.5)
+
+```python
+tok, mu = fusedtok.sample_mirostat(logits, mu, tau=5.0, eta=0.1,
+                                   temperature=0.8, seed=step)
+toks, mus = fusedtok.sample_mirostat_batched(batch_logits, mus,
+                                             seeds=seeds)
+```
+
+Mirostat v2 (Basirat 2023) targets a SURPRISE level instead of a
+fixed nucleus: the caller owns a bound `mu` (initialize at
+`2 * tau`), the nucleus is every token with `p_i >= 2 ** -mu` (an
+absolute probability threshold, boundary-inclusive like the library's
+other value thresholds), and after the draw the state updates as
+`new_mu = mu - eta * (s - tau)` with `s = -log2(p_sampled)` under the
+full softmax. Feeding `new_mu` back each step keeps the running
+surprisal near `tau` - the paper's perplexity-steering property.
+
+- **This is the one sampler that returns a tuple** - `(token,
+  new_mu)` single-row, `(tokens, new_mus)` batched (each row carries
+  its own mu; states are independent conversations). The batched GPU
+  path loops the fused single-row launcher on the caller's stream -
+  the documented first implementation; a fused chunk-sequencer mode
+  is future work if batched mirostat matters at serving scale.
+- An empty nucleus (`2 ** -mu > p_max`) falls back to the top-1 token
+  - the state update still applies.
+- `tau` (target entropy, paper default 5.0) and `eta` (learning rate,
+  default 0.1) must be positive; `mu` must be finite. The token
+  follows the standard per-seed determinism and neighbor-rank
+  cross-path contract; `new_mu` is derived f32 arithmetic
+  (`log2(total) - log2(exp)`) and may differ at the ulp level between
+  CPU and GPU paths.
+- Implementation: the top-a pipeline (threshold derived in-kernel
+  from the workspace total) with the absolute threshold `2^-mu` and
+  the state update fused into the serial tail; the widening bound
+  reuses the min-p mass argument with the derived threshold.
+
 ## sample_eta - entropy-adaptive cutoff sampling (v1.6)
 
 ```python
@@ -524,7 +562,7 @@ inherent to returning tokens at all, so - like the single-row samplers
   benchmark tables in the README measure GPU time, a different
   protocol). On peaked logits the batched calls sit at torch's native
   batched-multinomial level, and `sample_topk_batched` wins outright
-  (**1.57x / 1.17x**). The flat worst case keeps the singles' honest
+  (**1.75x / 1.19x**). The flat worst case keeps the singles' honest
   caveat, one tier lower (0.05x).
 - `decode_step` gained its batched variant in v1.5 - see the next
   section.

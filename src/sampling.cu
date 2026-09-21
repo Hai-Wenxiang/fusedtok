@@ -1240,6 +1240,104 @@ std::vector<long long> sample_xtc_batched_cpu(
 }
 
 // ---------------------------------------------------------------------------
+// Mirostat v2 sampling (v2.5): see activations.hpp for the contract.
+// Mirrors the GPU serial tail op-for-op (exp2f/log2f in f32) so the
+// mu' values agree up to the documented exp ulp boundary.
+// ---------------------------------------------------------------------------
+std::pair<long long, float> sample_mirostat_cpu(
+    const std::vector<float>& logits, float mu, float tau, float eta,
+    float t, unsigned long long seed) {
+    if (logits.empty())
+        throw std::invalid_argument("sample of empty logits");
+    if (!(tau > 0.0f))
+        throw std::invalid_argument("tau must be > 0");
+    if (!(eta > 0.0f))
+        throw std::invalid_argument("eta must be > 0");
+    if (!std::isfinite(mu))
+        throw std::invalid_argument("mu must be finite");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+
+    const size_t n = logits.size();
+    std::vector<unsigned int> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (unsigned int)i;
+    const float inv_t = 1.0f / t;
+    std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        const float va = logits[a] * inv_t, vb = logits[b] * inv_t;
+        if (va != vb) return va > vb;
+        return a < b;
+    });
+    std::vector<float> exps(n);
+    float total = 0.0f;
+    const float row_max = logits[order[0]] * inv_t;
+    for (size_t i = 0; i < n; ++i) {
+        exps[i] = std::exp(logits[order[i]] * inv_t - row_max);
+        total += exps[i];
+    }
+    // nucleus: p_i >= 2^-mu, i.e. exp_i >= 2^-mu * total (>= rule,
+    // boundary-inclusive like the other value thresholds)
+    const float thr_exp = exp2f(-mu) * total;
+    size_t nucleus = 0;
+    float nucleus_mass = 0.0f;
+    while (nucleus < n && exps[nucleus] >= thr_exp) {
+        nucleus_mass += exps[nucleus];
+        ++nucleus;
+    }
+    if (nucleus == 0) {                  // empty: top-1 fallback
+        nucleus = 1;
+        nucleus_mass = exps[0];
+    }
+    const float u = splitmix_uniform(seed);
+    const float target = u * nucleus_mass;
+    float cum = 0.0f;
+    size_t idx = nucleus - 1;
+    for (size_t i = 0; i < nucleus; ++i) {
+        cum += exps[i];
+        if (cum >= target) { idx = i; break; }
+    }
+    // state update in the same f32 op order as the GPU tail
+    const float s = log2f(total) - log2f(exps[idx]);
+    return {(long long)order[idx], mu - eta * (s - tau)};
+}
+
+std::vector<std::pair<long long, float>> sample_mirostat_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<float>& mus, float tau, float eta, float t,
+    const std::vector<unsigned long long>& seeds) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(tau > 0.0f))
+        throw std::invalid_argument("tau must be > 0");
+    if (!(eta > 0.0f))
+        throw std::invalid_argument("eta must be > 0");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)mus.size() != rows)
+        throw std::invalid_argument("mus must have one entry per row");
+    for (float m : mus)
+        if (!std::isfinite(m))
+            throw std::invalid_argument("mu must be finite");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    if ((long long)logits.size() < (long long)rows * n)
+        throw std::invalid_argument(
+            "logits size must be at least rows * n");
+    std::vector<std::pair<long long, float>> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r) {
+        const float* row = logits.data() + (size_t)r * n;
+        std::vector<float> rowv(row, row + n);
+        out.push_back(sample_mirostat_cpu(rowv, mus[r], tau, eta, t,
+                                          seeds[r]));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // DRY sampling (v2.3, "Don't Repeat Yourself"): sequence-aware repeat
 // penalty + temperature + full-softmax draw. See activations.hpp for
 // the contract; the scan below is the single source of truth both CPU

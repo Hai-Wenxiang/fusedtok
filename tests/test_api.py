@@ -55,6 +55,8 @@ FROZEN_API = frozenset({
     "sample_xtc_batched",
     "sample_dry",
     "sample_dry_batched",
+    "sample_mirostat",
+    "sample_mirostat_batched",
     "sample_topk_batched",
     "sample_minp_batched",
     "sample_topa_batched",

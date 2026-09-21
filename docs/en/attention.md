@@ -175,7 +175,7 @@ Honest scope, two tiers since v2.4:
   accumulation, output rounded to the storage dtype). At S=1024 D=128
   causal this is 5.1x the previous CUDA-core half path on a 3060
   (6019 -> 1171 us, 5-round means; the 5060 Ti lands at ~630 us) and
-  0.41-0.58x SDPA's bf16 flash kernel on the same inputs - up from
+  0.68-0.91x SDPA's bf16 flash kernel on the same inputs - up from
   0.11x before the tensor-core path. The honest SDPA gap is carried
   in the benchmark tables (`attn prefill bf16` row).
 - **float32 storage, and half storage at other dims, keeps the v0.5
@@ -200,7 +200,8 @@ kv-cache once. What to expect:
   (1.15x on a 3060, 1.09x on a 5060 Ti, this round).
 - The f32 prefill path deliberately stays off tensor cores (and thus
 not competitive with flash backends); the half-precision path is
-within 0.41-0.58x of SDPA's bf16 flash since v2.4.
+within 0.68-0.91x of SDPA's bf16 flash (v2.4 tensor cores, the
+2.5 lane-parallel softmax).
 
 See [benchmarks.md](benchmarks.md) for the measurement protocol and
 how to reproduce the tables.

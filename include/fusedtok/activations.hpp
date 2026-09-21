@@ -90,6 +90,25 @@ std::vector<long long> sample_xtc_batched_cpu(
     float probability, float t,
     const std::vector<unsigned long long>& seeds);
 
+// Mirostat v2 sampling (v2.5, Basirat 2023): entropy-targeting
+// sampling with a caller-owned surprise bound mu. The nucleus is
+// every token with p_i >= 2^-mu (an ABSOLUTE probability threshold -
+// boundary-inclusive, consistent with the library's other
+// value-threshold samplers); empty nucleus falls back to the top-1
+// token. The draw renormalizes inside the nucleus; the observed
+// surprisal s = -log2(p_sampled) under the FULL softmax updates the
+// state: mu' = mu - eta * (s - tau). Returns (token, mu'). The mu'
+// arithmetic is f32 on every path (log2f(total) - log2f(exp_i)); CPU
+// and GPU mu' agree up to the same exp ulp boundary class as the
+// token contract.
+std::pair<long long, float> sample_mirostat_cpu(
+    const std::vector<float>& logits, float mu, float tau, float eta,
+    float t, unsigned long long seed);
+std::vector<std::pair<long long, float>> sample_mirostat_batched_cpu(
+    const std::vector<float>& logits, int rows, int n,
+    const std::vector<float>& mus, float tau, float eta, float t,
+    const std::vector<unsigned long long>& seeds);
+
 // DRY sampling (v2.3, "Don't Repeat Yourself"): sequence-aware repeat
 // penalty + temperature + full-softmax draw. Only the last
 // kDryMaxScan history tokens participate; for every suffix length

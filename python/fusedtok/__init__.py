@@ -32,7 +32,7 @@ try:
 except ImportError:  # torch is an optional dependency
     torch = None
 
-__version__ = "2.4.4"
+__version__ = "2.5.0"
 
 __all__ = [
     "cuda_available",
@@ -78,6 +78,8 @@ __all__ = [
     "sample_xtc_batched",
     "sample_dry",
     "sample_dry_batched",
+    "sample_mirostat",
+    "sample_mirostat_batched",
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -2094,6 +2096,107 @@ def sample_dry_batched(logits, token_ids, allowed_length=2,
                            (ids, offs, allowed_length, multiplier),
                            temperature=temperature, seeds=seeds,
                            cuda=cuda)
+
+
+def sample_mirostat(logits, mu, *, tau=5.0, eta=0.1, temperature=1.0,
+                    seed=0, cuda=False):
+    """Fused Mirostat v2 sampling (v2.5, Basirat 2023): entropy-targeting
+    sampling with a caller-owned surprise bound.
+
+    Unlike the other samplers this returns a TUPLE
+    ``(token, new_mu)`` - the mu state is the loop variable a decode
+    step feeds back into the next call (initialize with ``2 * tau``).
+    The nucleus is every token with ``p_i >= 2 ** -mu`` (an absolute
+    probability threshold, boundary-inclusive like the library's other
+    value thresholds); an empty nucleus falls back to the top-1 token.
+    The draw renormalizes inside the nucleus, and the state update is
+    ``new_mu = mu - eta * (s - tau)`` where ``s = -log2(p_sampled)``
+    under the full softmax. ``tau`` (target entropy) and ``eta``
+    (learning rate) must be positive; the paper's defaults are 5.0 and
+    0.1. Deterministic per seed. The token follows the standard
+    neighbor-rank contract between paths; ``new_mu`` is derived
+    arithmetic and may differ at the ulp level between CPU and GPU.
+    """
+    if not tau > 0.0:
+        raise ValueError("tau must be > 0")
+    if not eta > 0.0:
+        raise ValueError("eta must be > 0")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    if not np.isfinite(mu):
+        raise ValueError("mu must be finite")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 1:
+            raise ValueError("logits must be 1-D")
+        toks, muv = _fusedtok.sample_mirostat_launch(
+            logits.data_ptr(), logits.numel(), mu, tau, eta,
+            temperature, seed, _cuda_stream())
+        return int(toks), float(muv)
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 1:
+        raise ValueError("logits must be 1-D")
+    call = (_fusedtok.sample_mirostat if path == "staged"
+            else _fusedtok.sample_mirostat_cpu)
+    toks, muv = call(arr, mu, tau, eta, temperature, seed)
+    return int(toks), float(muv)
+
+
+def sample_mirostat_batched(logits, mus, *, tau=5.0, eta=0.1,
+                            temperature=1.0, seeds=None, cuda=False):
+    """Fused Mirostat v2 sampling for a batch of rows (v2.5).
+
+    Returns ``(tokens, new_mus)`` - int64 tokens (array / CPU torch
+    tensor) and float32 new mu states, one per row. Each row carries
+    its OWN mu in ``mus`` (row states are independent conversations).
+    Every row runs the single-row pipeline with its own seed; the
+    batched GPU path loops the fused single-row launcher on the
+    caller's stream (the documented first implementation - see the
+    sampling page).
+    """
+    if not tau > 0.0:
+        raise ValueError("tau must be > 0")
+    if not eta > 0.0:
+        raise ValueError("eta must be > 0")
+    if not temperature > 0.0:
+        raise ValueError("temperature must be > 0")
+    mus = np.ascontiguousarray(mus, dtype=np.float32)
+    if mus.ndim != 1:
+        raise ValueError("mus must be 1-D")
+    if not np.all(np.isfinite(mus)):
+        raise ValueError("mu must be finite")
+    path = _device_path(logits, cuda)
+    if path == "torch-cuda":
+        _check_torch_f32(logits, "logits")
+        if logits.ndim != 2:
+            raise ValueError("logits must be 2-D [rows, vocab]")
+        rows, n = logits.shape
+        if mus.shape[0] != rows:
+            raise ValueError("mus must have one entry per row")
+        s = _batch_seeds(seeds, rows, "seeds")
+        toks, muv = _fusedtok.sample_mirostat_batched_launch(
+            logits.data_ptr(), rows, n, mus, tau, eta, temperature, s,
+            _cuda_stream())
+        return (torch.from_numpy(np.asarray(toks, dtype=np.int64)),
+                torch.from_numpy(np.asarray(muv, dtype=np.float32)))
+    arr = _as_numpy(logits, "logits")
+    if arr.ndim != 2:
+        raise ValueError("logits must be 2-D [rows, vocab]")
+    rows, n = arr.shape
+    if mus.shape[0] != rows:
+        raise ValueError("mus must have one entry per row")
+    s = _batch_seeds(seeds, rows, "seeds")
+    if rows == 0:
+        return (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32))
+    call = (_fusedtok.sample_mirostat_batched if path == "staged"
+            else _fusedtok.sample_mirostat_batched_cpu)
+    toks, muv = call(arr, rows, n, mus, tau, eta, temperature, s)
+    toks = np.asarray(toks, dtype=np.int64)
+    muv = np.asarray(muv, dtype=np.float32)
+    if _is_torch(logits):
+        return (torch.from_numpy(toks), torch.from_numpy(muv))
+    return toks, muv
 
 
 def _sample_batched(kind, logits, args, *, temperature, seeds, cuda):

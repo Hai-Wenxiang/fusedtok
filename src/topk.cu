@@ -1781,6 +1781,29 @@ static int widen_window_topa(int window, int n, float top_a, double total,
     while (mp < want) mp <<= 1;
     return std::min(n, mp);
 }
+// Adaptive widening jump for mirostat (v2.5): the nucleus threshold in
+// exp units is 2^-mu * total, so the same mass bound as min-p applies
+// with that derived threshold. A very large mu drives the threshold to
+// zero (every token qualifies) - the bound degenerates and the honest
+// x8 ladder floor carries the widening.
+static int widen_window_mirostat(int window, int n, float mu,
+                                 double total,
+                                 const unsigned long long* ws) {
+    unsigned long long cw = 0ULL;
+    if (cudaMemcpy(&cw, ws + kWsCumW, sizeof(cw),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("mirostat mass readback failed");
+    const double c = (double)*reinterpret_cast<const float*>(&cw);
+    const double thr = std::exp2((double)-mu) * total;
+    long long lb = (long long)window + 1;
+    if (thr > 0.0)
+        lb = minp_widen_bound(window, thr, total, c);
+    const long long want = std::max<long long>((long long)window * 8, lb);
+    if (want >= n) return n;
+    int mp = 1;                       // pow2 headroom over the bound
+    while (mp < want) mp <<= 1;
+    return std::min(n, mp);
+}
 
 // Adaptive widening jump for top-n-sigma: the nucleus is a VALUE
 // threshold on the temperature-scaled logit (l_i >= mu - nsigma *
@@ -2296,6 +2319,55 @@ __global__ void sample_topa_serial_kernel(
                        (unsigned)(keys[idx] & 0xFFFFFFFFu));
 }
 
+// Mirostat v2 serial tail (v2.5): value-threshold nucleus at
+// p_i >= 2^-mu derived from the workspace total (the top-a pattern -
+// one exp2f + multiply off kWsTotal), top-1 fallback for an empty
+// nucleus, and the fused state update
+// mu' = mu - eta * (log2(total) - log2(exp_sampled)). On success the
+// new mu rides the kWsCumW word (disjoint from the widen-failure cum
+// mass the host reads on retry); the f32 op order matches the CPU
+// reference exactly.
+__global__ void sample_mirostat_serial_kernel(
+    const unsigned long long* __restrict__ keys,
+    const float* __restrict__ exps,
+    unsigned long long* __restrict__ ws,
+    int* __restrict__ token_out,
+    int k, int n, float mu, float tau, float eta,
+    unsigned long long seed) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    extern __shared__ float cps[];   // walk checkpoints (walk_cp_slots)
+    const int stride = walk_cp_stride(k);
+    const float total =
+        *reinterpret_cast<const float*>(&ws[kWsTotal]);
+    const float thr_exp = exp2f(-mu) * total;
+    float nucleus_mass = 0.0f;
+    int ncp = 0;
+    const int edge = walk_until_below(exps, k, thr_exp, &nucleus_mass,
+                                      cps, stride, &ncp);
+    if (edge < 0 && k < n) {
+        // window covers only nucleus members: the host widens; leave
+        // the whole-window cum mass for the jump bound
+        *reinterpret_cast<float*>(&ws[kWsCumW]) = nucleus_mass;
+        return;
+    }
+    int nucleus = (edge < 0) ? k : edge;
+    if (nucleus == 0) {                  // threshold above the top exp
+        nucleus = 1;                     // top-1 fallback
+        nucleus_mass = exps[0];
+    }
+    const float u = splitmix_uniform(seed);
+    const float target = u * nucleus_mass;
+    const int hit = walk_from_cp(exps, nucleus, target, cps, ncp, stride);
+    const int idx = (hit >= 0) ? hit : nucleus - 1;
+    // state update: s = -log2(p) = log2(total) - log2(exp) in f32,
+    // same op order as the CPU reference
+    const float s = log2f(total) - log2f(exps[idx]);
+    *reinterpret_cast<float*>(&ws[kWsCumW]) = mu - eta * (s - tau);
+    *token_out = (int)(0xFFFFFFFFu -
+                       (unsigned)(keys[idx] & 0xFFFFFFFFu));
+}
+
+
 // top-n-sigma sampling tail (Shi et al. 2024, "Top-n sigma: Not All
 // Logits Are You Need"): keep every element whose temperature-scaled
 // logit exceeds mu - nsigma * sigma (mu / sigma: the row's mean and
@@ -2683,6 +2755,116 @@ long long sample_topa_launch(const float* x, int n, float top_a, float t,
             total = (double)*reinterpret_cast<const float*>(&tw);
         }
         window = widen_window_topa(window, n, top_a, total, ws);
+    }
+}
+
+// Mirostat v2 single-row launcher (v2.5): the top-a pipeline with the
+// absolute threshold 2^-mu * total and the fused mu update. Returns
+// (token, mu'). Not CUDA-graph capturable (per-attempt readback).
+
+std::pair<long long, float> sample_mirostat_launch(
+    const float* x, int n, float mu, float tau, float eta, float t,
+    unsigned long long seed, std::uintptr_t stream) {
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(tau > 0.0f))
+        throw std::invalid_argument("tau must be > 0");
+    if (!(eta > 0.0f))
+        throw std::invalid_argument("eta must be > 0");
+    if (!std::isfinite(mu))
+        throw std::invalid_argument("mu must be finite");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    cudaStream_t cs = (cudaStream_t)stream;
+    // like top-a, the cutoff derives from a workspace quantity (T)
+    // the serial walker reads - so the mass passes run on EVERY
+    // attempt (the head memset zeroes the slot). The widening bound
+    // additionally needs the total host-side; it is window-invariant,
+    // so it is read back once after the first failure and cached
+    // (same lazy pattern as min-p's / top-a's total).
+    double total = -1.0;
+    int window = std::min(kSelEarlyOut, n);
+    for (;;) {
+        int m = 1;
+        while (m < window) m <<= 1;                // sort pad size
+        unsigned long long* ws =
+            selection_workspace((size_t)kSelEarlyOut + 2 * (size_t)m +
+                                kWsScanWords +
+                                sizeof(SelArgs) / sizeof(unsigned long long));
+        SelArgs* dargs = reinterpret_cast<SelArgs*>(ws + sel_args_off(m));
+        int* token_out = reinterpret_cast<int*>(ws + kWsToken);
+        int token = -1;
+        checked_memset_async(ws, kWsHead * sizeof(unsigned long long), cs, "workspace memset");
+        if (cudaMemcpyAsync(token_out, &token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cs) != cudaSuccess)
+            throw std::runtime_error("token preset upload failed");
+        ship_args(cs, dargs, x, nullptr, nullptr, nullptr, 0.0f);
+        const int grid = selection_grid(n);
+        const float inv_t = 1.0f / t;
+        const bool full = (window == n);
+        if (!full) {
+            for (int level = 7; level >= 0; --level)
+                select_round_kernel<<<grid, kSelBlock, 0, cs>>>(
+                    dargs, ws, n, level, (unsigned long long)window,
+                    inv_t, kNoPen);
+            select_finalize_kernel<<<grid, kSelBlock, 0, cs>>>(
+                dargs, ws, n, inv_t, kNoPen);
+        }
+        // the mass pass feeds the serial walker's cutoff (kWsExpMax
+        // publishes the max before the total consumer)
+        expmax_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t, kNoPen);
+        exptotal_kernel<<<grid, kSelBlock, 0, cs>>>(x, ws, n, inv_t,
+                                                    kNoPen);
+        check_launch("mirostat mass launch");
+        emit_kernel<<<grid, kSelBlock, 0, cs>>>(dargs, ws, n, window,
+                                                inv_t, kNoPen);
+        check_launch("mirostat selection launch");
+        unsigned long long* sorted = sort_keys(ws, window, m, cs);
+        float* exps =
+            reinterpret_cast<float*>(sort_keys_mate(ws, m, sorted));
+        exp_window_kernel<<<selection_grid(window), kSelBlock, 0, cs>>>(
+            sorted, exps, window);
+        sample_mirostat_serial_kernel<<<1, 32,
+                                    walk_cp_slots(window) * sizeof(float),
+                                    cs>>>(
+            sorted, exps, ws, token_out, window, n, mu, tau, eta,
+            seed);
+        check_launch("mirostat tail launch");
+        cudaError_t err = cudaStreamSynchronize(cs);
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("mirostat kernel failed: ") +
+                                     cudaGetErrorString(err));
+        if (cudaMemcpy(&token, token_out, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("mirostat readback failed");
+        if (token >= 0) {
+            // the tail parked mu' in the kWsCumW word on success
+            unsigned long long mw = 0ULL;
+            if (cudaMemcpy(&mw, ws + kWsCumW, sizeof(mw),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("mirostat mu readback failed");
+            return {token,
+                    *reinterpret_cast<const float*>(&mw)};
+        }
+        if (window == n)
+            throw std::runtime_error("mirostat nucleus not covered");
+        if (total < 0.0) {
+            // one-time readback of the global total for the adaptive
+            // bound (window-invariant, and already correct: the failed
+            // attempt's own exptotal pass populated the slot - re-running
+            // the pass would atomicAdd onto it and double the value)
+            err = cudaStreamSynchronize(cs);
+            if (err != cudaSuccess)
+                throw std::runtime_error(std::string("top-a mass failed: ") +
+                                         cudaGetErrorString(err));
+            unsigned long long tw = 0ULL;
+            if (cudaMemcpy(&tw, ws + kWsTotal, sizeof(tw),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("top-a total readback failed");
+            total = (double)*reinterpret_cast<const float*>(&tw);
+        }
+        window = widen_window_mirostat(window, n, mu, total, ws);
     }
 }
 
@@ -5402,6 +5584,45 @@ std::vector<long long> sample_dry_batched_launch(
             stream);
         std::copy(chunk.begin(), chunk.end(), out.begin() + c);
     }
+    return out;
+}
+
+// Batched mirostat (v2.5): every row runs the single-row pipeline on
+// the caller's stream, each with its own mu state - the documented
+// first implementation (a fused chunk-sequencer mode is future work
+// if batched mirostat matters at serving scale; the per-row cost is
+// the same class the 2.1-era TFS/XTC loops had, ~1 launch + readback
+// per row).
+std::vector<std::pair<long long, float>> sample_mirostat_batched_launch(
+    const float* x, int rows, int n, const std::vector<float>& mus,
+    float tau, float eta, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream) {
+    if (rows < 0)
+        throw std::invalid_argument("rows must be >= 0");
+    if (rows == 0)
+        return {};
+    if (n <= 0)
+        throw std::invalid_argument("sample of empty logits");
+    if (!(tau > 0.0f))
+        throw std::invalid_argument("tau must be > 0");
+    if (!(eta > 0.0f))
+        throw std::invalid_argument("eta must be > 0");
+    if (!(t > 0.0f))
+        throw std::invalid_argument("temperature must be > 0");
+    if ((int)mus.size() != rows)
+        throw std::invalid_argument("mus must have one entry per row");
+    for (float m : mus)
+        if (!std::isfinite(m))
+            throw std::invalid_argument("mu must be finite");
+    if ((int)seeds.size() != rows)
+        throw std::invalid_argument("seeds must have one entry per row");
+    std::vector<std::pair<long long, float>> out;
+    out.reserve((size_t)rows);
+    for (int r = 0; r < rows; ++r)
+        out.push_back(sample_mirostat_launch(
+            x + (size_t)r * n, n, mus[r], tau, eta, t, seeds[r],
+            stream));
     return out;
 }
 
