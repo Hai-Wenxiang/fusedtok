@@ -1,3 +1,46 @@
+## [2.5.0] - 2026-09-21
+
+A new sampling algorithm with cross-call state, plus a 1.6x round on
+the tensor-core prefill. 57 public names; 796 tests green on RTX 3060
+(Windows, CUDA 13.3) and RTX 5060 Ti (Linux, CUDA 13.2).
+
+### Added
+- **`sample_mirostat(logits, mu, *, tau=5.0, eta=0.1, temperature,
+  seed)`** and **`sample_mirostat_batched`** - Mirostat v2
+  (Basirat 2023): entropy-targeting sampling with a caller-owned
+  surprise bound. The nucleus is every token with `p_i >= 2^-mu` (an
+  absolute threshold; empty falls back to top-1), the draw
+  renormalizes inside, and the fused state update
+  `new_mu = mu - eta * (s - tau)` rides the serial tail. The ONE
+  tuple-returning sampler family - `(token, new_mu)` - because mu is
+  loop state (initialize at `2 * tau`). API count 55 -> 57.
+
+### Changed
+- **Lane-parallel online softmax in the tensor-core prefill**: the
+  v2.4 tail walked 16 rows sequentially (two 5-round warp reductions
+  each - the kernel's critical path); all 16 rows now process
+  simultaneously with 2 lanes per row. Probe (5 interleaved rounds,
+  S=1024 D=128 causal bf16, RTX 3060): 1092 -> 668 us (1.63x); the
+  shipped-build table row moves 0.58x -> 0.91x of SDPA's bf16 flash.
+  racecheck caught a missing barrier between the P pack and the mma
+  loads in the first integration cut (64 hazards) - fixed before
+  release.
+
+### Evaluated, not shipped
+- **cp.async double-buffered K/V staging for the prefill**: measured
+  SLOWER than the register staging path both alone (0.93x) and
+  combined with the softmax restructure (698 vs 668 us) - the tile
+  size's global traffic is too small to pay for the extra sync
+  structure. Reverted.
+- **16-bit radix keys for the selection pipeline**: quantizing the
+  float key to 16 bits would halve the 8 radix rounds (~8 launches of
+  an n-read pass each, roughly 40% of a single-row sampler's ~140 us
+  at a 131k vocab) - but it REORDERS near-tied floats, changing every
+  sampler's token stream and breaking the documented determinism
+  contract and cross-version reproducibility. A single-row-only,
+  non-graph-captured ~20% win does not buy that. Withdrawn from the
+  roadmap.
+
 ## [2.4.4] - 2026-09-21
 
 Small correction round from the post-release verification audit. No

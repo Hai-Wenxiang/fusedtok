@@ -17,6 +17,7 @@ CPU 与 GPU 抽签可能不一致的精确边界。
 - [sample_tfs——尾部自由采样（v2.1）](#sample_tfs尾部自由采样v21)
 - [sample_xtc——排除顶部选择采样（v2.2）](#sample_xtc排除顶部选择采样v22)
 - [sample_dry——序列级重复惩罚采样（v2.3）](#sample_dry序列级重复惩罚采样v23)
+- [sample_mirostat——带状态的熵目标采样（v2.5）](#sample_mirostat带状态的熵目标采样v25)
 - [sample_eta——熵自适应截断采样（v1.6）](#sample_eta熵自适应截断采样v16)
 - [sample_typical——局部典型采样（v1.6）](#sample_typical局部典型采样v16)
 - [logit_penalties——一次调用套齐 HF 三件惩罚（v1.6.1）](#logit_penalties一次调用完成-hf-三种惩罚v161)
@@ -265,6 +266,38 @@ token"。扫描窗口 = 最近 64 个历史 token。对每个后缀长度
   每行一个扫描 block、对所有行做一次融合 apply，然后走普通全词表
   批量抽签。每行与单行算子在该行上按文档记载的 ulp 边界一致。
 
+## sample_mirostat——带状态的熵目标采样（v2.5）
+
+```python
+tok, mu = fusedtok.sample_mirostat(logits, mu, tau=5.0, eta=0.1,
+                                   temperature=0.8, seed=step)
+toks, mus = fusedtok.sample_mirostat_batched(batch_logits, mus,
+                                             seeds=seeds)
+```
+
+Mirostat v2（Basirat 2023）瞄准的是一个"意外度"水平而不是固定核：
+调用方持有一个界限 `mu`（初始值取 `2 * tau`），核为所有满足
+`p_i >= 2 ** -mu` 的 token（绝对概率阈值，边界包含——与库内其他值
+阈值采样器一致），抽签后按 `new_mu = mu - eta * (s - tau)` 更新状态，
+其中 `s = -log2(p_sampled)` 取自完整 softmax。每步把 `new_mu` 喂回
+下一次调用，运行意外度就会贴着 `tau` 走——论文的困惑度调控性质。
+
+- **这是唯一返回元组的采样器**——单行 `(token, new_mu)`，批量
+  `(tokens, new_mus)`（每行自带各自的 mu，状态互相独立）。批量 GPU
+  路径在调用方流上逐行循环融合的单行 launcher——这是文档化
+  的第一版实现；若批量 mirostat 在服务规模上重要，融合的
+  chunk-sequencer 模式留作后续工作。
+- 空核（`2 ** -mu > p_max`）回退到 top-1 token——状态更新照常
+  进行。
+- `tau`（目标熵，论文默认 5.0）与 `eta`（学习率，默认 0.1）必须为
+  正；`mu` 必须有限。token 遵循标准的逐种子确定性与跨路径
+  邻居排名契约；`new_mu` 是派生的 f32 算术
+  （`log2(total) - log2(exp)`），CPU 与 GPU 路径间允许 ulp 级
+  差异。
+- 实现：top-a 管线（阈值在 kernel 内从 workspace 总量导出）换上
+  绝对阈值 `2^-mu`，状态更新融进串行尾部；扩窗下界以导出阈值
+  复用 min-p 的质量论证。
+
 ## sample_eta——熵自适应截断采样（v1.6）
 
 ```python
@@ -434,7 +467,7 @@ CUDA graph 捕获。
   274 µs、minp 1399 -> 237 µs；README 中的事件计时基准表量的是
   GPU 时间，协议不同）。尖峰 logits 下与 torch 原生批量
   multinomial 处于同一档位，`sample_topk_batched` 明确胜出
-  （1.57x / 1.17x）；平坦最坏情况则比单行版再低一档
+  （1.75x / 1.19x）；平坦最坏情况则比单行版再低一档
   （0.05x），差距同样如实给出。
 - `decode_step` 的批量版见下一节（v1.5）。
 

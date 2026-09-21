@@ -1300,6 +1300,159 @@ PYBIND11_MODULE(_fusedtok, m) {
     }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("top_n"),
        py::arg("probability"), py::arg("t") = 1.0, py::arg("seeds"));
 
+    m.def("sample_mirostat_cpu",
+          [](FArray logits, double mu, double tau, double eta, double t,
+             unsigned long long seed) -> py::tuple {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        const auto r = ft::sample_mirostat_cpu(to_vec(logits),
+                                               (float)mu, (float)tau,
+                                               (float)eta, (float)t, seed);
+        return py::make_tuple((long long)r.first, (double)r.second);
+    }, py::arg("logits"), py::arg("mu"), py::arg("tau") = 5.0,
+       py::arg("eta") = 0.1, py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_mirostat",
+          [](FArray logits, double mu, double tau, double eta, double t,
+             unsigned long long seed) -> py::tuple {
+        if (logits.ndim() != 1)
+            throw std::invalid_argument("logits must be 1-D");
+        if (!(tau > 0.0))
+            throw std::invalid_argument("tau must be > 0");
+        if (!(eta > 0.0))
+            throw std::invalid_argument("eta must be > 0");
+        if (!std::isfinite(mu))
+            throw std::invalid_argument("mu must be finite");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        const int n = (int)logits.size();
+        if (n == 0)
+            throw std::invalid_argument("sample of empty logits");
+        DevBuf dx(n * 4);
+        h2d(dx.get(), logits.data(), n * 4);
+        const auto r = ft::sample_mirostat_launch(
+            dx.fget(), n, (float)mu, (float)tau, (float)eta, (float)t,
+            seed);
+        sync_device("sample mirostat kernel");
+        return py::make_tuple((long long)r.first, (double)r.second);
+    }, py::arg("logits"), py::arg("mu"), py::arg("tau") = 5.0,
+       py::arg("eta") = 0.1, py::arg("t") = 1.0, py::arg("seed") = 0);
+
+    m.def("sample_mirostat_launch",
+          [](py::int_ x, int n, double mu, double tau, double eta,
+             double t, unsigned long long seed,
+             std::uintptr_t stream) -> py::tuple {
+        const auto r = ft::sample_mirostat_launch(
+            df(x), n, (float)mu, (float)tau, (float)eta, (float)t, seed,
+            stream);
+        return py::make_tuple((long long)r.first, (double)r.second);
+    }, py::arg("logits"), py::arg("n"), py::arg("mu"),
+       py::arg("tau") = 5.0, py::arg("eta") = 0.1, py::arg("t") = 1.0,
+       py::arg("seed") = 0, py::arg("stream") = 0);
+
+    m.def("sample_mirostat_batched_cpu",
+          [](FArray logits, int rows, int n, const FArray& mus,
+             double tau, double eta, double t,
+             const I64Array& seeds) -> py::tuple {
+        check_batch_host(logits, rows, n);
+        if (!(tau > 0.0))
+            throw std::invalid_argument("tau must be > 0");
+        if (!(eta > 0.0))
+            throw std::invalid_argument("eta must be > 0");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        if (mus.ndim() != 1 || (int)mus.size() != rows)
+            throw std::invalid_argument(
+                "mus must be 1-D with one entry per row");
+        check_batch_seeds(seeds, rows);
+        const std::vector<float> mv(mus.data(), mus.data() + mus.size());
+        const auto out = ft::sample_mirostat_batched_cpu(
+            to_vec(logits), rows, n, mv, (float)tau, (float)eta,
+            (float)t, seeds_vec(seeds));
+        py::array_t<long long> toks((py::ssize_t)rows);
+        py::array_t<float> muv((py::ssize_t)rows);
+        for (int r = 0; r < rows; ++r) {
+            toks.mutable_at(r) = out[r].first;
+            muv.mutable_at(r) = out[r].second;
+        }
+        return py::make_tuple(toks, muv);
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("mus"),
+       py::arg("tau") = 5.0, py::arg("eta") = 0.1, py::arg("t") = 1.0,
+       py::arg("seeds"));
+
+    m.def("sample_mirostat_batched",
+          [](FArray logits, int rows, int n, const FArray& mus,
+             double tau, double eta, double t,
+             const I64Array& seeds) -> py::tuple {
+        check_batch_host(logits, rows, n);
+        if (!(tau > 0.0))
+            throw std::invalid_argument("tau must be > 0");
+        if (!(eta > 0.0))
+            throw std::invalid_argument("eta must be > 0");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        if (mus.ndim() != 1 || (int)mus.size() != rows)
+            throw std::invalid_argument(
+                "mus must be 1-D with one entry per row");
+        check_batch_seeds(seeds, rows);
+        if (rows == 0)
+            return py::make_tuple(wrap_ivec({}),
+                                  py::array_t<float>(0));
+        DevBuf dx((size_t)rows * n * 4);
+        h2d(dx.get(), logits.data(), (size_t)rows * n * 4);
+        const std::vector<float> mv(mus.data(), mus.data() + mus.size());
+        const auto out = ft::sample_mirostat_batched_launch(
+            dx.fget(), rows, n, mv, (float)tau, (float)eta, (float)t,
+            seeds_vec(seeds));
+        std::vector<long long> toks;
+        std::vector<float> muv;
+        toks.reserve((size_t)rows);
+        muv.reserve((size_t)rows);
+        for (const auto& p : out) {
+            toks.push_back(p.first);
+            muv.push_back(p.second);
+        }
+        return py::make_tuple(wrap_ivec(toks),
+                              py::array_t<float>(
+                                  {(py::ssize_t)rows}, muv.data()));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("mus"),
+       py::arg("tau") = 5.0, py::arg("eta") = 0.1, py::arg("t") = 1.0,
+       py::arg("seeds"));
+
+    m.def("sample_mirostat_batched_launch",
+          [](py::int_ x, int rows, int n, const FArray& mus,
+             double tau, double eta, double t, const I64Array& seeds,
+             std::uintptr_t stream) -> py::tuple {
+        check_batch_rows_n(rows, n);
+        if (!(tau > 0.0))
+            throw std::invalid_argument("tau must be > 0");
+        if (!(eta > 0.0))
+            throw std::invalid_argument("eta must be > 0");
+        if (!(t > 0.0))
+            throw std::invalid_argument("temperature must be > 0");
+        if (mus.ndim() != 1 || (int)mus.size() != rows)
+            throw std::invalid_argument(
+                "mus must be 1-D with one entry per row");
+        check_batch_seeds(seeds, rows);
+        const std::vector<float> mv(mus.data(), mus.data() + mus.size());
+        const auto out = ft::sample_mirostat_batched_launch(
+            df(x), rows, n, mv, (float)tau, (float)eta, (float)t,
+            seeds_vec(seeds), stream);
+        std::vector<long long> toks;
+        std::vector<float> muv;
+        toks.reserve((size_t)rows);
+        muv.reserve((size_t)rows);
+        for (const auto& p : out) {
+            toks.push_back(p.first);
+            muv.push_back(p.second);
+        }
+        return py::make_tuple(wrap_ivec(toks),
+                              py::array_t<float>(
+                                  {(py::ssize_t)rows}, muv.data()));
+    }, py::arg("logits"), py::arg("rows"), py::arg("n"), py::arg("mus"),
+       py::arg("tau") = 5.0, py::arg("eta") = 0.1, py::arg("t") = 1.0,
+       py::arg("seeds"), py::arg("stream") = 0);
+
     m.def("sample_dry_cpu",
           [](FArray logits, const I64Array& ids, int allowed_length,
              double multiplier, double t,

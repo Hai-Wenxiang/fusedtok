@@ -156,9 +156,10 @@ ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
 - **bfloat16 / float16 存储、维度为 {32, 64, 128} 时走 tensor core**
   （flash 式 `mma.sync m16n8k16` kernel：f32 的 softmax 与累加，
   输出舍回存储 dtype）。S=1024 D=128 因果式下比原先的 CUDA core
-  半精度路径快 5.1 倍（3060 上 6019 -> 1171 微秒，5 轮平均；
+  半精度路径在 2.5 的逐 lane 并行 softmax 后又快 1.6 倍（探针：
+  1092 -> 668 微秒；
   5060 Ti 约 630 微秒），为同输入 SDPA bf16 flash 的
-  0.41-0.58x——tensor core 路径之前只有 0.11x。与 SDPA 的诚实
+  0.68-0.91x——tensor core 路径之前只有 0.11x。与 SDPA 的诚实
   差距照旧写进基准表（`attn prefill bf16` 行）。
 - **float32 存储，以及其他维度的半精度，保持 v0.5 的便捷路径**——
   单个分块 CUDA core kernel、不用 tensor core（f32 上 tensor core
@@ -177,6 +178,7 @@ ctx = fusedtok.attention_prefill(q_all, k_all, v_all, causal=True)
   绝对收益有限，batch 越大收益越大。
 - 分页间接寻址比连续版多付约 1.09-1.15 倍（本轮 3060 为 1.15、5060 Ti 为 1.09）。
 - f32 prefill 刻意不上 tensor core（因而不与 flash 后端竞争）；半精度路径
-自 v2.4 起达到 SDPA bf16 flash 的 0.41-0.58x。
+自 v2.4（tensor core）与 2.5（逐 lane 并行 softmax）起达到 SDPA
+bf16 flash 的 0.68-0.91x。
 
 测试协议与复现方法见[基准测试](benchmarks.md)。

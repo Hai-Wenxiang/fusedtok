@@ -1082,64 +1082,77 @@ __global__ void attn_prefill_wmma_kernel(const T* __restrict__ q,
         }
         __syncwarp();
 
-        // ---- online softmax + P (the warp cooperates per row) ----
-        // rows past seq produce NaN state here (alpha = expf(-inf-inf))
-        // but are never stored - the epilogue guards on row < seq
+        // ---- online softmax + P (v2.5 lane-parallel restructure) ----
+        // 16 rows processed SIMULTANEOUSLY, 2 lanes per row (16 cols
+        // each): two xor-shfl rounds per tile instead of the v2.4
+        // loop's 16 rows x two 5-round warp reductions - the softmax
+        // was the kernel's critical path (1.63x end-to-end on a 3060;
+        // cp.async double-buffered staging measured SLOWER than the
+        // register path and stays out - see the changelog).
+        // Rows past seq produce NaN state (alpha = expf(-inf-inf)) but
+        // are never stored - the epilogue guards on row < seq.
         const int t_stop = min(t0 + KVTILE, seq);
-        for (int r = 0; r < 16; ++r) {
-            const int row_abs = row0 + qwarp + r;
-            const int lim = causal ? row_abs + 1 : seq;
-            float mrow = -INFINITY;
-            for (int c = lane; c < KVTILE; c += 32) {
-                const int key = t0 + c;
-                float val = S[r * S_STRIDE + c];
-                if (key >= t_stop || key >= lim) val = -INFINITY;
-                S[r * S_STRIDE + c] = val;
-                mrow = fmaxf(mrow, val);
-            }
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                mrow = fmaxf(mrow,
-                             __shfl_xor_sync(0xffffffffu, mrow, off));
-            // lane 0 owns the ML state; the broadcast doubles as the
-            // warp-collective sync point BEFORE lane 0 rewrites ML[r]
-            // (a plain all-lane read would race the lane-0 store under
-            // independent thread scheduling - the racecheck finding)
-            const float m_old = __shfl_sync(
-                0xffffffffu, (lane == 0) ? ML[r] : 0.0f, 0);
-            const float m_new = fmaxf(m_old, mrow);
-            const float alpha = __expf(m_old - m_new);
-            float lrow = 0.0f;
-            for (int c = lane; c < KVTILE; c += 32) {
-                const float val = S[r * S_STRIDE + c];
-                const float p =
-                    (val == -INFINITY) ? 0.0f : __expf(val - m_new);
-                lrow += p;
-                S[r * S_STRIDE + c] = p;
-            }
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                lrow += __shfl_xor_sync(0xffffffffu, lrow, off);
-            if (lane == 0) {
-                ML[r] = m_new;
-                ML[16 + r] = ML[16 + r] * alpha + lrow;
-                ML[32 + r] = alpha;
-            }
+        constexpr int COLS_PER_LANE = KVTILE / 2;
+        const int r = lane >> 1;            // this lane's row 0..15
+        const int half = lane & 1;          // column half
+        const int row_abs = row0 + qwarp + r;
+        const int lim = causal ? row_abs + 1 : seq;
+        float mpart = -INFINITY;
+        #pragma unroll
+        for (int i = 0; i < COLS_PER_LANE; ++i) {
+            const int c = half * COLS_PER_LANE + i;
+            const int key = t0 + c;
+            float val = S[r * S_STRIDE + c];
+            if (key >= t_stop || key >= lim) val = -INFINITY;
+            S[r * S_STRIDE + c] = val;
+            mpart = fmaxf(mpart, val);
+        }
+        // combine the row's two lane halves (1 xor round each way)
+        const float mrow = fmaxf(mpart, __shfl_xor_sync(0xffffffffu,
+                                                        mpart, 1));
+        // only the state-writing lane (2r, the half==0 lane of row r)
+        // touches ML; the shfl broadcasts to its partner - same-lane
+        // read/write ordering, the racecheck-clean pattern
+        const float m_old = __shfl_sync(
+            0xffffffffu, (half == 0) ? ML[r] : 0.0f, r * 2);
+        const float m_new = fmaxf(m_old, mrow);
+        const float alpha = __expf(m_old - m_new);
+        float lpart = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < COLS_PER_LANE; ++i) {
+            const int c = half * COLS_PER_LANE + i;
+            const float val = S[r * S_STRIDE + c];
+            const float p =
+                (val == -INFINITY) ? 0.0f : __expf(val - m_new);
+            lpart += p;
+            S[r * S_STRIDE + c] = p;
+        }
+        const float lrow = lpart + __shfl_xor_sync(0xffffffffu, lpart, 1);
+        if (half == 0) {                    // one writer per row
+            ML[r] = m_new;
+            ML[16 + r] = ML[16 + r] * alpha + lrow;
+            ML[32 + r] = alpha;
         }
         __syncwarp();
-        const float alpha_g = ML[32 + g];
-        const float alpha_g8 = ML[32 + g + 8];
 
-        // pack P to half precision
-        for (int idx = lane; idx < 16 * (KVTILE / 2); idx += 32) {
-            const int r = idx / (KVTILE / 2), cp = idx % (KVTILE / 2);
-            *reinterpret_cast<unsigned*>(&P[r * KVTILE + cp * 2]) =
-                pack_pair<IS_BF16>(S[r * S_STRIDE + cp * 2],
-                                   S[r * S_STRIDE + cp * 2 + 1]);
+        // pack P and rescale O in the same lane layout: each lane owns
+        // its 16 consecutive columns of one row. The barrier after the
+        // pack is REQUIRED: the mma A-fragments below read P rows g
+        // and g+8 across the whole warp - writes by the row's two
+        // lanes must be visible first (the 2.5 restructure initially
+        // dropped this barrier; racecheck caught it before release).
+        #pragma unroll
+        for (int i = 0; i < COLS_PER_LANE / 2; ++i) {
+            const int c0 = half * COLS_PER_LANE + i * 2;
+            *reinterpret_cast<unsigned*>(&P[r * KVTILE + c0]) =
+                pack_pair<IS_BF16>(S[r * S_STRIDE + c0],
+                                   S[r * S_STRIDE + c0 + 1]);
         }
         __syncwarp();
 
         // ---- O = O * alpha + P @ V (tensor cores) ----
+        const float alpha_g = ML[32 + g];
+        const float alpha_g8 = ML[32 + g + 8];
         #pragma unroll
         for (int nt = 0; nt < NT_O; ++nt) {
             o[nt][0] *= alpha_g;
@@ -1147,6 +1160,7 @@ __global__ void attn_prefill_wmma_kernel(const T* __restrict__ q,
             o[nt][2] *= alpha_g8;
             o[nt][3] *= alpha_g8;
         }
+
         #pragma unroll
         for (int kt = 0; kt < KT_O; ++kt) {
             unsigned a[4];

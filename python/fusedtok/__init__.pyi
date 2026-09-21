@@ -77,6 +77,8 @@ __all__ = [
     "sample_xtc_batched"
     "sample_dry"
     "sample_dry_batched"
+    "sample_mirostat"
+    "sample_mirostat_batched"
     "quantize_int8",
     "dequantize_int8",
     "qadd_int8",
@@ -162,6 +164,15 @@ def sample_xtc_batched(logits: Array, top_n: int, probability: float, *,
                        temperature: float = 1.0,
                        seeds: "Array | None" = None,
                        cuda: bool = False) -> Array: ...
+def sample_mirostat(logits: Array, mu: float, *, tau: float = 5.0,
+                    eta: float = 0.1, temperature: float = 1.0,
+                    seed: int = 0,
+                    cuda: bool = False) -> "tuple[int, float]": ...
+def sample_mirostat_batched(logits: Array, mus: Array, *,
+                            tau: float = 5.0, eta: float = 0.1,
+                            temperature: float = 1.0,
+                            seeds: "Array | None" = None,
+                            cuda: bool = False) -> "tuple[Array, Array]": ...
 def sample_dry(logits: Array, token_ids: Array, allowed_length: int = 2,
                multiplier: float = 1.75, *, temperature: float = 1.0,
                seed: int = 0, cuda: bool = False) -> int: ...

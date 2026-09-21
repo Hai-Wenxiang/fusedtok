@@ -17,6 +17,7 @@
 // the kernels with no staging copies.
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 // bf16 storage type (compute stays float32)
@@ -232,6 +233,24 @@ std::vector<long long> sample_xtc_batched_launch(
 long long sample_tfs_launch(const float* x, int n, float z, float t,
                             unsigned long long seed,
                             std::uintptr_t stream = 0);
+
+// Mirostat v2 sampling (v2.5): value-threshold nucleus at
+// p_i >= 2^-mu with the min-p widening machinery (the threshold is
+// absolute, derived in-kernel from the workspace total), the top-1
+// fallback for an empty nucleus, and the mu state update
+// (mu' = mu - eta * (s - tau)) fused into the serial tail. Returns
+// (token, mu'); not CUDA-graph capturable (per-attempt readback).
+std::pair<long long, float> sample_mirostat_launch(
+    const float* x, int n, float mu, float tau, float eta, float t,
+    unsigned long long seed, std::uintptr_t stream = 0);
+// Batched mirostat over per-row mu states; every row runs the
+// single-row pipeline on the caller's stream (the per-row loop is
+// the documented first implementation - see the sampling page).
+std::vector<std::pair<long long, float>> sample_mirostat_batched_launch(
+    const float* x, int rows, int n, const std::vector<float>& mus,
+    float tau, float eta, float t,
+    const std::vector<unsigned long long>& seeds,
+    std::uintptr_t stream = 0);
 
 // DRY sampling (v2.3): sequence-aware repeat penalty applied to a
 // scratch copy of the row, then the plain full-softmax draw (the
